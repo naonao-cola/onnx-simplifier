@@ -94,9 +94,10 @@ int replay_rpc_run(remote_handle64 h, int iters, unsigned char* out, int outLen,
   memset(codes, 0, codesLen * sizeof(int));
   compute_res_attr_t attr;
   HAP_compute_res_attr_init(&attr);
-  /* the generated kernels' tile cache spans the 256 KB at __hmx_vtcm and assumes it is one 256 KB window: an HMX operand
-   * span crossing a 256 KB boundary page-faults the PD (rc 0x4e, ../../hmx_gemm) -- acquire 512 KB, align up */
-  HAP_compute_res_attr_set_vtcm_param_v2(&attr, 512 * 1024, 0, 0);
+  /* the generated kernels' tile cache spans VTCM_KB (tinygrad's HMX_VTCM_KB) at __hmx_vtcm and is laid out from a 256 KB
+   * window boundary: an HMX operand span crossing one page-faults the PD (rc 0x4e, ../../hmx_gemm) -- acquire 256 KB
+   * more, align up */
+  HAP_compute_res_attr_set_vtcm_param_v2(&attr, (VTCM_KB + 256) * 1024, 0, 0);
   HAP_compute_res_attr_set_hmx_param(&attr, 1);
   unsigned int ctx = HAP_compute_res_acquire(&attr, 100000);
   codes[0] = (int)ctx;

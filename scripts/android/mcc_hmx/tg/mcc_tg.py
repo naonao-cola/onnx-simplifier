@@ -91,6 +91,61 @@ def tg_block(x, w):
     return x + g.matmul(T(w["w2"]), dtype=dtypes.half) + T(w["b2"])
 
 
+def block_weights_t(blk, k, v):
+    """block_weights for the feature-major block: torch's own (out, in) weights are the HMX A operands as they are"""
+    a = blk.attn
+    f16 = lambda t: t.detach().numpy().astype(np.float16)  # noqa: E731
+    km = np.zeros((HEADS, SEEN_PAD, HD), np.float32)
+    km[:, :SEEN] = k * a.scale
+    vt = np.zeros((HEADS, HD, SEEN_PAD), np.float32)
+    vt[:, :, :SEEN] = v.transpose(0, 2, 1)
+    mask = np.zeros((SEEN_PAD, 1), np.float32)
+    mask[SEEN:] = -1e4
+    col = lambda t: f16(t).reshape(-1, 1)  # noqa: E731
+    return {
+        "ln1": (col(blk.norm1.weight), col(blk.norm1.bias)),
+        "wqkv": f16(a.qkv.weight), "bqkv": col(a.qkv.bias),
+        "wproj": f16(a.proj.weight), "bproj": col(a.proj.bias),
+        "ln2": (col(blk.norm2.weight), col(blk.norm2.bias)),
+        "w1": f16(blk.mlp.fc1.weight), "b1": col(blk.mlp.fc1.bias),
+        "w2": f16(blk.mlp.fc2.weight), "b2": col(blk.mlp.fc2.bias),
+        "km": km.astype(np.float16),  # K * scale, (16, 224, 32)
+        "vt": vt.astype(np.float16),  # V^T, (16, 32, 224)
+        "mask": mask,
+    }
+
+
+def tg_block_t(xt, w):
+    """one decoder block, feature-major: xt = x^T, (512, Q) half. The queries are the vector lanes -- the HVX-natural
+    layout for independent queries: every reduction (LayerNorm over features, softmax over seen tokens, the self score over
+    head_dim) runs along the outer axis with contiguous 32-query vector loads, and every matmul is weights x activations
+    (qkv^T = Wqkv . x^T, S^T = K_h . q_h^T, o_h^T = V_h^T . P^T, ...), the weights being HMX's A operand as stored."""
+    from tinygrad import Tensor, dtypes
+
+    T = lambda a: Tensor(a)  # noqa: E731
+    q_n = xt.shape[1]
+
+    def ln(t, gb):
+        f = t.float()
+        mu = f.mean(0, keepdim=True)
+        c = f - mu
+        return (c * ((c * c).mean(0, keepdim=True) + 1e-6).rsqrt() * T(gb[0]).float() + T(gb[1]).float()).cast(dtypes.half).contiguous()
+
+    qkv = T(w["wqkv"]).matmul(ln(xt, w["ln1"]), dtype=dtypes.half) + T(w["bqkv"])  # (1536, Q)
+    q, k, v = (qkv[i * D : (i + 1) * D].reshape(HEADS, HD, q_n) for i in range(3))  # (16, 32, Q)
+    s = T(w["km"]).matmul(q.contiguous(), dtype=dtypes.half).contiguous().float() + T(w["mask"])  # S^T, (16, 224, Q)
+    ss = (q.float() * k.float()).sum(1, keepdim=True) * (HD**-0.5)  # (16, 1, Q)
+    m = s.max(1, keepdim=True).maximum(ss)
+    e, es = (s - m).exp(), (ss - m).exp()
+    inv = 1.0 / (e.sum(1, keepdim=True) + es)
+    o = T(w["vt"]).matmul((e * inv).cast(dtypes.half).contiguous(), dtype=dtypes.half).float() + (es * inv) * v.float()  # (16, 32, Q)
+    o = o.cast(dtypes.half).reshape(D, q_n).contiguous()
+    xt = xt + T(w["wproj"]).matmul(o, dtype=dtypes.half) + T(w["bproj"])
+    h = (T(w["w1"]).matmul(ln(xt, w["ln2"]), dtype=dtypes.half) + T(w["b1"])).contiguous()
+    g = h.float().gelu(approximate="tanh").cast(dtypes.half).contiguous()
+    return xt + T(w["w2"]).matmul(g, dtype=dtypes.half) + T(w["b2"])
+
+
 def cmd_check(a):
     import torch
     from tinygrad import Tensor
@@ -105,10 +160,12 @@ def cmd_check(a):
     kv = np.load(R.WORK / "kv_quest2m.npz")
     d = Path(a.data)
     x0 = np.fromfile(d / "x0.bin", np.float16).reshape(-1, D)[: a.q]
-    x = Tensor(x0)
+    tr = a.layout == "t"
+    x = Tensor(np.ascontiguousarray(x0.T) if tr else x0).realize()
+    blk, wts = (tg_block_t, block_weights_t) if tr else (tg_block, block_weights)
     capture.start(run=not a.no_run)
     for b in range(a.blocks):
-        x = tg_block(x, block_weights(m.decoder_blocks[b], kv["k"][b], kv["v"][b]))
+        x = blk(x, wts(m.decoder_blocks[b], kv["k"][b], kv["v"][b]))
     x = x.realize()
     calls = capture.stop()
     if a.no_run:
@@ -116,6 +173,8 @@ def cmd_check(a):
         print(f"recorded {len(calls)} kernel calls ({sum('__hmx_' in c.src for c in calls)} HMX) -> {a.save}")
         return
     got = x.numpy().astype(np.float64)
+    if tr:
+        got = got.T
     ref = np.fromfile(d / f"ref_out{a.blocks - 1}.bin", np.float32).reshape(-1, D)[: a.q].astype(np.float64)
     cs = float((got * ref).sum() / np.sqrt((got**2).sum() * (ref**2).sum()))
     print(
@@ -136,6 +195,7 @@ def main():
     c.add_argument("--blocks", type=int, default=1)
     c.add_argument("--save")
     c.add_argument("--no-run", action="store_true")
+    c.add_argument("--layout", default="t", choices=["t", "rows"], help="t: feature-major (x^T; default), rows: x as (Q, 512)")
     a = ap.parse_args()
     {"check": cmd_check}[a.cmd](a)
 

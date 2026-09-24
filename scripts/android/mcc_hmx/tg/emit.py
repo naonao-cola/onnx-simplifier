@@ -50,11 +50,11 @@ def driver_c(calls, bufs, regions, out, nk, repeat, dump=False):
     return "\n".join(lines) + "\n"
 
 
-def skel_h(calls, bufs, regions, out, nk):
+def skel_h(calls, bufs, regions, out, nk, vtcm_kb=256):
     """replay_gen.h: the regions, the output buffer and the call sequence (each call timed in pcycles)"""
     lines = [f"#define NR {len(regions)}", f"#define NCALL {len(calls)}",
              f"static const unsigned int RSZ[NR] = {{{', '.join(str(max(s, 1)) for s in regions.values())}}};",
-             "static unsigned char* R[NR];", f"#define OUT_R {bufs[out][0]}", f"#define OUT_O {bufs[out][1]}", f"#define OUT_N {bufs[out][2]}",
+             "static unsigned char* R[NR];", f"#define VTCM_KB {vtcm_kb}", f"#define OUT_R {bufs[out][0]}", f"#define OUT_O {bufs[out][1]}", f"#define OUT_N {bufs[out][2]}",
              "#pragma clang diagnostic ignored \"-Wdeprecated-non-prototype\""]
     lines += [f"void tgk{i}();" for i in range(nk)]
     lines += ["static void tg_calls(unsigned long long* pc) {", "  unsigned long long t;"]
@@ -95,7 +95,8 @@ def main():
     b = Path(a.bundle)
     if a.cmd == "skel":
         calls, bufs, regions, out, nk = load(b)
-        (b / "replay_gen.h").write_text(skel_h(calls, bufs, regions, out, nk))
+        vk = b / "vtcm_kb.txt"
+        (b / "replay_gen.h").write_text(skel_h(calls, bufs, regions, out, nk, int(vk.read_text()) if vk.exists() else 256))
         (b / "out_bytes.txt").write_text(f"{bufs[out][2]}\n")
         print(f"{b}/replay_gen.h: {len(calls)} calls, {len(regions)} regions")
         return

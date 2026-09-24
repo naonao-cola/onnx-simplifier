@@ -5,7 +5,7 @@ directory runs the same block as **plain tinygrad Tensor code** through the onnx
 (`hvx-hmx`: HVX codegen, qfloat, the HMX TensorCore) on the phone, checks it kernel by kernel, and fixes what that
 turned up in the fork (onnxsim/tinygrad#7, branch `hvx-hmx-mcc`). The hand kernel is the target to match.
 
-**Status: correct on the phone (cos 0.9999997 vs float64 at 1024 queries), 572 ms per block** -- about 220x the hand
+**Status: correct on the phone (cos 0.9999986 vs float64 at 1024 queries), 77 ms per block** -- about 30x the hand
 kernel. It started at "doesn't compile / wrong / faults on the phone"; the table at the end has the steps and the
 remaining gap.
 
@@ -45,6 +45,19 @@ now emits (`decode_packet: assertion failed`). So the kernels are captured and r
 5. **Softmax row width** (model code): rows of 225 (224 seen + the self score) don't vectorize; the self term is kept
    apart as in the hand kernel.
 6. **Replay pitfalls** (this directory): buffer aliasing (region replay), VTCM window alignment, qemu-free validation.
+7. **Reductions across rows** (model code + fork heuristic): with queries as rows, every reduction (LayerNorm over
+   features, softmax over tokens) upcast 128 *rows* and gathered one element per row. `mcc_tg.py --layout t` (default)
+   runs the block feature-major, x^T (512 x Q), the queries on the vector lanes, so reductions are contiguous vector
+   accumulations -- but tinygrad's upcast heuristic then still picked axes some buffer strides across (gathers) and, for
+   a reduction nothing broadcasts into (the per-query self score q . k), unrolled the reduce and left it scalar. On the
+   DSP the heuristic now sorts gathers first and upcasts the contiguous output axis before unrolling.
+8. **Float max stayed scalar** (fork): a float MAX renders as a statement expression (NaN semantics), so the softmax row
+   max never vectorized (100 ms). On qfloat targets a vector max is HVX's native vmax (`__builtin_elementwise_max`).
+9. **HMX tile cache too small** (fork): 116 slots of 2 KB in one 256 KB window, so fc2 (K = 64 tiles) repacked both
+   operands per output tile, and after the loop interchange qkv / fc1 repacked the activation panel (a 32-way reuse
+   through an 8-way tag cache). `HMX_VTCM_KB=4096`: one pool in 4 MB of VTCM, K panels at a stride that keeps every
+   load pair inside a 256 KB window; weights and activation panels are packed once per call. The capture records it
+   (`vtcm_kb.txt`) and the replay skel acquires that much VTCM.
 
 ## Phone (Xiaomi 12S, one decoder block, 1024 queries, `run.sh`)
 
@@ -52,22 +65,26 @@ now emits (`decode_packet: assertion failed`). So the kernels are captured and r
 |---|---:|---|
 | first valid run (after 1-3): S on HMX, element-wise scalar | 914 | cos 0.9999997 |
 | + qfloat exp2 / reciprocal, softmax 224 + self | (GELU 299 -> 8.4 ms) | |
-| + multi-vector lane columns (softmax normalize 368 -> 28 ms) | **572** | cos 0.9999997 |
+| + multi-vector lane columns (softmax normalize 368 -> 28 ms) | 572 | cos 0.9999997 |
+| + feature-major block (`--layout t`) | 649 | |
+| + DSP upcast heuristic: no gathers (7) | 258.5 | cos 0.9999986 |
+| + vector float max (8) | 160.8 | |
+| + contiguous upcast before the reduce unroll (7: self score 37.8 -> 0.7 ms) | 123.4 | |
+| + 4 MB HMX tile pool (9) | **77.2** | cos 0.9999986 |
 | hand kernel (`../mcc_block.h`) | 2.6 | cos 0.9999996 |
 
-Per kernel now (ms): softmax row max 125 + sum of exp 171, LayerNorm statistics 2 x (43 + 45), self score 31, softmax
-normalize 28, GELU 8.4; HMX: qkv 18.4, S 1.7, P V 45, proj 3.5, fc1 31, fc2 17.6 (the hand kernel's HMX work is 1.14 ms
-in total, at 3.07 TMAC/s).
+Per kernel now (ms): HVX -- P V 13.1 (on HVX: its 7-tile K didn't take the HMX path), softmax sum of exp 8.9, softmax
+normalize 8.9, GELU 8.4, softmax row max 2.8, LayerNorm 2 x (0.6 + 1.9 statistics, 1.9 apply), self score 0.7; HMX --
+fc1 9.9, qkv 7.5, fc2 5.8, proj 4.5, S 2.0 (the hand kernel's HMX work is 1.14 ms in total, at 3.07 TMAC/s).
 
 ## The remaining gap, largest first
 
-1. **Reductions laid out across rows**: the softmax / LayerNorm reductions upcast 128 *rows* and load one element per row
-   at the row stride (128 scalar loads per reduce step); contiguous 32-lane loads along the row with a vector accumulator
-   and one horizontal reduce is the HVX shape. A DSP heuristic for contiguous reduce axes, or BEAM timed on hexagon-sim
-   (`HEXSIM=1`, already in the fork), should pick it.
-2. **HMX kernels from DDR**: every matmul packs its operands from row-major DDR into VTCM tiles per call and unpacks the
-   output; the hand kernel keeps activations in VTCM between steps and streams prepacked weights (see
-   `../../tinygrad_hexagon_bridge/tinygrad_codegen/hmx`: 2.1x the hand GEMM for one GEMM, far more for small K).
+1. **HMX kernels from DDR**: every matmul still packs its operands from row-major DDR into VTCM tiles once per call and
+   unpacks the output (29.7 ms for 3.5 GMAC); the hand kernel keeps activations in VTCM between steps in the tile layout
+   and streams prepacked weights (see `../../tinygrad_hexagon_bridge/tinygrad_codegen/hmx`: 2.1x the hand GEMM for one
+   GEMM, far more for small K). P V (K = 224 = 7 tiles) runs on HVX, not HMX.
+2. **The softmax / GELU element-wise work** (27 ms vs the hand kernel's ~0.9 ms on 4 threads): each step is its own
+   kernel through DDR in fp32, where the hand kernel works in hf / qf32 on VTCM tiles.
 3. **No fusion across ops**: 15 kernels, every intermediate through DDR (the hand kernel: one fused block).
 4. **One thread**: the backend runs one HVX context; the hand kernel splits row blocks over 4 and overlaps HMX with HVX.
 
@@ -75,9 +92,10 @@ in total, at 3.07 TMAC/s).
 
 ```bash
 TG=<onnxsim/tinygrad hvx-hmx-mcc checkout>
-ENV="PARALLEL=0 CAPTURE_NO_COMPILE=1 HMX=1 DEV=DSP MOCKDSP=1 TC=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLCHAIN=<Hexagon tools>"
-env $ENV PYTHONPATH=$TG:.:.. python mcc_tg.py check --data <../ref.py export --q 1024 dir> --q 1024 --no-run --save $B
-python emit.py sim $B --ref <ref_out0.bin rows> --q 1024          # hexagon-sim, real HMX
+ENV="PARALLEL=0 CAPTURE_NO_COMPILE=1 HMX=1 HMX_VTCM_KB=4096 DEV=DSP MOCKDSP=1 TC=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLCHAIN=<Hexagon tools>"
+env $ENV PYTHONPATH=$TG:.:.. python mcc_tg.py check --data <../ref.py export --q 1024 dir> --q 1024 --blocks 1 --no-run --save $B
+python -c "import numpy as np; np.ascontiguousarray(np.fromfile('<dir>/ref_out0.bin', np.float32).reshape(-1, 512)[:1024].T).tofile('$B/ref.bin')"
+python emit.py sim $B --ref $B/ref.bin --q 512                    # hexagon-sim, real HMX (output is x^T: 512 rows)
 python emit.py sim $B --dump && THREADS=0 PYTHONPATH=$TG python verify.py $B   # per-kernel check vs the CPU backend
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... NDK_CLANG=... ./build.sh $B
 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh $B 3 $B/ref.bin

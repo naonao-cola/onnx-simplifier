@@ -126,7 +126,7 @@ def save(calls, out: Path, out_addr):
     intervals merge into regions, a buffer is (region, offset, size), and a region's initial image is its
     intervals' first-seen contents in order of first appearance.
     Writes k<i>.c, calls.txt (kernel, then buffer ids), bufs.txt (id region offset size), regions.txt
-    (region size), r<region>.bin, out.txt, calls.pkl."""
+    (region size), r<region>.bin, out.txt, vtcm_kb.txt, calls.pkl."""
     out.mkdir(parents=True, exist_ok=True)
     kern, ids = {}, {}
     for c in calls:
@@ -172,6 +172,10 @@ def save(calls, out: Path, out_addr):
     )
     out_id = next(i for (a, s), i in ids.items() if a == out_addr)
     (out / "out.txt").write_text(f"{out_id}\n")
+    from tinygrad.runtime import ops_dsp
+
+    # the VTCM the kernels' tile cache was laid out for (the replay acquires it, 256 KB aligned)
+    (out / "vtcm_kb.txt").write_text(f"{getattr(ops_dsp, 'HMX_VTCM_KB', 256)}\n")
     import pickle
 
     with open(out / "calls.pkl", "wb") as f:  # per call: kernel AST + parameter -> call-buffer order (verify.py)
