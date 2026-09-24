@@ -72,6 +72,7 @@ public class MainActivity extends Activity {
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
     static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
+            {"YOLO26n-seg", "yolo", "yolo26n-seg"}, {"YOLO11n-seg", "yolo", "yolo11n-seg"},
             {"RT-DETR", "rtdetr", ""}, {"RF-DETR", "yolo", "rfdetr_nano"}, {"SAM", "sam", ""}, {"MCC 3D", "mcc", ""},
             {"Super-res", "sr", ""}, {"Game upscaling", "game", ""}};
 
