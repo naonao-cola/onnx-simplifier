@@ -1239,6 +1239,9 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
             real[step_name] = (q["consumer_int8_scale"], 0.0)
         else:
             real[step_name] = (q["scale"], float(q["zero_point"]))
+        if "consumer_int8_scale" in q and name + mre.I8 in old:
+            # a uint8 tensor the MatMul requantizes: its int8 view
+            real[step_name + mre.I8] = (q["consumer_int8_scale"], 0.0)
     try:
         new = mre.step_node_scales(entry, old, real)
         mre.recalibrate(mre.load_model(entry["axmodel"]), old, new)
