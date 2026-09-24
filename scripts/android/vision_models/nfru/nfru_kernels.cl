@@ -44,6 +44,28 @@ __kernel void colour_luma(__global const float* lin, float expo, int H, int W, _
   y8[i] = (uchar)to_u8f(0.25f * ((c.x + 2.0f * c.y) + c.z));
 }
 
+// the same from a linear RGBA32F image (e.g. NSS's linear output, for NSS + NFRU)
+__kernel void colour_luma_img(__read_only image2d_t lin, float expo, int H, int W, __write_only image2d_t rgb,
+                              __global uchar* y8) {
+  int y = get_global_id(1), x = get_global_id(0);
+  if (y >= H || x >= W) return;
+  float4 c = read_imagef(lin, NEAREST, (int2)(x, y));
+  c.w = 0.0f;
+  c = clamp(c * expo, 0.0f, HALF_MAX);
+  c = clamp(c * (1.0f / (1.0f + c)), 0.0f, 1.0f);
+  write_imagef(rgb, (int2)(x, y), c);
+  y8[y * W + x] = (uchar)to_u8f(0.25f * ((c.x + 2.0f * c.y) + c.z));
+}
+
+// a linear RGBA image -> RGBA8 for display (exposure, reinhard): e.g. the renderer's native low-res frame
+__kernel void tonemap8(__read_only image2d_t lin, float expo, int H, int W, __global uchar4* out) {
+  int y = get_global_id(1), x = get_global_id(0);
+  if (y >= H || x >= W) return;
+  float4 c = fmax(read_imagef(lin, NEAREST, (int2)(x, y)) * expo, 0.0f);
+  c = clamp(c * (1.0f / (1.0f + c)), 0.0f, 1.0f);
+  out[y * W + x] = convert_uchar4_sat_rte((float4)(c.xyz, 1.0f) * 255.0f);
+}
+
 // the luma alone, from an already colour-processed image
 __kernel void luma8(__global const float* rgb, int n, __global uchar* y8) {
   int i = get_global_id(0);

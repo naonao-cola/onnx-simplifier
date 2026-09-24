@@ -9,10 +9,12 @@
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 #   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
+#   GAME=<game_seq.py --out dir, e.g. ~/.cache/arm-nss/game> ./deploy.sh   the game-upscaling mode (NSS + NFRU)
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.SamActivity [--es mode images] [--es tap 0.5,0.5]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.SrActivity [--es mode images] [--es ref original]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.GameActivity [--ez nfru true]
 #
 # Files go to the app's *internal* files dir through `run-as` (the APK is debuggable): files adb
 # puts under /sdcard/Android/data/<pkg> are owned by the shell user and unreadable by the app.
@@ -103,6 +105,21 @@ if [ -n "${SR:-}" ]; then
       "${A[@]}" push -q "$SR/${m}_$hw/$p.onnx" "$STAGE/sr/$b"
       RA "cmp -s $STAGE/sr/$b files/models/$b || { cp $STAGE/sr/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
     done
+  done
+fi
+# Game-upscaling mode: the replay sequence from game_seq.py (GAME=its --out dir, e.g. ~/.cache/arm-nss/game:
+# game_seq.bin + Arm's license) and the two int8 networks, NSS's CNN (NSS_ONNX, default
+# ~/.cache/arm-nss/onnx/cnn_int8_qat.onnx) and NFRU's (NFRU_ONNX, default ~/.cache/arm-nfru/onnx/net_int8_qat.onnx)
+if [ -n "${GAME:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/game"
+  "${A[@]}" push -q "$GAME/game_seq.bin" "$GAME/LICENSE_Arm_AI_Model_Community.pdf" "$STAGE/game/"
+  "${A[@]}" push -q "${NSS_ONNX:-$HOME/.cache/arm-nss/onnx/cnn_int8_qat.onnx}" "$STAGE/game/game_nss_cnn.onnx"
+  "${A[@]}" push -q "${NFRU_ONNX:-$HOME/.cache/arm-nfru/onnx/net_int8_qat.onnx}" "$STAGE/game/game_nfru_net.onnx"
+  for b in game_seq.bin LICENSE_Arm_AI_Model_Community.pdf; do
+    RA "cmp -s $STAGE/game/$b files/models/$b || cp $STAGE/game/$b files/models/"
+  done
+  for b in game_nss_cnn.onnx game_nfru_net.onnx; do
+    RA "cmp -s $STAGE/game/$b files/models/$b || { cp $STAGE/game/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
 if [ -n "${IMGS:-}" ]; then

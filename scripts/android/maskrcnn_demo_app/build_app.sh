@@ -8,7 +8,7 @@
 # 2. the three Hexagon FastRPC skels + their ARM stubs, built by ../e2e_pipeline/build.sh (BUILD_ONLY)
 # 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so,
 #    native/{yolo,sam,sr}_engine.cpp -> lib{yolo,sam,sr}_demo.so, native/rtdetr_engine.cpp (+ the ../msda_hvx
-#    skel) -> librtdetr_demo.so, libmsda_rpc.so
+#    skel) -> librtdetr_demo.so, libmsda_rpc.so, native/game_engine.cpp (NSS + NFRU, OpenCL) -> libgame_demo.so
 # 4. everything into app/src/main/jniLibs/arm64-v8a, then gradle assembleDebug (offline).
 set -euo pipefail
 : "${HEXAGON_SDK_ROOT:?}" "${HEXAGON_TOOLCHAIN:?}"
@@ -36,6 +36,20 @@ for e in yolo sam sr; do
     -o "$J/lib${e}_demo.so" "$HERE/native/${e}_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog \
     -Wl,--no-undefined
 done
+# Game-upscaling mode: NSS + NFRU (../vision_models/{nss,nfru}); their OpenCL kernel sources are compiled
+# in as strings (game_cl.h), the vendor libOpenCL.so is dlopen'ed at run time (../vision_models/nss/cl_dl.h;
+# CL_HEADERS: the Khronos OpenCL headers, default /usr/include)
+VM="$HERE/../vision_models"
+python3 - "$VM/nss/nss_kernels.cl" "$VM/nfru/nfru_kernels.cl" > "$B/game_cl.h" <<'PY'
+import sys
+for name, path in (("NSS_CL", sys.argv[1]), ("NFRU_CL", sys.argv[2])):
+    src = open(path).read()
+    assert ")CLSRC\"" not in src
+    print(f'static const char {name}[] = R"CLSRC({src})CLSRC";')
+PY
+"$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" -I "$B" \
+  -I "$VM/nss" -I "${CL_HEADERS:-/usr/include}" -o "$J/libgame_demo.so" "$HERE/native/game_engine.cpp" \
+  -L "$QS/libs" -lonnxruntime -ljnigraphics -llog -ldl -Wl,--no-undefined
 # RT-DETR mode: the MSDA skel + stub (../msda_hvx, BUILD_ONLY) and the engine, which #includes
 # ../vision_models/rtdetr/msda_hvx/dec_run.cpp
 OUT="$B/msda" BUILD_ONLY=1 NDK_CLANG="$NDK/aarch64-linux-android29-clang" "$HERE/../msda_hvx/build.sh"
