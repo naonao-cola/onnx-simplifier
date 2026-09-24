@@ -118,7 +118,8 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     records = sr.load_records()
     segs, host = sr.build_plan(model, records, calib)
     everything, _ = sr.build_plan(model, records, calib, include_unsafe=True)
-    covered = sum(len(s.nodes) for s in everything)
+    # a node inside two chains is recomputed by both: count it once
+    covered = len({n for s in everything for n in s.nodes})
     assert (
         covered
         == sr.axb.coverage_report(records, calibration=calib)["totals"]["covered"]
@@ -126,8 +127,8 @@ def test_plan_covers_the_validated_nodes_and_no_reshape_is_unsafe():
     unsafe = [s for s in everything if s.unsafe]
     # signed Reshapes take the Reshape -> Identity templates, so none is unsafe
     assert not any(s.kind == "reshape" for s in unsafe)
-    assert sum(len(s.nodes) for s in segs) == covered - sum(
-        len(s.nodes) for s in unsafe
+    assert len({n for s in segs for n in s.nodes}) == covered - len(
+        {n for s in unsafe for n in s.nodes}
     )
 
 

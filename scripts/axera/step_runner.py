@@ -217,11 +217,11 @@ def _segment_for(
                 inv[a] = inv[src]
         t_in = [inv[i.name] for i in tmpl.graph.input]
         t_out = [inv[o.name] for o in tmpl.graph.output if o.name not in aliases]
-        internal = [
-            s
-            for s, t in entry["names"].items()
-            if t not in {i.name for i in tmpl.graph.input}
-        ]
+        # A ``__pre`` input stands for its step tensor (the template's Relu
+        # is template-only), so that tensor is an input, not computed here.
+        t_inputs = {i.name for i in tmpl.graph.input}
+        t_inputs |= {src for a, src in aliases.items() if a in t_inputs}
+        internal = [s for s, t in entry["names"].items() if t not in t_inputs]
         producers = {o: n.name for n in model.graph.node for o in n.output}
         nodes = sorted({producers[t] for t in internal if t in producers})
 
@@ -445,12 +445,28 @@ def build_plan(
             continue
         candidates.append(seg)
     # multi-node segments (chains, fused pairs) claim their nodes first
+    # A node inside two chains (the fc Squeeze feeds both the forward Gemm
+    # chain and the fc dW chain) is recomputed by each; only a clash on a
+    # node whose output a segment exports keeps the smaller segment out.
+    exported: dict[str, set[str]] = {}
+    for seg in candidates:
+        exported[seg.name] = {
+            n.name for n in model.graph.node if set(n.output) & set(seg.outputs)
+        }
+    claimed: dict[str, str] = {}
     for seg in sorted(candidates, key=lambda s: -len(s.nodes)):
-        if taken & set(seg.nodes):
+        clash = [
+            n
+            for n in taken & set(seg.nodes)
+            if n in exported[seg.name] or n in exported[claimed[n]]
+        ]
+        if clash:
             for n in seg.nodes:
                 host.setdefault(n, f"covered, but inside another segment ({seg.name})")
             continue
         segs.append(seg)
+        for n in seg.nodes:
+            claimed.setdefault(n, seg.name)
         taken.update(seg.nodes)
     order = {r["name"]: k for k, r in enumerate(records)}
     segs.sort(key=lambda s: max(order.get(n, 0) for n in s.nodes))

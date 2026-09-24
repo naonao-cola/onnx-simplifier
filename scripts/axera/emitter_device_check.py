@@ -173,7 +173,12 @@ def retarget_config(cfg: QConfig, new: Mapping[str, tuple[float, int]]) -> QConf
     ``(scale, zero_point)`` (keeping the quantization range)."""
     out = QConfig()
     for (op, t), q in cfg.inputs.items():
-        out.inputs[(op, t)] = (*new[t], q[2], q[3]) if t in new else q
+        # A consumer that reads a uint8 tensor as int8 (a dX kernel Reshape
+        # reading the weight) has its own scale: ``t#i8`` (quant_scales).
+        if q[2] < 0 and t + mre.I8 in new:
+            out.inputs[(op, t)] = (*new[t + mre.I8], q[2], q[3])
+        else:
+            out.inputs[(op, t)] = (*new[t], q[2], q[3]) if t in new else q
     for t, q in cfg.outputs.items():
         out.outputs[t] = (*new[t], q[2], q[3]) if t in new else q
     return out
