@@ -106,5 +106,8 @@ python ref.py weights --out $W/weights                      # the app: MCC_HMX=$
   (`../hmx_gemm`), so the MACs stay at one context's rate.
 - `set_kv` packs K / V on the DSP in 66 ms (scalar); the app packs them on the CPU instead
   (`set_kv_tiles`).
-- Generalize with tinygrad (its HMX TensorCore codegen, `../tinygrad_hexagon_bridge/tinygrad_codegen/hmx`):
-  these kernels are the target to match.
+- **Generalizing with tinygrad: `tg/`** -- the same block as plain tinygrad Tensor code through the onnxsim/tinygrad
+  fork's DSP backend, captured and replayed on hexagon-sim (real HMX, per-kernel check against the CPU backend) and the
+  phone. Running it fixed three fork bugs (single-K-tile HMX ops, the A-panel prefetch that faulted the phone, scalar
+  transcendentals on v69: onnxsim/tinygrad#7); correct at 1024 queries, 572 ms per block vs this kernel's 2.6. `tg/README.md`
+  has the remaining gap (reductions laid out across rows, HMX operands packed from DDR per call, no fusion, one thread).
