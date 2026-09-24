@@ -1,9 +1,13 @@
-/* mcc_hmx_client <uri> <data dir> <Q> <blocks> [iters] [hvx mask, default 30 = all] [threads, default 4]: load ref.py's packed blocks into the skel, run
- * them on x0 and compare with the float64 reference of the last block; prints per-phase times. */
+/* mcc_hmx_client <uri> <data dir> <Q> <blocks> [iters] [hvx mask, default 30 = all] [threads, default 4]:
+ *   load ref.py's packed blocks into the skel, run them on x0 and compare with the float64 reference of
+ *   the last block; prints per-phase times.
+ * mcc_hmx_client <uri> <data dir> decode <Q> [iters] [hvx] [threads]:
+ *   the whole decoder (load_head, set_kv from kv.bin, decode xyz.bin) vs ref_occ / ref_rgb. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "mcc_hmx_rpc.h"
 #include "remote.h"
@@ -22,7 +26,53 @@ static void* slurp(const char* dir, const char* name, size_t* n) {
   fclose(f);
   return b;
 }
-static const char* PH[] = {"layernorm", "weight copy", "qkv", "S=qK", "softmax", "PV", "self term", "proj", "fc1", "fc2", "wait/sync", "gelu"};
+static const char* PH[] = {"layernorm", "weight copy", "qkv/pos", "S=qK", "softmax/color", "PV", "self term", "proj", "fc1", "fc2/pred", "wait/sync", "gelu"};
+static int decode_mode(remote_handle64 h, const char* dir, int argc, char** argv) {
+  int q = atoi(argv[4]), iters = argc > 5 ? atoi(argv[5]) : 3, hvx = argc > 6 ? atoi(argv[6]) : 30, nthr = argc > 7 ? atoi(argv[7]) : 4;
+  size_t n;
+  void* head = slurp(dir, "head.bin", &n);
+  int rc = mcc_hmx_rpc_load_head(h, head, (int)n);
+  float* kv = slurp(dir, "kv.bin", &n);
+  const int kvn = (int)(n / 8);
+  struct timespec a, b;
+  clock_gettime(CLOCK_MONOTONIC, &a);
+  rc |= mcc_hmx_rpc_set_kv(h, kv, kvn, kv + kvn, kvn) << 8;
+  clock_gettime(CLOCK_MONOTONIC, &b);
+  const double kv_ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+  float* xyz = slurp(dir, "xyz.bin", &n);
+  float *ro = slurp(dir, "ref_occ.bin", &n), *rr = slurp(dir, "ref_rgb.bin", &n);
+  float *occ = malloc(q * 4), *rgb = malloc(q * 12);
+  uint64 t[13];
+  int codes[6];
+  double wall = 0;
+  for (int it = 0; it < iters; it++) {
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    rc |= mcc_hmx_rpc_decode(h, q, hvx, nthr, xyz, q * 3, occ, q, rgb, q * 3, t, 13, codes, 6) << 16;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    if (it) wall += (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+  }
+  /* colors matter where a point is kept: max over p > 0.1, mean over all */
+  double eo = 0, er = 0, em = 0;
+  int flip = 0, occd = 0;
+  for (int i = 0; i < q; i++) {
+    eo = fabs(occ[i] - ro[i]) > eo ? fabs(occ[i] - ro[i]) : eo;
+    const int x = 1 / (1 + exp(-occ[i])) > 0.3, y = 1 / (1 + exp(-ro[i])) > 0.3;
+    flip += x != y, occd += y;
+    for (int c = 0; c < 3; c++) {
+      const double d = fabs(rgb[i * 3 + c] - rr[i * 3 + c]);
+      em += d / (3.0 * q);
+      if (1 / (1 + exp(-ro[i])) > 0.1) er = d > er ? d : er;
+    }
+  }
+  printf("rc %d ctx %d hvx %d hmx %d vtcm %d thread %d | set_kv %.2f ms (wall)\n", rc, codes[0], codes[1], codes[2], codes[3], codes[4], kv_ms);
+  printf("decode Q=%d, %d threads: %s occ logit max abs err %.4g, p>0.3 differ %d of %d (%d occupied), rgb err mean %.2f/255, max (p>0.1) %.2f/255;"
+         " DSP %.3f ms, wall %.3f ms per call\n",
+         q, nthr, flip <= q / 100 && em < 1.0 / 255 ? "PASS" : "FAIL", eo, flip, q, occd, em * 255, er * 255, t[0] / 1e3,
+         iters > 1 ? wall / (iters - 1) : 0);
+  for (int i = 0; i < 12; i++) printf("  %-13s %8.3f ms\n", PH[i], t[1 + i] / 1.5e6);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 5) return 2;
   const char* dir = argv[2];
@@ -34,6 +84,8 @@ int main(int argc, char** argv) {
   if (rc) { printf("open failed %d\n", rc); return 1; }
   int prc = 0;
   mcc_hmx_rpc_perf_vote(h, 3, &prc);
+  const int dec = !strcmp(argv[3], "decode");
+  if (dec) nb = 8;
   for (int b = 0; b < nb; b++) {
     char n[32];
     size_t len;
@@ -42,6 +94,11 @@ int main(int argc, char** argv) {
     rc = mcc_hmx_rpc_load_block(h, b, blob, (int)len);
     free(blob);
     if (rc) { printf("load_block %d rc %d\n", b, rc); return 1; }
+  }
+  if (dec) {
+    decode_mode(h, dir, argc, argv);
+    mcc_hmx_rpc_close(h);
+    return 0;
   }
   size_t xl, rl;
   uint16_t* x = slurp(dir, "x0.bin", &xl);

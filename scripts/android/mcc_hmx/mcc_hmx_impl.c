@@ -8,12 +8,13 @@
 #include "mcc_hmx_rpc.h"
 #include "qurt.h"
 #define MB_NOW() qurt_get_core_pcycles()
-#include "mcc_block.h"
+#include "mcc_decoder.h"
 
 extern unsigned long long HAP_perf_get_time_us(void);
 
-#define MAXB 8
+#define MAXB MB_BLOCKS
 static uint8_t* g_blob[MAXB];
+static uint8_t* g_head;
 
 int mcc_hmx_rpc_open(const char* uri, remote_handle64* h) {
   *h = (remote_handle64)(uintptr_t)malloc(1);
@@ -60,10 +61,43 @@ int mcc_hmx_rpc_load_block(remote_handle64 h, int idx, const unsigned char* blob
   return 0;
 }
 
+int mcc_hmx_rpc_load_head(remote_handle64 h, const unsigned char* blob, int len) {
+  if ((size_t)len != mb_head_bytes()) return AEE_EBADPARM;
+  if (!g_head) g_head = memalign(4096, len);
+  if (!g_head) return AEE_ENOMEMORY;
+  memcpy(g_head, blob, len);
+  return 0;
+}
+
+int mcc_hmx_rpc_set_kv(remote_handle64 h, const float* k, int kLen, const float* v, int vLen) {
+  const int n = MB_BLOCKS * MB_HEADS * MB_SEEN * 32;
+  if (kLen != n || vLen != n) return AEE_EBADPARM;
+  mb_hf *kt[MB_BLOCKS], *vt[MB_BLOCKS];
+  for (int b = 0; b < MB_BLOCKS; b++) {
+    if (!g_blob[b]) return AEE_EBADSTATE;
+    kt[b] = mb_blob_kt(g_blob[b]), vt[b] = mb_blob_vt(g_blob[b]);
+  }
+  mb_pack_kv(kt, vt, k, v);
+  return 0;
+}
+
+int mcc_hmx_rpc_set_kv_tiles(remote_handle64 h, const uint16* tiles, int len) {
+  const size_t per = (size_t)2 * MB_HEADS * MB_ST * MB_TH; /* halfwords per block */
+  if ((size_t)len != per * MB_BLOCKS) return AEE_EBADPARM;
+  for (int b = 0; b < MB_BLOCKS; b++) {
+    if (!g_blob[b]) return AEE_EBADSTATE;
+    memcpy(mb_blob_kt(g_blob[b]), tiles + per * b, per * 2); /* kt then vt: adjacent in the blob */
+  }
+  return 0;
+}
+
 typedef struct {
   unsigned int ctx;
   uint8_t* vtcm;
-  int q, nb, iters, hvx, nthr;
+  int q, nb, iters, hvx, nthr, mode; /* mode 0: run (blocks on x), 1: decode (xyz -> occ, rgb) */
+  const float* xyz;
+  float *occ, *rgb;
+  mb_head hd;
   const uint16_t* x;
   uint16_t* y;
   uint64* t;
@@ -105,19 +139,24 @@ static void worker(void* p) {
       if (tid == 0) {
         mb_layout(&j->c, j->vtcm, j->q, g_pself);
         j->c.hvx = j->hvx, j->c.nthr = j->nthr, j->c.sync = bar_wait, j->c.sync_arg = &j->bar;
-        for (int r = 0; r < j->q; r++)
-          for (int d = 0; d < MB_D; d++) *mb_at(j->c.x, MB_KT, r, d) = j->x[(size_t)r * MB_D + d];
+        if (j->mode == 0)
+          for (int r = 0; r < j->q; r++)
+            for (int d = 0; d < MB_D; d++) *mb_at(j->c.x, MB_KT, r, d) = j->x[(size_t)r * MB_D + d];
         t0 = HAP_perf_get_time_us();
       }
       qurt_barrier_wait(&j->bar);
-      for (int b = 0; b < j->nb; b++) mb_block(&j->c, &j->w[b], tid);
+      if (j->mode == 1)
+        mb_decode(&j->c, &j->hd, j->w, j->xyz, j->occ, j->rgb, tid);
+      else
+        for (int b = 0; b < j->nb; b++) mb_block(&j->c, &j->w[b], tid);
       if (tid == 0) tsum += HAP_perf_get_time_us() - t0;
     }
     if (tid == 0) {
       j->t[0] = tsum / j->iters;
       for (int i = 0; i < MB_NPROF; i++) j->t[1 + i] = j->c.prof[i];
-      for (int r = 0; r < j->q; r++)
-        for (int d = 0; d < MB_D; d++) j->y[(size_t)r * MB_D + d] = *mb_at(j->c.x, MB_KT, r, d);
+      if (j->mode == 0)
+        for (int r = 0; r < j->q; r++)
+          for (int d = 0; d < MB_D; d++) j->y[(size_t)r * MB_D + d] = *mb_at(j->c.x, MB_KT, r, d);
     }
   }
   if (tid == 0 && j->codes[2] == 0) HAP_compute_res_hmx_unlock(j->ctx);
@@ -125,39 +164,28 @@ static void worker(void* p) {
   qurt_thread_exit(0);
 }
 
-int mcc_hmx_rpc_run(remote_handle64 h, int q, int nb, int iters, int hvx, int nthr, const uint16* x, int xLen, uint16* y, int yLen, uint64* t,
-                    int tLen, int* codes, int codesLen) {
-  if (q <= 0 || q > 1024 || q % 32 || nb < 1 || nb > MAXB || xLen < q * MB_D || yLen < q * MB_D || tLen < 1 + MB_NPROF ||
-      codesLen < 6 || iters < 1 || nthr < 1 || nthr > MAXT)
-    return AEE_EBADPARM;
-  for (int b = 0; b < nb; b++)
-    if (!g_blob[b]) return AEE_EBADSTATE;
-  memset(t, 0, tLen * sizeof(uint64));
-  memset(codes, 0, codesLen * sizeof(int));
-  const size_t need = 7u << 20; /* mcc_block.h layout: up to 6 MB + weight buffer + tables */
+/* acquire VTCM + HMX, run job `j` on nthr SPMD threads, release */
+static void launch(job_t* j, int nthr, int* codes) {
+  const size_t need = 7u << 20; /* mcc_block.h layout: up to 6.4 MB */
   compute_res_attr_t attr;
   HAP_compute_res_attr_init(&attr);
   HAP_compute_res_attr_set_vtcm_param_v2(&attr, need, 0, 0);
   HAP_compute_res_attr_set_hmx_param(&attr, 1);
   unsigned int ctx = HAP_compute_res_acquire(&attr, 100000);
   codes[0] = (int)ctx;
-  if (!ctx) return 0;
+  if (!ctx) return;
   void* vp = NULL;
   unsigned int vs = 0;
   HAP_compute_res_attr_get_vtcm_ptr_v2(&attr, &vp, &vs);
   codes[3] = (int)vs;
   if (vp && vs >= need) {
-    static job_t j;
-    memset(&j, 0, sizeof j);
-    j.ctx = ctx, j.vtcm = (uint8_t*)vp, j.q = q, j.nb = nb, j.iters = iters, j.hvx = hvx, j.nthr = nthr;
-    j.x = x, j.y = y, j.t = t, j.codes = codes;
-    for (int b = 0; b < nb; b++) mb_bind(&j.w[b], g_blob[b]);
-    qurt_barrier_init(&j.bar, nthr);
+    j->ctx = ctx, j->vtcm = (uint8_t*)vp, j->nthr = nthr, j->codes = codes;
+    qurt_barrier_init(&j->bar, nthr);
     targ_t ta_[MAXT];
     qurt_thread_t tids[MAXT];
     int n = 0;
     for (; n < nthr; n++) {
-      ta_[n].j = &j, ta_[n].tid = n;
+      ta_[n].j = j, ta_[n].tid = n;
       qurt_thread_attr_t ta;
       qurt_thread_attr_init(&ta);
       qurt_thread_attr_set_stack_addr(&ta, g_stack[n]);
@@ -169,9 +197,46 @@ int mcc_hmx_rpc_run(remote_handle64 h, int q, int nb, int iters, int hvx, int nt
       int st;
       qurt_thread_join(tids[i], &st);
     }
-    qurt_barrier_destroy(&j.bar);
+    qurt_barrier_destroy(&j->bar);
   } else
     codes[4] = -1;
   HAP_compute_res_release(ctx);
+}
+
+static job_t g_job;
+
+int mcc_hmx_rpc_decode(remote_handle64 h, int q, int hvx, int nthr, const float* xyz, int xyzLen, float* occ, int occLen, float* rgb, int rgbLen,
+                       uint64* t, int tLen, int* codes, int codesLen) {
+  if (q <= 0 || q > 1024 || q % 32 || xyzLen < q * 3 || occLen < q || rgbLen < q * 3 || tLen < 1 + MB_NPROF || codesLen < 6 || nthr < 1 ||
+      nthr > MAXT)
+    return AEE_EBADPARM;
+  if (!g_head) return AEE_EBADSTATE;
+  for (int b = 0; b < MB_BLOCKS; b++)
+    if (!g_blob[b]) return AEE_EBADSTATE;
+  memset(t, 0, tLen * sizeof(uint64));
+  memset(codes, 0, codesLen * sizeof(int));
+  job_t* j = &g_job;
+  memset(j, 0, sizeof *j);
+  j->q = q, j->nb = MB_BLOCKS, j->iters = 1, j->hvx = hvx, j->mode = 1, j->xyz = xyz, j->occ = occ, j->rgb = rgb, j->t = t;
+  for (int b = 0; b < MB_BLOCKS; b++) mb_bind(&j->w[b], g_blob[b]);
+  mb_bind_head(&j->hd, g_head);
+  launch(j, nthr, codes);
+  return 0;
+}
+
+int mcc_hmx_rpc_run(remote_handle64 h, int q, int nb, int iters, int hvx, int nthr, const uint16* x, int xLen, uint16* y, int yLen, uint64* t,
+                    int tLen, int* codes, int codesLen) {
+  if (q <= 0 || q > 1024 || q % 32 || nb < 1 || nb > MAXB || xLen < q * MB_D || yLen < q * MB_D || tLen < 1 + MB_NPROF ||
+      codesLen < 6 || iters < 1 || nthr < 1 || nthr > MAXT)
+    return AEE_EBADPARM;
+  for (int b = 0; b < nb; b++)
+    if (!g_blob[b]) return AEE_EBADSTATE;
+  memset(t, 0, tLen * sizeof(uint64));
+  memset(codes, 0, codesLen * sizeof(int));
+  job_t* j = &g_job;
+  memset(j, 0, sizeof *j);
+  j->q = q, j->nb = nb, j->iters = iters, j->hvx = hvx, j->mode = 0, j->x = x, j->y = y, j->t = t;
+  for (int b = 0; b < nb; b++) mb_bind(&j->w[b], g_blob[b]);
+  launch(j, nthr, codes);
   return 0;
 }

@@ -17,6 +17,7 @@ QURT_INC=(-I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/qurt" -I "$HE
   "${INC[@]}" "${QURT_INC[@]}" -o impl.o mcc_hmx_impl.c
 LIBPATH="$HEXAGON_TOOLCHAIN/target/hexagon/lib/$HEX_ARCH/G0"
 "$HEXAGON_TOOLCHAIN/bin/hexagon-link" -Bdynamic -shared -export-dynamic -o mcc_hmx_rpc.so skel.o impl.o "$LIBPATH/pic/libgcc.so"
+"$NDK_CLANG" -O2 -c "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o mcc_hmx_stub.o mcc_hmx_rpc_stub.c  # for other clients (the demo app)
 "$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o mcc_hmx_client mcc_hmx_client.c -lm mcc_hmx_rpc_stub.c \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
 echo "built $OUT/mcc_hmx_rpc.so $OUT/mcc_hmx_client"

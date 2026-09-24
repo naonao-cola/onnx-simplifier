@@ -253,12 +253,16 @@ static void mb_copy_job(mb_ctx* x, const mb_job* j, int buf) {
 /* thread 0: job j's HMX work from buffer buf. C[:, cb] = A . W_cb + table (+ the C tile itself for
  * MB_RESID: its tile times the identity is one more K tile) */
 static void mb_hmx_job(mb_ctx* x, const mb_job* j, int buf) {
+#ifdef __hexagon__
   hmx_blk_set_table(x->tbuf[buf]);
   for (int rb = j->rb0; rb < j->rb0 + j->nrb; rb++) {
     hmx_blk_mac_f16(j->a + rb * j->a_stride, x->wbuf[buf], j->kt);
     if (j->mode == MB_RESID) hmx_blk_mac_f16(j->c + rb * j->c_stride, x->ident, 1);
     hmx_blk_store_f16(j->c + rb * j->c_stride);
   }
+#else /* host builds (the app's ARM side) only use the packing helpers */
+  (void)x, (void)j, (void)buf;
+#endif
 }
 
 /* A phase of n jobs. Thread 0 runs the HMX side; with >= 2 threads thread 1 copies ahead (double

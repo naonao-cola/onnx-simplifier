@@ -1,11 +1,15 @@
 """MCC decoder blocks on HMX + HVX: host-side data (packed weights, inputs, float64 references).
 
   python ref.py export --out <dir> [--q 128] [--blocks 8]
+  python ref.py weights --out <dir>          just blk0..7.bin + head.bin (what the demo app loads)
 
-Writes <dir>/blk<i>.bin (every block's weights prepacked into HMX tiles, see pack_w / BLOCK_LAYOUT),
-<dir>/x0.bin (the query chunk after the positional embedding, fp16 row-major [Q, 512]) and the float64
-references ref_attn<i>.bin / ref_out<i>.bin (fp32, [Q, 512]) of every block run on the fp16-rounded
-input of block 0, block by block (each block's reference input is the previous reference output).
+Writes <dir>/blk<i>.bin (every block's weights prepacked into HMX tiles, see tiles / BLOCK_LAYOUT),
+<dir>/head.bin (positional embedding, final LayerNorm, prediction layer: HEAD_LAYOUT), <dir>/x0.bin
+(the query chunk after the positional embedding, fp16 row-major [Q, 512]), the float64 references
+ref_attn<i>.bin / ref_out<i>.bin (fp32, [Q, 512]) of every block run on the fp16-rounded input of block
+0 (each block's reference input is the previous reference output), and for the whole decoder:
+xyz.bin (fp32 [Q, 3]), kv.bin (fp32 k then v, [8, 16, 197, 32] each: what set_kv takes) and
+ref_occ.bin / ref_rgb.bin (fp32 [Q] / [Q, 3], float64 model.QueryDecoder).
 
 Queries: the first Q of the demo app's quest2m level-2 (surface) query set, K/V: its encoder cache
 (../vision_models/mcc/dec_opt.py prep) -- real data, not random.
@@ -102,6 +106,35 @@ def pack_block(blk, k, v):
     return b"".join(np.ascontiguousarray(f[n]).tobytes() for n in BLOCK_LAYOUT)
 
 
+# the decoder's ends, in file order (mcc_decoder.h reads the same order)
+HEAD_LAYOUT = [
+    "wpos",  # [16 cb][1 kb] tiles: the 3 -> 512 positional embedding, K padded 3 -> 32
+    "tpos",  # [16][64] u32 tables
+    "lnf",  # [2][512] fp16: the final LayerNorm (decoder_norm) gamma, beta
+    "wpred",  # [25 cb][16 kb] tiles: decoder_pred with its columns reordered (PRED_ORDER), 769 -> 800
+    "tpred",  # [25][64]
+]
+# pred output columns: color channel c's 256 logits at 256 c .. 256 c + 255 (8 whole tiles each), the
+# occupancy logit at 768 (upstream order: occupancy at 0, then the 3 x 256 color logits)
+PRED_ORDER = list(range(1, 769)) + [0]
+
+
+def pack_head(m):
+    f = {}
+    wp = np.zeros((32, D), np.float32)
+    wp[:3] = m.decoder_xyz_pos_embed.pos_embed.weight.detach().numpy().T
+    f["wpos"] = tiles(wp, "cr")
+    f["tpos"] = table(m.decoder_xyz_pos_embed.pos_embed.bias.detach().numpy())
+    f["lnf"] = np.stack([m.decoder_norm.weight.detach().numpy(), m.decoder_norm.bias.detach().numpy()]).astype(np.float16)
+    w = np.zeros((D, 800), np.float32)
+    b = np.zeros(800, np.float32)
+    w[:, :769] = m.decoder_pred.weight.detach().numpy().T[:, PRED_ORDER]
+    b[:769] = m.decoder_pred.bias.detach().numpy()[PRED_ORDER]
+    f["wpred"] = tiles(w, "cr")
+    f["tpred"] = table(b)
+    return b"".join(np.ascontiguousarray(f[n]).tobytes() for n in HEAD_LAYOUT)
+
+
 def block_ref(blk, x, k, v):
     """float64 block forward (model.QueryDecoder's per-block math) -> (after attention, after MLP)"""
     a = blk.attn
@@ -131,18 +164,39 @@ def cmd_export(a):
         xa, x = block_ref(md.decoder_blocks[i], x, torch.from_numpy(k).double(), torch.from_numpy(v).double())
         xa.float().numpy().reshape(a.q, D).tofile(out / f"ref_attn{i}.bin")
         x.float().numpy().reshape(a.q, D).tofile(out / f"ref_out{i}.bin")
-    print(f"{a.blocks} blocks, Q={a.q} -> {out} ({(out / 'blk0.bin').stat().st_size} B per block)")
+    (out / "head.bin").write_bytes(pack_head(m))
+    xyz.numpy().reshape(a.q, 3).astype(np.float32).tofile(out / "xyz.bin")
+    np.concatenate([kv["k"].astype(np.float32).ravel(), kv["v"].astype(np.float32).ravel()]).tofile(out / "kv.bin")
+    occ, rgb = M.QueryDecoder(md).eval()(xyz.double(), torch.from_numpy(kv["k"]).double(), torch.from_numpy(kv["v"]).double())
+    occ.float().numpy().ravel().tofile(out / "ref_occ.bin")
+    rgb.float().numpy().reshape(a.q, 3).tofile(out / "ref_rgb.bin")
+    print(f"{a.blocks} blocks, Q={a.q} -> {out} ({(out / 'blk0.bin').stat().st_size} B per block, head {(out / 'head.bin').stat().st_size} B)")
+
+
+def cmd_weights(a):
+    """blocks + head only; each block's K / V slots hold zeros (the app fills them per image: set_kv)"""
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    torch.set_grad_enabled(False)
+    m = M.load_mcc(str(CKPT))
+    z = np.zeros((HEADS, SEEN, HD), np.float32)
+    for i in range(8):
+        (out / f"blk{i}.bin").write_bytes(pack_block(m.decoder_blocks[i], z, z))
+    (out / "head.bin").write_bytes(pack_head(m))
+    print(f"-> {out}: blk0..7.bin, head.bin")
 
 
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    w = sub.add_parser("weights")
+    w.add_argument("--out", required=True)
     e = sub.add_parser("export")
     e.add_argument("--out", required=True)
     e.add_argument("--q", type=int, default=128)
     e.add_argument("--blocks", type=int, default=8)
     a = ap.parse_args()
-    {"export": cmd_export}[a.cmd](a)
+    {"export": cmd_export, "weights": cmd_weights}[a.cmd](a)
 
 
 if __name__ == "__main__":

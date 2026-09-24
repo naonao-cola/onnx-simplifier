@@ -14,7 +14,7 @@ case "$1" in
     "${A[@]}" shell "mkdir -p $D/data"
     "${A[@]}" push "$B/mcc_hmx_client" "$B/mcc_hmx_rpc.so" "$MSDA_BUILD/msda_client" "$MSDA_BUILD/msda_rpc.so" $D/ >/dev/null
     "${A[@]}" push "$MSDA_CASE" "$D/case" >/dev/null
-    for f in "$2"/x0.bin "$2"/blk*.bin "$2"/ref_out*.bin; do "${A[@]}" push "$f" "$D/data/" >/dev/null; done
+    for f in "$2"/x0.bin "$2"/blk*.bin "$2"/ref_out*.bin "$2"/head.bin "$2"/kv.bin "$2"/xyz.bin "$2"/ref_occ.bin "$2"/ref_rgb.bin; do "${A[@]}" push "$f" "$D/data/" >/dev/null; done
     "${A[@]}" shell "chmod 755 $D/mcc_hmx_client $D/msda_client" ;;
   run)
     shift
