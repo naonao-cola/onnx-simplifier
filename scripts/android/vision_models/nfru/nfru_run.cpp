@@ -115,13 +115,23 @@ int main(int argc, char** argv) try {
     return m;
   };
   cl_mem nullmem = nullptr;
+  auto IMG = [&](int w, int h) {  // RGBA32F: the tonemapped colour, read through the texture path
+    cl_image_format f{CL_RGBA, CL_FLOAT};
+    cl_image_desc d{};
+    d.image_type = CL_MEM_OBJECT_IMAGE2D;
+    d.image_width = w;
+    d.image_height = h;
+    cl_mem m = p_clCreateImage(ctx, CL_MEM_READ_WRITE, &f, &d, nullptr, &err);
+    CK(err);
+    return m;
+  };
   // per rendered frame (two slots: m1 / p1): colour, pyramid, depth, normalized motion, the motion hint
   struct Frame {
     cl_mem lin, rgb, pyr[6], depth, mv_raw, mv, sy;
   } fr[2];
   for (auto& f : fr) {
     f.lin = B((size_t)3 * cH * cW * 4);
-    f.rgb = B((size_t)3 * cH * cW * 4);
+    f.rgb = IMG(cW, cH);
     for (int i = 0; i < 6; i++) f.pyr[i] = B((size_t)lv[i].h * lv[i].w);
     f.depth = B(H * W * 4);
     f.mv_raw = B(2 * H * W * 4);
@@ -148,15 +158,20 @@ int main(int argc, char** argv) try {
   auto set = [&](cl_kernel k, std::vector<Arg> args) {
     for (cl_uint i = 0; i < args.size(); i++) CK(p_clSetKernelArg(k, i, args[i].size, args[i].p));
   };
-  // enqueue a kernel (1-D if gy == 0), timed into the named stage
+  // enqueue a kernel (1-D if gy == 0), timed into the named stage; bm_match needs 16 x 16 work-groups
   std::vector<std::pair<std::string, cl_event>> evs;
+  const bool detail = getenv("NFRU_DETAIL") != nullptr;  // per-kernel times too
+  std::vector<std::string> names;
   auto run = [&](const char* stage, const char* name, std::vector<Arg> args, size_t gx, size_t gy = 0) {
     cl_kernel k = K(name);
     set(k, args);
-    size_t g[2] = {gx, gy};
+    size_t g[2] = {gx, gy}, l[2] = {16, 16};
+    const bool tiled = std::string(name) == "bm_match";
+    if (tiled) g[0] = (gx + 15) / 16 * 16, g[1] = (gy + 15) / 16 * 16;
     cl_event e;
-    CK(p_clEnqueueNDRangeKernel(q, k, gy ? 2 : 1, nullptr, g, nullptr, 0, nullptr, &e));
+    CK(p_clEnqueueNDRangeKernel(q, k, gy ? 2 : 1, nullptr, g, tiled ? l : nullptr, 0, nullptr, &e));
     evs.push_back({stage, e});
+    if (detail) names.push_back(name);
   };
   auto ev_ms = [&](cl_event e) {
     cl_ulong a, b;
@@ -214,8 +229,7 @@ int main(int argc, char** argv) try {
     CK(p_clFinish(q));
   };
   auto frame_work = [&](Frame& f) {
-    int n = cH * cW;
-    run("colour", "colour_luma", {A(f.lin), A(EXPO), A(n), A(f.rgb), A(f.pyr[0])}, n);
+    run("colour", "colour_luma", {A(f.lin), A(EXPO), A(cH), A(cW), A(f.rgb), A(f.pyr[0])}, cW, cH);
     for (int i = 1; i < 6; i++) {
       int blur = (i - 1) >= 1 && (i - 1) <= 4, quad = i == 5;
       run("pyramid", "pyr_down",
@@ -236,6 +250,7 @@ int main(int argc, char** argv) try {
     CK(p_clFinish(q));
     for (auto& e : evs) p_clReleaseEvent(e.second);
     evs.clear();
+    names.clear();
     for (int w = 0; w < windows; w++) {
       Frame &m1 = fr[w & 1], &p1 = fr[(w + 1) & 1];
       upload(w + 1, p1);
@@ -331,12 +346,16 @@ int main(int argc, char** argv) try {
       double post_wall = now_ms() - p0, gen_ms = now_ms() - f0;
       std::map<std::string, double> st;
       double sum = 0;
-      for (auto& [s, e] : evs) {
-        double ms = ev_ms(e);
-        st[s] += ms;
+      std::string det;
+      for (size_t i = 0; i < evs.size(); i++) {
+        double ms = ev_ms(evs[i].second);
+        st[evs[i].first] += ms;
         sum += ms;
+        if (detail) det += " " + names[i] + "=" + std::to_string(ms).substr(0, 5);
       }
       evs.clear();
+      names.clear();
+      if (detail) printf("   %s\n", det.c_str());
       printf("%3d %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", w, st["colour"], st["pyramid"], st["bm"],
              st["motion"], st["pre"], htp_ms, st["post"], sum, gen_ms);
       (void)pre_wall;

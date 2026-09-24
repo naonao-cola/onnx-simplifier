@@ -68,6 +68,30 @@ class NfruCL:
             self.ctx, self.cl.mem_flags.READ_WRITE, max(int(nbytes), 4)
         )
 
+    def img(self, planar=None, hw=None):
+        """An RGBA32F image: from a planar (1, 3, H, W) float array, or empty of size hw = (H, W)."""
+        cl = self.cl
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
+        if planar is None:
+            return cl.Image(
+                self.ctx, cl.mem_flags.READ_WRITE, fmt, shape=(hw[1], hw[0])
+            )
+        _, c, h, w = planar.shape
+        a = np.zeros((h, w, 4), np.float32)
+        a[..., :c] = planar[0].transpose(1, 2, 0)
+        return cl.Image(
+            self.ctx,
+            cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
+            fmt,
+            shape=(w, h),
+            hostbuf=a,
+        )
+
+    def img_get(self, im, h, w):  # -> planar (1, 3, H, W)
+        o = np.empty((h, w, 4), np.float32)
+        self.cl.enqueue_copy(self.q, o, im, origin=(0, 0), region=(w, h))
+        return o[..., :3].transpose(2, 0, 1)[None]
+
     def get(self, b, shape, dtype):
         o = np.empty(shape, dtype)
         self.cl.enqueue_copy(self.q, o, b)
@@ -85,7 +109,10 @@ class NfruCL:
                 cl_args.append(np.float32(a))
             else:
                 cl_args.append(a)
-        k(self.q, gsz, None, *cl_args)
+        lws = LWS.get(name)
+        if lws:
+            gsz = tuple(-(-g // w) * w for g, w in zip(gsz, lws))
+        k(self.q, gsz, lws, *cl_args)
 
     # --- the block matcher -------------------------------------------------------------------------------
     def pyramid(self, rgb):
@@ -165,6 +192,7 @@ class NfruCL:
         return r
 
 
+LWS = {"bm_match": (16, 16)}  # kernels with a required work-group size
 SEED0 = 12345  # nfru.py golden: seed = SEED0 + the window's centre frame
 
 
@@ -180,9 +208,9 @@ def check_stages(g: NfruCL, z, report):
     # the colour pipeline (exposure exp(2), clamp, reinhard) + luma, from the frame's linear rgb
     lin = linear_rgb(int(z["seed"]) - SEED0 - 1)
     _, _, cH, cW = lin.shape
-    rgb, y8 = g.empty(3 * cH * cW * 4), g.empty(cH * cW)
-    g.run("colour_luma", (cH * cW,), g.buf(f32(lin)), EXPO, cH * cW, rgb, y8)
-    report("colour m1", g.get(rgb, (1, 3, cH, cW), np.float32), z["rgb_m1"])
+    rgb, y8 = g.img(hw=(cH, cW)), g.empty(cH * cW)
+    g.run("colour_luma", (cW, cH), g.buf(f32(lin)), EXPO, cH, cW, rgb, y8)
+    report("colour m1", g.img_get(rgb, cH, cW), z["rgb_m1"])
     # pyramid (templates = m1)
     pm, pp = g.pyramid(z["rgb_m1"]), g.pyramid(z["rgb_p1"])
     for lvl, (b, h, w, _, _) in enumerate(pm):
@@ -356,8 +384,8 @@ def check_stages(g: NfruCL, z, report):
         g.buf(f32(z["mv_t"])),
         H,
         W,
-        g.buf(f32(z["rgb_m1"])),
-        g.buf(f32(z["rgb_p1"])),
+        g.img(z["rgb_m1"]),
+        g.img(z["rgb_p1"]),
         cH,
         cW,
         g.buf(f32(z["depth_m1"])),
@@ -401,8 +429,8 @@ def check_stages(g: NfruCL, z, report):
         fw,
         PSC,
         PZP,
-        g.buf(f32(z["rgb_m1"])),
-        g.buf(f32(z["rgb_p1"])),
+        g.img(z["rgb_m1"]),
+        g.img(z["rgb_p1"]),
         cH,
         cW,
         T,
@@ -490,7 +518,7 @@ def closed_loop(g: NfruCL, z, sess):
     flt = g.empty(2 * fh * fw * 4)
     g.run("fill_mv", (fw, fh), pf, fh, fw, flt)
     _, _, cH, cW = z["rgb_m1"].shape
-    rm1, rp1 = g.buf(f32(z["rgb_m1"])), g.buf(f32(z["rgb_p1"]))
+    rm1, rp1 = g.img(z["rgb_m1"]), g.img(z["rgb_p1"])
     netu = g.empty(16 * fh * fw)
     dp = np.array(z["depth_params"], np.float32).view(cl_float4())
     g.run(
