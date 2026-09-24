@@ -244,20 +244,55 @@ def _requant(kind: str, x: str, y: str, scales: Scales) -> int:
     return int(c * 2.0 ** (15 - k)) & 0xFFFFFFFF
 
 
-def _q15_at_most_one(a: str, b: str, scales: Scales) -> int:
+def _q15_shift(a: str, b: str, scales: Scales) -> int:
+    """``k``, the smallest shift that brings ``s_a/s_b * 2**-k`` to at most 1
+    (the requantize's rule: exactly 1 keeps ``k = 0``)."""
     r = scales[a][0] / scales[b][0]
-    if a == b or r > 1.0:
-        raise CalibrationError(f"Concat ratio {a}/{b} = {r} is not in (0, 1]")
-    return int(round(r * 2.0**15))
+    if a == b or not r > 0:
+        raise CalibrationError(f"Concat ratio {a}/{b} = {r} is not positive")
+    k = 0
+    while r * 2.0**-k > 1.0:
+        k += 1
+        if k > 15:
+            raise CalibrationError(f"Concat ratio {a}/{b} = {r} does not fit Q15")
+    return k
 
 
-def _cat15(a: str, b: str, c: str, d: str, scales: Scales) -> int:
+def _q15_shifted(a: str, b: str, scales: Scales, k: int | None = None) -> int:
+    """``round(s_a/s_b * 2**(15-k))``. With the template's ``k`` given, refuse
+    a ratio on the other side of 1: ``k = 0`` and ``k >= 1`` compile to
+    different record counts (a shift above 0 adds the ``0x1ea0`` write of
+    the activation taps' requantize, which ``k = 0`` elides). Shifts 1 and 2
+    are the same program (record-exact both ways in the
+    ``docs/axera-conv-concat-shift.md`` sweep)."""
+    got = _q15_shift(a, b, scales)
+    if k is not None and (got == 0) != (k == 0):
+        raise CalibrationError(
+            f"Concat ratio {a}/{b} needs shift {got}, the template has {k} "
+            "(a ratio on the other side of 1 is a different program)"
+        )
+    if k is not None and max(got, k) > 2:
+        # Only builds at shifts 0..2 were paired (the sweep's shift-3 build
+        # pairs with none: it only ever came out as the other allocator
+        # variant); the step's convs need at most 1.
+        raise CalibrationError(f"Concat ratio {a}/{b} needs shift {got}, unmeasured")
+    return int(round(scales[a][0] / scales[b][0] * 2.0 ** (15 - got)))
+
+
+def _cat15(a: str, b: str, c: str, d: str, *shifts_and_scales) -> int:
     """A 3x3 Conv chain's Concat header in ``npu_params``: the activation
     taps' ratio into their Concat (``s_a/s_b``) and the weight taps' ratio
-    into theirs (``s_c/s_d``), each ``round(r * 2**15)`` as a uint16, low
-    half first. Both ratios are at most 1 (the requantize's ``k = 0``), so a
-    ratio a hair below 1 stores 32768, one further down 32767."""
-    return _q15_at_most_one(a, b, scales) | _q15_at_most_one(c, d, scales) << 16
+    into theirs (``s_c/s_d``), each ``round(r * 2**(15-k))`` as a uint16,
+    low half first, ``k`` the requantize's shift for that ratio. A ratio at
+    most 1 has ``k = 0`` (a hair below 1 stores 32768, one further down
+    32767). An unfused Relu's output feeding the taps shares its wider
+    pre-activation quantization, so the activation taps' ratio into their
+    Concat is above 1 there (stage2/3/4 conv1): ``k = 1`` and the half is
+    Q14 (stage2 conv1: ``1.0991 * 2**14`` = 18008). The role carries both
+    ``k``: a recalibration that moves either across ``k = 0`` is refused."""
+    *shifts, scales = shifts_and_scales
+    ka, kw = shifts if shifts else (None, None)
+    return _q15_shifted(a, b, scales, ka) | _q15_shifted(c, d, scales, kw) << 16
 
 
 def _add(kind: str, x: str, z: str, y: str, scales: Scales) -> int:
@@ -540,10 +575,11 @@ def _locate_cat_header(scales, rq_pairs, params, taken_lanes):
     names = sorted(scales)
 
     def halves(pairs):
-        out: dict[int, list[tuple[str, str]]] = {}
+        out: dict[int, list[tuple[str, str, int]]] = {}
         for a, b in pairs:
             try:
-                out.setdefault(_q15_at_most_one(a, b, scales), []).append((a, b))
+                k = _q15_shift(a, b, scales)
+                out.setdefault(_q15_shifted(a, b, scales), []).append((a, b, k))
             except CalibrationError:
                 pass
         return out
@@ -558,8 +594,17 @@ def _locate_cat_header(scales, rq_pairs, params, taken_lanes):
         v = struct.unpack_from("<I", params, off)[0]
         wl, wh = v & 0xFFFF, v >> 16
         if wh in hi and wl in lo:
-            roles = [("cat15", *p, *q) for p in lo[wl] for q in hi[wh]]
-            found.append((off, v, roles))
+            # The two halves are two different Concats' ratios. One ratio
+            # and its inverse (now that a half may be shifted) is a
+            # misaligned read two bytes before the stem's real header.
+            roles = [
+                ("cat15", p[0], p[1], q[0], q[1], p[2], q[2])
+                for p in lo[wl]
+                for q in hi[wh]
+                if (scales[p[0]], scales[p[1]]) != (scales[q[1]], scales[q[0]])
+            ]
+            if roles:
+                found.append((off, v, roles))
     if len(found) != 1:
         raise CalibrationError(
             f"Concat header found {len(found)} times in npu_params, want once"

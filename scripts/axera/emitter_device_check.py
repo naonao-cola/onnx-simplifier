@@ -634,7 +634,13 @@ def cases() -> list[Callable[[], Case]]:
     out.append(lambda: matmul_case("fc_dW_MatMul_38"))
     out.append(lambda: matmul_case("dX_MatMul_121"))
     out.append(lambda: matmul_case("dW_MatMul_142"))
-    out.append(lambda: matmul_case("conv_resnetv15_stage3_conv1_fwd", "perturb"))
+    out.append(lambda: matmul_case("conv_resnetv15_stage3_conv1_fwd"))
+    # 3x3 Conv chains whose Concat header half is above 1 (k >= 1) and at
+    # most 1 (k = 0), at the step's predicted calibration
+    # (docs/axera-conv-concat-shift.md)
+    out.append(lambda: matmul_case("conv_resnetv15_stage2_conv1_fwd"))
+    out.append(lambda: matmul_case("conv_resnetv15_stage2_conv4_fwd"))
+    out.append(lambda: matmul_case("conv_resnetv15_stage4_conv3_fwd"))
     out.append(lambda: matmul_case("fc_fwd_resnetv15_dense0_fwd", "perturb"))
     return out
 

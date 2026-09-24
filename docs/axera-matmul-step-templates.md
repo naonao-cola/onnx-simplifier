@@ -107,17 +107,13 @@ What the emitter had to learn for these:
 
 Still refused, and why:
 
-- **3x3 Conv stage2/3/4 conv1 (9 nodes):** the Concat header is not found.
-  With the Relu prefix, the taps' ratio into the Concat is above 1, and the
-  header then has a different form. That needs decoding.
-- **stage1 conv0 template (serves 4):** it fits the 2 nodes whose input is
-  the max pool. For the 2 whose input is an unfused Relu, the Concat ratio is
-  above 1 (a different program). Those need a Relu-prefix template of their
-  own.
-- **stage4 conv0 / stage4 conv2:** held-out pair mismatch. For conv2 the
-  `npu_params` DMA table differs by one tile rotation (#1836-style noise),
-  and a second build is needed to confirm. For conv0 the record structure
-  differs between the two calibrations.
+- **Conv: all 20 now covered** (`docs/axera-conv-concat-shift.md`). The
+  3x3 conv1 chains' Concat header was a shifted Q15 half (the taps' ratio
+  above 1); `k = 0` and `k >= 1` are two programs, so each chain shape has a
+  template per shift class the step needs, and the stage3 conv1 / stage4
+  conv0 / stage4 conv2 "mismatches" were Pulsar2 picking one of two program
+  variants per build, resolved by pairing rebuilds. Totals at the predicted
+  calibration: 481 / 623 -> **496 / 608**.
 - **The extended dX chains 54, 138, 223, 240, 258, 342, 360:** each
   recalibrates onto the step, but its two builds differ in record structure,
   so the pair check can't pass yet. 240 also has a ratio tie. These nodes keep

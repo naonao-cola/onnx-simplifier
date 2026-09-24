@@ -80,10 +80,13 @@ def test_lsb_error_is_in_output_steps():
 
 def test_conv_concat_ratio_change_is_refused():
     # Moving a 3x3 Conv's Concat input off 2x its source's scale ran 189 LSB
-    # off on the device; recalibrate must refuse it.
-    case = edc.matmul_case("conv_resnetv15_stage3_conv1_fwd", "perturb_free")
+    # off on the device; recalibrate must refuse it. (The first-round stage3
+    # conv1 template that showed it is replaced by a step-real one without a
+    # power-of-two ratio, so the guard is checked on its own.)
+    old = {"src": (0.0125, 0.0), "cat": (0.025, 0.0), "w": (0.003, 0.0)}
+    edc.mre._check_fixed_ratios(old, {**old, "src": (0.01, 0.0), "cat": (0.02, 0.0)})
     with pytest.raises(edc.mre.CalibrationError, match="breaks that ratio"):
-        case.emitted()
+        edc.mre._check_fixed_ratios(old, {**old, "cat": (0.026, 0.0)})
 
 
 def test_log_emits_the_output_scale_lanes():
