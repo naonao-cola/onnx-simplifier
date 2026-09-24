@@ -85,15 +85,16 @@ if [ -n "${SAM:-}" ]; then
     RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
-# MCC 3D mode: MCC's pieces from ../vision_models/mcc (mcc.py export --chunks 1024; MCC=its work dir):
-# enc.onnx -> mcc_enc.onnx, dec_q1024.onnx -> mcc_dec_q1024.onnx; and MoGe-2 ViT-S in both orientations
+# MCC 3D mode: MCC's pieces from ../vision_models/mcc (mcc.py export --chunks 1024, then dec_opt.py prep +
+# quant --policy a16c; MCC=its work dir): enc.onnx -> mcc_enc.onnx, the w8a16 decoder dec_q1024.a16c.onnx
+# (MCC_DEC=dec_q1024.onnx for the fp16 one) -> mcc_dec_q1024.onnx; and MoGe-2 ViT-S in both orientations
 # (depth.py static --h 640 --w 480 and --h 480 --w 640; MOGE=their dir) -> moge_640x480.onnx,
 # moge_480x640.onnx. The segmentation is the SAM mode's sam_l0_enc/dec. EP-context models are compiled on
 # the app's first MCC launch (MoGe-2 on its first use per orientation).
 if [ -n "${MCC:-}" ]; then
   "${A[@]}" shell "mkdir -p $STAGE/mcc"
   "${A[@]}" push -q "$MCC/enc.onnx" "$STAGE/mcc/mcc_enc.onnx"
-  "${A[@]}" push -q "$MCC/dec_q1024.onnx" "$STAGE/mcc/mcc_dec_q1024.onnx"
+  "${A[@]}" push -q "$MCC/${MCC_DEC:-dec_q1024.a16c.onnx}" "$STAGE/mcc/mcc_dec_q1024.onnx"
   for hw in 640x480 480x640; do "${A[@]}" push -q "$MOGE/model.$hw.t1200.onnx" "$STAGE/mcc/moge_$hw.onnx"; done
   for b in mcc_enc.onnx mcc_dec_q1024.onnx moge_640x480.onnx moge_480x640.onnx; do
     RA "cmp -s $STAGE/mcc/$b files/models/$b || { cp $STAGE/mcc/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"

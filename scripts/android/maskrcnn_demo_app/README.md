@@ -144,41 +144,54 @@ on the HTP from EP-context models:
 | monocular metric point map | MoGe-2 ViT-S, static 640x480 / 480x640 (`depth.py static`) | HTP, fp16 |
 | upstream `prep` + XYZ window partition (`model.py`) | ported to C++ | CPU |
 | encoder -> the decoder's seen K/V | MCC `enc.onnx` (`model.py` K/V-cache split) | HTP, fp16 |
-| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.05) | MCC `dec_q1024.onnx`, 1024 queries a run | HTP, fp16 |
+| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.1) | MCC `dec_q1024.a16c.onnx` (`dec_opt.py`), 1024 queries a run | HTP, w8a16 (color tail fp16) |
 
 - The working image is 480x640 (portrait) or 640x480 (landscape): camera frames (4:3) scaled, test
   images center-cropped to 3:4 / 4:3. MoGe-2's points are flipped into MCC's frame (y up, z toward the
-  viewer), as `depth.py` does; there is no gravity alignment yet (see `../vision_models/mcc` on the
+  viewer), as `depth.py` does. MoGe-2 needs only the image, so it starts on its own thread when an image
+  is encoded and is done by the time "3D" is pressed. There is no gravity alignment yet (see `../vision_models/mcc` on the
   17.5 deg rotation this leaves against the iPhone demo cloud).
 - **images:** the test images; tap an object (SAM mask in blue), "3D" reconstructs, "Photo" goes back,
   "Next image" moves on. **camera:** live preview; a tap freezes the frame and segments, "Live" unfreezes.
 - 3D view: z-buffered colored splats of the points with p > 0.3; drag to turn, pinch to zoom; the photo
   with its mask sits in the corner.
 - Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge ./deploy.sh`
-  (`mcc.py export --chunks 1024`; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
+  (`mcc.py export --chunks 1024`, `dec_opt.py prep` + `quant --policy a16c`, `MCC_DEC=dec_q1024.onnx` for
+  the fp16 decoder; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
   Scripted: `--es image quest2.jpg --es tap 0.506,0.491 --ez recon true`; `--es opts` takes `gran`,
-  `levels`, `lo`, `thr` (defaults 0.1 / 2 / 0.05 / 0.3) and `dump=1`.
+  `levels`, `lo`, `thr` (defaults 0.1 / 2 / 0.1 / 0.3) and `dump=1`.
 - **License:** MCC's code and weights are CC BY-NC 4.0 (non-commercial); nothing of it is in the APK,
   `deploy.sh` pushes the exported models. The screenshot's input is upstream MCC's `demo/quest2.jpg`.
 
-Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset:
+Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset ("3D" pressed again on the same
+mask for the steady state):
 
-| | ms |
-|---|---:|
-| SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 |
-| MoGe-2 ViT-S 640x480 | 268-276 |
-| prep (C++) | 6-21 |
-| MCC encoder | 205-207 |
-| MCC decoder, 59 chunks x 1024 queries (59,212 of the 216,000 dense queries), 64 ms a chunk | 3,340-3,790 |
-| **total, "3D" to points** (19,652 points; smaller objects need fewer chunks: 1.6 s at 17) | **3.9-4.3 s** |
-| init, first launch (compiles MCC's two graphs: encoder 42 s, decoder 5.5 s) / later launches | 48.7 s / 1.6 s |
-| MoGe-2 compile, first "3D" per orientation | 17-24 s |
+| | first version | optimized |
+|---|---:|---:|
+| SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 | same |
+| MoGe-2 ViT-S 640x480 | 268-276 | 270-590, in the background: 5-12 waited |
+| prep (C++) | 6-21 | 12-24 |
+| MCC encoder | 205-207 | 203-206 |
+| MCC decoder chunks x ms (queries: coarse-to-fine refine threshold 0.05 -> 0.1) | 59 x 64 (59,212) | 48 x 46.6 (47,317) |
+| **total, "3D" to points** (19,652-19,666 points) | **3.9-4.3 s** | **2.48-2.52 s** |
+| vs the dense host fp32 grid: recall / precision / chamfer / color L1 | 0.993 / 0.992 / 0.0008 / 0.46 | 0.990 / 0.988 / 0.0011 / 0.76 |
+| init, first launch (compiles MCC's two graphs) / later launches | 48.7 s / 1.6 s | ~49 s / 1.6 s |
+| MoGe-2 compile, first image per orientation (in the background now) | 17-24 s | same |
+
+The optimizations, one at a time (`../vision_models/mcc/dec_opt.py`, `README.md` "Decoder
+optimization" there for everything tried):
+- **w8a16 decoder** (`onnxsim.full_qdq`, uint16 activations, int8 weights, the color head's
+  temperature-0.1 softmax kept fp16): 63 -> 47 ms a chunk. The per-op profile had softmax at 44% of the
+  fp16 chunk; quantizing only softmax (or softmax + Gelu) is *slower* (72 / 83 ms: the fp16 <-> int16
+  conversions around it), the whole graph has to go integer.
+- **refine threshold `lo` 0.05 -> 0.1**: 13-20% fewer queries, recall >= 0.9975 of the dense grid's
+  occupied points on all three references (exact: host dense grids).
+- **MoGe-2 off the critical path**: it only needs the image, so it runs while the user taps.
 
 **Checked against the Python pipeline** (`../vision_models/mcc/app_check.py` on the app's `dump=1`
 tensors -- its own mask and MoGe-2 points): the C++ prep's image input is identical (max abs 0), the
 valid-point pattern identical, xyz within 1.9e-6; the phone encoder's K / V cos 0.999985 / 0.99988 vs
-host fp32; the coarse-to-fine phone reconstruction vs the dense host fp32 grid: recall 0.993, precision
-0.992, chamfer 0.0008, color L1 0.46/255 (19,652 vs 19,634 points).
+host fp32; the reconstruction vs the dense host fp32 grid in the table above.
 
 <img src="docs/mcc_quest2.jpg" width="480" alt="MCC 3D mode: the headset's reconstruction from the photo's viewpoint and turned to show its far side">
 

@@ -137,7 +137,7 @@ public class MccActivity extends MainActivity {
         int img = 0;
         for (int i = 0; i < images.size(); i++)
             if (images.get(i).getName().equals(getIntent().getStringExtra("image"))) img = i;
-        float[] et = new float[1], dt = new float[1], iou = new float[4], rt = new float[5];
+        float[] et = new float[1], dt = new float[1], iou = new float[4], rt = new float[6];
         int[] rc = new int[3];
         byte[] mask = null;
         Engine.Result r = null;  // the working image on screen
@@ -253,12 +253,13 @@ public class MccActivity extends MainActivity {
                     int[] col = new int[n];
                     MccEngine.nativePoints(xyz, col);
                     String s = String.format(Locale.US,
-                            "MCC 3D  %d points (granularity %.2f)\nMoGe-2 %.0f ms  prep %.0f ms  MCC encoder %.0f ms\n"
-                                    + "MCC decoder %.0f ms (%d queries, %d x 1024 chunks)\ntotal %.2f s   drag to turn, pinch to zoom",
-                            n, gran, rt[0], rt[1], rt[2], rt[3], rc[0], rc[1], rt[4] / 1000);
+                            "MCC 3D  %d points (granularity %.2f)\nMoGe-2 %.0f ms (in the background, waited %.0f ms)\n"
+                                    + "prep %.0f ms  MCC encoder %.0f ms\nMCC decoder %.0f ms (%d queries, %d x 1024)\n"
+                                    + "total %.2f s   drag to turn, pinch to zoom",
+                            n, gran, rt[0], rt[1], rt[2], rt[3], rt[4], rc[0], rc[1], rt[5] / 1000);
                     Log.i(TAG, String.format(Locale.US,
-                            "recon: %d points; MoGe %.1f prep %.1f encoder %.1f decoder %.1f (%d queries, %d chunks) total %.1f ms",
-                            n, rt[0], rt[1], rt[2], rt[3], rc[0], rc[1], rt[4]));
+                            "recon: %d points; MoGe %.1f (waited %.1f) prep %.1f encoder %.1f decoder %.1f (%d queries, %d chunks) total %.1f ms",
+                            n, rt[0], rt[1], rt[2], rt[3], rt[4], rc[0], rc[1], rt[5]));
                     cloud.setPoints(xyz, col, gran, thumbnail(r.frame, maskBmp), s);
                     showCloud(true);
                     overlay.setStats(photoLine);

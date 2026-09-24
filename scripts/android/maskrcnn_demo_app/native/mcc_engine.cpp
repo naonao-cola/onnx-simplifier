@@ -4,17 +4,21 @@
 //      mask. The working image is W x H = 480 x 640 (portrait) or 640 x 480 (landscape).
 //   2. MoGe-2 ViT-S (moge_<H>x<W>.onnx, ../vision_models/mcc/depth.py static): float NCHW image in
 //      [0, 1] -> metric point map "points" [1, H, W, 3] in the OpenCV camera frame; y and z are
-//      flipped into MCC's frame (x right, y up, z toward the viewer), as depth.py does.
+//      flipped into MCC's frame (x right, y up, z toward the viewer), as depth.py does. It needs only
+//      the image, so it starts on its own thread as soon as an image is encoded and runs while the
+//      user picks the object; "3D" waits for it (usually done by then).
 //   3. model.py prep() + xyz_windows() on the CPU: points outside the mask -> inf, scale by the mean
 //      per-axis std, center, crop to the mask box + 40 px, pad square, image bilinear -> 800 -> 224
 //      (normalized), points bilinear -> 112 (a non-finite tap makes a point invalid, as in torch),
 //      invalid -> -100, shrink, 8x8 windows.
 //   4. MCC encoder (mcc_enc.onnx = ../vision_models/mcc enc.onnx): img, xyz_win, valid -> the decoder's
 //      seen K/V [8, 16, 197, 32] each, once per reconstruction.
-//   5. MCC decoder chunks (mcc_dec_q1024.onnx): 1024 query points each against that K/V -> occupancy
-//      logit + color. Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
+//   5. MCC decoder chunks (mcc_dec_q1024.onnx, the w8a16 dec_opt.py a16c build: 47 vs 63 ms a chunk
+//      fp16): 1024 query points each against that K/V -> occupancy logit + color. Queries coarse-to-fine exactly as mcc.py recon: every point of the coarsest grid,
 //      then at each finer level the 27-neighborhood of every cell with p > lo (default 15^3 -> 30^3 ->
-//      60^3, granularity 0.1). The result is the target grid's points with p > thr.
+//      60^3, granularity 0.1, lo 0.1: recall >= 0.9975 of the dense grid's occupied points on the three
+//      references in ../vision_models/mcc/dec_opt.py, 13-20% fewer queries than 0.05). The result is
+//      the target grid's points with p > thr.
 #include <jni.h>
 #include <android/bitmap.h>
 #include <android/log.h>
@@ -24,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -49,6 +54,8 @@ std::map<std::string, std::unique_ptr<Ort::Session>> g_moge;  // per orientation
 int g_w = 0, g_h = 0;                                          // working image
 std::vector<uint8_t> g_rgb, g_mask, g_q(S * S * 3);
 std::vector<float> g_emb(EMB), g_lr(4 * LR * LR);
+std::shared_future<std::vector<float>> g_moge_pts;  // the current image's MoGe-2 points (MCC frame)
+float g_moge_ms = 0;                                  // its run time (set by the MoGe thread)
 bool g_have_emb = false, g_have_mask = false;
 std::vector<float> g_pts;    // result: xyz per point
 std::vector<int32_t> g_col;  // result: ARGB per point
@@ -155,32 +162,42 @@ float sam_decode(float x, float y, float* iou) {
 }
 
 // ---- MoGe-2 + MCC -------------------------------------------------------------------------------
-Ort::Session& moge() {
-  const std::string stem = "moge_" + std::to_string(g_h) + "x" + std::to_string(g_w);
+// Runs on the MoGe thread only (g_moge is touched nowhere else).
+Ort::Session& moge(int w, int h) {
+  const std::string stem = "moge_" + std::to_string(h) + "x" + std::to_string(w);
   auto& s = g_moge[stem];
   if (!s) s = g_htp.session(g_dir, stem, g_perf, "MccDemo");
   return *s;
 }
 
-// working image -> MoGe points (H, W, 3), flipped into MCC's frame
-std::vector<float> moge_points() {
-  const size_t n = (size_t)g_w * g_h;
+// image (h, w, 3) -> MoGe points (h, w, 3), flipped into MCC's frame
+std::vector<float> moge_points(const std::vector<uint8_t>& rgb, int w, int h) {
+  const double t0 = now_ms();
+  const size_t n = (size_t)w * h;
   std::vector<float> img(3 * n), pts(3 * n), mk(n);
   for (size_t i = 0; i < n; ++i)
-    for (int c = 0; c < 3; ++c) img[c * n + i] = g_rgb[3 * i + c] / 255.f;
-  int64_t is[4] = {1, 3, g_h, g_w}, ps[4] = {1, g_h, g_w, 3}, ms[3] = {1, g_h, g_w};
+    for (int c = 0; c < 3; ++c) img[c * n + i] = rgb[3 * i + c] / 255.f;
+  int64_t is[4] = {1, 3, h, w}, ps[4] = {1, h, w, 3}, ms[3] = {1, h, w};
   Ort::Value in = Ort::Value::CreateTensor<float>(cpu(), img.data(), img.size(), is, 4);
   Ort::Value out[2] = {Ort::Value::CreateTensor<float>(cpu(), pts.data(), pts.size(), ps, 4),
                        Ort::Value::CreateTensor<float>(cpu(), mk.data(), mk.size(), ms, 3)};
   const char* in_n[] = {"image"};
   const char* out_n[] = {"points", "mask"};
-  moge().Run(Ort::RunOptions{nullptr}, in_n, &in, 1, out_n, out, 2);
+  moge(w, h).Run(Ort::RunOptions{nullptr}, in_n, &in, 1, out_n, out, 2);
   dump("moge_points.f32", pts.data(), pts.size() * 4);
   for (size_t i = 0; i < n; ++i) {  // OpenCV camera frame -> x right, y up, z toward the viewer
     pts[3 * i + 1] = -pts[3 * i + 1];
     pts[3 * i + 2] = -pts[3 * i + 2];
   }
+  g_moge_ms = (float)(now_ms() - t0);
+  LOGI("MoGe-2 %dx%d: %.1f ms (background)", w, h, g_moge_ms);
   return pts;
+}
+
+// A new working image: start its MoGe-2 run (after the previous one, which may still be running).
+void start_moge() {
+  if (g_moge_pts.valid()) g_moge_pts.wait();
+  g_moge_pts = std::async(std::launch::async, moge_points, g_rgb, g_w, g_h).share();
 }
 
 struct EncIn {
@@ -255,7 +272,8 @@ EncIn prep(std::vector<float> xyz) {
   return e;
 }
 
-// times: 0 MoGe, 1 prep, 2 encoder, 3 decoder (all chunks), 4 total; counts: queries, chunks, points
+// times: 0 MoGe-2 run (background), 1 waited for it, 2 prep, 3 encoder, 4 decoder (all chunks), 5 total;
+// counts: queries, chunks, points
 void reconstruct(float* times, int* counts) {
   if (!g_have_mask) throw std::runtime_error("tap an object first");
   const double t0 = now_ms();
@@ -266,7 +284,8 @@ void reconstruct(float* times, int* counts) {
   dump("dims.i32", dims, sizeof dims);
   dump("rgb.u8", g_rgb.data(), g_rgb.size());
   dump("mask.u8", g_mask.data(), g_mask.size());
-  std::vector<float> seen = moge_points();
+  if (!g_moge_pts.valid()) throw std::runtime_error("no image encoded yet");
+  std::vector<float> seen = g_moge_pts.get();  // a copy: the same image can be reconstructed again
   const double t1 = now_ms();
   EncIn e = prep(std::move(seen));
   const double t2 = now_ms();
@@ -362,7 +381,8 @@ void reconstruct(float* times, int* counts) {
         c |= (int32_t)std::lround(std::min(1.f, std::max(0.f, rgb_prev[3 * f + t])) * 255) << (16 - 8 * t);
       g_col.push_back(c);
     }
-  const float tt[5] = {(float)(t1 - t0), (float)(t2 - t1), (float)(t3 - t2), (float)(t4 - t3), (float)(now_ms() - t0)};
+  const float tt[6] = {g_moge_ms, (float)(t1 - t0), (float)(t2 - t1), (float)(t3 - t2), (float)(t4 - t3),
+                       (float)(now_ms() - t0)};
   memcpy(times, tt, sizeof tt);
   counts[0] = nq, counts[1] = nchunks, counts[2] = (int)g_col.size();
 }
@@ -397,7 +417,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_nat
     g_opts = demo::parse_opts(jstr(e, jopts), {{"htp_performance_mode", "burst"},
                                                {"gran", "0.1"},
                                                {"levels", "2"},
-                                               {"lo", "0.05"},
+                                               {"lo", "0.1"},
                                                {"thr", "0.3"},
                                                {"dump", "0"}});
     g_dir = jstr(e, jdir);
@@ -436,6 +456,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_na
     });
     if (enc) {
       float t = sam_encode();
+      start_moge();
       e->SetFloatArrayRegion(jt, 0, 1, &t);
     }
     return JNI_TRUE;
@@ -457,6 +478,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_na
     for (int y = 0; y < g_h; ++y)
       for (int x = 0; x < g_w; ++x) memcpy(g_rgb.data() + ((size_t)y * g_w + x) * 3, d.px + (size_t)y * d.bi.stride + 4 * x, 3);
     float t = sam_encode();
+    start_moge();
     e->SetFloatArrayRegion(jt, 0, 1, &t);
     return JNI_TRUE;
   } catch (const std::exception& ex) {
@@ -487,16 +509,16 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_native
   }
 }
 
-// MoGe-2 + MCC for the current mask. times[5]: MoGe, prep, encoder, decoder, total ms; counts[3]:
-// queries, chunks, points. Returns the number of points, -1 on error.
+// MoGe-2 + MCC for the current mask. times[6]: MoGe-2 run, MoGe-2 wait, prep, encoder, decoder, total
+// ms; counts[3]: queries, chunks, points. Returns the number of points, -1 on error.
 extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_MccEngine_nativeReconstruct(JNIEnv* e, jclass,
                                                                                            jfloatArray jt, jintArray jc) {
   std::lock_guard<std::mutex> l(g_mu);
   try {
-    float t[5];
+    float t[6];
     int c[3];
     reconstruct(t, c);
-    e->SetFloatArrayRegion(jt, 0, 5, t);
+    e->SetFloatArrayRegion(jt, 0, 6, t);
     e->SetIntArrayRegion(jc, 0, 3, c);
     return c[2];
   } catch (const std::exception& ex) {
