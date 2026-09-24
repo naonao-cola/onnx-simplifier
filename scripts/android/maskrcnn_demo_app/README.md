@@ -177,6 +177,51 @@ converting the full-res frame when the original is shown). In the camera path th
 costs 6.9 ms since only the 130K low-res pixels are converted -- converting all 2M pixels first
 took 23 ms.
 
+## Game-upscaling mode (NSS super sampling + NFRU frame generation, replayed Bistro)
+
+The "Game upscaling" button (`GameActivity`, its own process `:game`, `native/game_engine.cpp` ->
+`libgame_demo.so`) replays a short stretch of Arm's rendered test sequence -- what a game hands its
+upscaler every frame: a 960x540 colour render, depth, motion vectors, camera matrix, jitter -- through
+
+1. **NSS** (`../vision_models/nss`): temporal super sampling to 1920x1080, the int8 CNN on the HTP and
+   the pre/post-processing as OpenCL kernels on the Adreno 730;
+2. with **NFRU on** (`../vision_models/nfru`): one generated frame between each two NSS outputs, the
+   int8 network on the HTP and the block-matching flow, motion splats and blend on the Adreno.
+
+The same kernels (compiled into the library from `nss_kernels.cl` / `nfru_kernels.cl`) and networks as
+the standalone runners; everything stays in GPU buffers/images, the networks read and write host-mapped
+buffers shared with ORT, and only the displayed RGBA8 frames are copied into bitmaps (1.1-3 ms). NFRU
+consumes NSS's linear output through its own colour pipeline (the same exposure + Reinhard NSS displays
+with) and NSS's motion negated: NFRU's vectors point back, NSS's forward (checked against the camera:
+the camera-induced motion matches `-motion_lr` to 0.05% median). The sequence has no forward vectors,
+so NFRU's block-matching hint for m1 -> p1 is NSS's motion of p1 (an approximation; the hint only
+competes with the 7x7 search).
+
+The screen: NSS (or NSS + NFRU) right of a draggable divider, the native 540p render (nearest) left of
+it, the NFRU on/off button, per-frame ms. Data: `python game_seq.py` (the first 48 frames of
+`Arm/neural-graphics-dataset` `nss/test`, 379 MiB, + Arm's license text next to it), then
+`GAME=~/.cache/arm-nss/game ./deploy.sh` (also pushes NSS's and NFRU's int8 ONNX; EP-context compiled
+on the first launch); `adb shell am start -n org.onnxsim.maskrcnndemo/.GameActivity [--ez nfru true]`.
+The sequence and weights are under the Arm AI Model Community License, which permits redistribution
+with its text and notices (see `../vision_models/nss/README.md`); at 379 MiB it is still deployed, not
+bundled into the APK.
+
+Phone (Xiaomi 12S), `cl_qcom_perf_hint` high, HTP burst, in the app:
+
+| NFRU | NSS per frame (CNN on the HTP) | NFRU per generated frame (net on the HTP) | upload + copy-out | displayed FPS (1080p) |
+|---|---:|---:|---:|---:|
+| off | 26.4 ms (3.7) | - | 1.7 + 1.7 ms | **31-33** |
+| on | 26.4 ms (3.7) | 29.3 ms (1.8) | 2 + 3 ms | **30-33** (15-16 rendered) |
+
+<img src="docs/game_nss.jpg" width="540" alt="Game upscaling, NFRU off: native 960x540 left, NSS 1920x1080 right">
+<img src="docs/game_nfru.jpg" width="540" alt="Game upscaling, NFRU on: native 960x540 left, NSS + NFRU right">
+
+With the replay's rendering free (the frames come from a file), NFRU doesn't raise the displayed rate
+here: one generated frame (29 ms) costs about as much as upscaling a rendered one (26 ms). It pays off
+once the game's own 540p rendering costs more than ~5 ms a frame (`../vision_models/nfru/README.md`).
+The generated frame is shown right away and frame t half a step later (posted, so the next step's
+work overlaps it).
+
 ## More modes: follow-ups (not built)
 
 - **BEV replay** (Fast-BEV++, PR #1873 / #1895 pipelined): bundle a few nuScenes-mini scene-0103
