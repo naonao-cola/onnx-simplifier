@@ -6,8 +6,9 @@ camera-usable part: single-image x4 neural super-resolution, strict all-HTP on t
 Gen 1 (Hexagon V69), with uint8 NHWC input/output so a camera frame goes in and a displayable frame
 comes out with no host float conversion.
 
-Status (this PR, step 1 of the plan below): the SR models, their phone numbers and accuracy.
-**Paused here** (coordinator request, 2026-09-24) for the HMX GEMM work; next steps below.
+Status: the SR models, their phone numbers and accuracy (#1906), and the demo app's
+"Super-res" mode (`../../maskrcnn_demo_app`, README "Super-resolution mode": XLSR int8, 54 FPS
+end to end on test images, the camera's 30 FPS with a bicubic / original / low-res comparison).
 
 ## Models
 
@@ -85,10 +86,9 @@ python superres.py report                         # the tables above
 `phone` uses `../sam/phone.sh` (ORT + QNN EP runner, `../../htp_exploration/qnn_shell/qnn_run_multi.cpp`)
 with its own phone dir `/data/local/tmp/codex-android-superres`.
 
-## Next steps (not started; resumed after the HMX work)
+## Next steps
 
-1. Demo app "super resolution" mode (camera -> downscale -> XLSR/QuickSRNet int8 on the HTP; slider
-   between bicubic, neural SR and the original; SR ms + FPS).
+1. Demo app "super resolution" mode: done (`../../maskrcnn_demo_app`).
 2. Arm's open mobile temporal super sampling, `Arm/neural-super-sampling` (NSS v1, Arm AI Model
    Community License): export with the `arm/neural-graphics-model-gym` definition, HTP/HVX split,
    phone ms and PSNR vs fp32 on its `scenario/` data; then a "game upscaling" replay demo.

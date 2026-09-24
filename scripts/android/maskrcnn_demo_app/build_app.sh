@@ -7,7 +7,7 @@
 # 1. ORT + QNN EP + Qualcomm QNN runtime libs (Maven Central) via ../htp_exploration/qnn_shell/fetch_libs.sh
 # 2. the three Hexagon FastRPC skels + their ARM stubs, built by ../e2e_pipeline/build.sh (BUILD_ONLY)
 # 3. native/maskrcnn_engine.cpp (includes ../e2e_pipeline/e2e_run.cpp) -> libmaskrcnn_demo.so,
-#    native/{yolo,sam}_engine.cpp -> lib{yolo,sam}_demo.so, native/rtdetr_engine.cpp (+ the ../msda_hvx
+#    native/{yolo,sam,sr}_engine.cpp -> lib{yolo,sam,sr}_demo.so, native/rtdetr_engine.cpp (+ the ../msda_hvx
 #    skel) -> librtdetr_demo.so, libmsda_rpc.so
 # 4. everything into app/src/main/jniLibs/arm64-v8a, then gradle assembleDebug (offline).
 set -euo pipefail
@@ -30,8 +30,8 @@ INC=(-I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" -I "$HEXAGON
   "$B/e2e/rpn_glue.o" "$B/e2e/rpn_stub.o" "$B/e2e/roi_stub.o" "$B/e2e/roiu8_stub.o" \
   -L "$QS/libs" -lonnxruntime -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc \
   -ljnigraphics -llog -Wl,--no-undefined
-# YOLO and SAM modes: one engine library each (ORT + QNN EP only, no DSP skels)
-for e in yolo sam; do
+# YOLO, SAM and super-resolution modes: one engine library each (ORT + QNN EP only, no DSP skels)
+for e in yolo sam sr; do
   "$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" \
     -o "$J/lib${e}_demo.so" "$HERE/native/${e}_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog \
     -Wl,--no-undefined

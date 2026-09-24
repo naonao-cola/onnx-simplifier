@@ -72,7 +72,7 @@ public class MainActivity extends Activity {
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
     static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
-            {"RT-DETR", "rtdetr", ""}, {"RF-DETR", "yolo", "rfdetr_nano"}, {"SAM", "sam", ""}};
+            {"RT-DETR", "rtdetr", ""}, {"RF-DETR", "yolo", "rfdetr_nano"}, {"SAM", "sam", ""}, {"Super-res", "sr", ""}};
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.
@@ -160,7 +160,8 @@ public class MainActivity extends Activity {
         }
         Class<?> c = key.equals("yolo") ? YoloActivity.class
                 : key.equals("rtdetr") ? RtDetrActivity.class
-                : key.equals("sam") ? SamActivity.class : MainActivity.class;
+                : key.equals("sam") ? SamActivity.class
+                : key.equals("sr") ? SrActivity.class : MainActivity.class;
         android.content.Intent i = new android.content.Intent(this, c);
         i.putExtra("mode", cameraMode ? "camera" : "images");
         if (!model.isEmpty()) i.putExtra("model", model);
