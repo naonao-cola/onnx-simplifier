@@ -878,7 +878,7 @@ class _Lowering:
                 (before, after),
                 mode="edge" if mode == "edge" else "reflect",
             ).tolist()
-            runs = []  # [start, length] of ascending consecutive index runs
+            runs: List[List[int]] = []  # [start, length] of ascending index runs
             for i in idx:
                 if runs and runs[-1][0] + runs[-1][1] == i:
                     runs[-1][1] += 1
