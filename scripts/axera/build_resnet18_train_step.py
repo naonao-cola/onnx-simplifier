@@ -35,7 +35,8 @@ import build_resident_train_step as brts  # noqa: E402
 
 
 TRAIN_PARAMS = [
-    "layer4.0.downsample.0.weight",
+    # resnet18d's downsample is AvgPool (index 0) followed by Conv (index 1).
+    "layer4.0.downsample.1.weight",
     "layer4.1.conv1.weight",
     "layer4.1.conv2.weight",
     "fc.weight",
@@ -120,6 +121,27 @@ def _fix_flatten_reshape(model: onnx.ModelProto) -> onnx.ModelProto:
     return out
 
 
+def _prepare_forward(fwd_path: str, prepared_path: str) -> onnx.ModelProto:
+    """Export-independent preprocessing shared by every requested batch.
+
+    Constant folding and shape inference dominate repeated batch sweeps.  The
+    resulting graph contains no batch-specific shape, so persist it once and
+    only redo ``set_batch`` plus backward construction for later batches.
+    """
+    if os.path.exists(prepared_path):
+        return onnx.load(prepared_path)
+
+    fwd = onnx.load(fwd_path)
+    fwd = _downgrade_reduce_axes_to_attr(fwd)
+    fwd = _fix_flatten_reshape(fwd)
+    onnx.checker.check_model(fwd)
+    fwd = onnx.shape_inference.infer_shapes(fwd)
+    fwd = brts._fold_constants(fwd)
+    onnx.checker.check_model(fwd)
+    onnx.save(fwd, prepared_path)
+    return fwd
+
+
 def build_step(out_dir: str, batch: int):
     """Build and save one batch-specific ResNet-18 training step."""
     if batch < 1:
@@ -129,12 +151,8 @@ def build_step(out_dir: str, batch: int):
     if not os.path.exists(fwd_path):
         export_forward(fwd_path)
 
-    fwd = onnx.load(fwd_path)
-    fwd = _downgrade_reduce_axes_to_attr(fwd)
-    fwd = _fix_flatten_reshape(fwd)
-    onnx.checker.check_model(fwd)
-    fwd = onnx.shape_inference.infer_shapes(fwd)
-    fwd = brts._fold_constants(fwd)
+    prepared_path = os.path.join(out_dir, "resnet18d_fwd_prepared.onnx")
+    fwd = _prepare_forward(fwd_path, prepared_path)
 
     init_names = {t.name for t in fwd.graph.initializer}
     missing = [p for p in TRAIN_PARAMS if p not in init_names]
