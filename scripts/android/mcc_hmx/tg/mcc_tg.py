@@ -138,7 +138,9 @@ def tg_block_t(xt, w):
     m = s.max(1, keepdim=True).maximum(ss)
     # e = exp(s - m) once, stored half (in (0, 1]); the row sums read it back, and the normalization happens after P V, in
     # its epilogue (o = (V^T e) / sum): fused into both the sum and a separate P = e / sum kernel, the exp ran twice
-    e, es = (s - m).exp().cast(dtypes.half).contiguous(), (ss - m).exp()
+    # the exponent in half (s - m <= 0, e in (0, 1]): the DSP backend's hf exp2 then runs 64 lanes per register (as the hand
+    # kernel), not 32 through float
+    e, es = (s - m).cast(dtypes.half).exp().contiguous(), (ss - m).exp()
     inv = (1.0 / (e.float().sum(1, keepdim=True) + es)).contiguous()
     # the self term's weight is materialized (16 x Q): fused into P V's epilogue it was a scalar exp per output element
     ps = (es * inv).contiguous()
@@ -148,7 +150,7 @@ def tg_block_t(xt, w):
     o = o.cast(dtypes.half).contiguous().reshape(D, q_n)
     xt = xt + T(w["wproj"]).matmul(o, dtype=dtypes.half) + T(w["bproj"])
     h = (T(w["w1"]).matmul(ln(xt, w["ln2"]), dtype=dtypes.half) + T(w["b1"])).contiguous()
-    g = h.float().gelu(approximate="tanh").cast(dtypes.half).contiguous()
+    g = h.gelu(approximate="tanh").contiguous()  # in half, as the hand kernel (hf exp2 on the DSP)
     return xt + T(w["w2"]).matmul(g, dtype=dtypes.half) + T(w["b2"])
 
 
