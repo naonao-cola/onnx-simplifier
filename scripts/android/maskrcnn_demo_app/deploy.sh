@@ -4,6 +4,8 @@
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   RFDETR=<rfdetr export.py model, e.g. ~/.cache/onnxsim-rfdetr/work/nano@320.u8.onnx> ./deploy.sh
+#                                   the RF-DETR button (pushed as rfdetr_nano.onnx)
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
 #   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
@@ -59,6 +61,13 @@ if [ -n "${YOLO:-}" ]; then
     b=$(basename "$f")
     RA "cmp -s $STAGE/yolo/$b files/models/$b || { cp $STAGE/yolo/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
+fi
+# RF-DETR (the YOLO activity's post=detr): one strict-HTP model from ../vision_models/rfdetr (uint8
+# NHWC SxS in, logits + boxes out), stored as rfdetr_nano.onnx.
+if [ -n "${RFDETR:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/yolo"
+  "${A[@]}" push -q "$RFDETR" "$STAGE/yolo/rfdetr_nano.onnx"
+  RA "cmp -s $STAGE/yolo/rfdetr_nano.onnx files/models/rfdetr_nano.onnx || { cp $STAGE/yolo/rfdetr_nano.onnx files/models/ && rm -f files/models/rfdetr_nano.ctx0*; }"
 fi
 # SAM mode: EfficientViT-SAM-L0 from ../vision_models/sam (sam.py export + quantize; its work dir,
 # e.g. SAM=$HOME/.cache/onnxsim-sam/efficientvit_sam_l0): enc.fp16.onnx -> sam_l0_enc.onnx,

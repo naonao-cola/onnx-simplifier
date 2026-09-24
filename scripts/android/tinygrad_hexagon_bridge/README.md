@@ -2733,6 +2733,9 @@ TINYGRAD_PATH=/path/to/onnxsim-tinygrad HEXAGON_TOOLS=/path/to/Tools HEXAGON_CLA
   HVX codegen checks under qemu / hexagon-sim), `pd_selfcheck.c` (synthetic proposal-decode
   self-consistency + qemu inputs), `hexagon_divrt.c` (integer divide helpers for freestanding
   qemu builds). See "Continuous integration" above.
+- `tinygrad_codegen/hmx/` -- the tinygrad fork's HMX (V69 matrix unit) fp16 TensorCore: `hmxsim.py` runs a generated
+  matmul on hexagon-sim `--mhmx 1` with real data, `build.sh`/`run.sh` + `tg_hmx_*` run it on the phone next to the hand
+  kernel in `../hmx_gemm`. Bit-exact everywhere; ~100x slower than the hand kernel for now (see its README).
 - `tinygrad_codegen/qfloat/` -- stage 2: `qfsim.py` runs a plain-tinygrad float kernel with real data on hexagon-sim
   (qemu can't decode HVX float) and reports accuracy and cycles, or `--dump`s it; `build.sh` + `qf_rpc.idl`/`qf_impl.c`/
   `qf_client.c` run the dumps (plus `hand_blend.c`) on the phone, `analyze.py` checks them; `qf_ops.py` holds the inputs

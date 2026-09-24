@@ -1,0 +1,24 @@
+{
+ "ReduceSumReshape_16x1x64x3136_c64_r371.axmodel.gz": {
+  "key": "ReduceSum:16x1x64x3136:axes0,3:k0:reshape64",
+  "scales": {
+   "x": 9.953897460945882e-06,
+   "y": 0.0047623408026993275
+  },
+  "zero_points": {
+   "x": 126,
+   "y": 115
+  }
+ },
+ "ReduceSumReshape_16x1x64x3136_c64_r416.axmodel.gz": {
+  "key": "ReduceSum:16x1x64x3136:axes0,3:k0:reshape64",
+  "scales": {
+   "x": 1.4005619050294627e-05,
+   "y": 0.006207560654729605
+  },
+  "zero_points": {
+   "x": 125,
+   "y": 131
+  }
+ }
+}

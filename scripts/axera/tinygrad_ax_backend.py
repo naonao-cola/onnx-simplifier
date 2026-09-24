@@ -3,7 +3,8 @@
 First code for ``docs/axera-tinygrad-emitter-plan.md`` (#1834). It wires the
 emitters this repository has already validated into the interfaces the plan
 names, and exposes tinygrad-facing classes built on the user's tinygrad fork
-``onnxsim/tinygrad`` (pinned below). It compiles nothing and touches no device:
+``onnxsim/tinygrad`` (pinned below). It compiles nothing (templates are Pulsar2-built fixtures); only
+``AXProgram`` touches the device:
 
 * ``TemplateCache`` resolves a ``TemplateKey`` to a committed, Pulsar2-built and
   checked fixture. A key with no fixture raises ``ValueError``; building a new
@@ -28,9 +29,9 @@ names, and exposes tinygrad-facing classes built on the user's tinygrad fork
   backend can produce today and say why the rest is refused.
 * ``tinygrad_classes()`` returns ``AXCompiler`` (a tinygrad ``Compiler`` whose
   "source" is a JSON template request and whose output is patched ``.axmodel``
-  bytes) plus ``AXAllocator``/``AXProgram`` transport stubs that raise
-  ``NotImplementedError`` -- the AXCL transport is roadmap milestone 1 and needs
-  the device.
+  bytes), ``AXAllocator`` (host-staged buffers) and ``AXProgram`` (loads the
+  bytes into a persistent AXCL session, ``axcl_session.py``, and runs them on
+  the card). ``register_ax_device()`` makes ``"AX"`` a tinygrad device.
 
 Every unvalidated op, shape, calibration class or edit raises ``ValueError``;
 nothing here extrapolates.
@@ -684,11 +685,15 @@ class ElementwiseScaleEdit:
                 dict(self.scales),
                 entry.meta["zero_points"],
             )
-        init = _mcode_initializer(model)
-        init.raw_data = ew.retarget(
-            bytes(init.raw_data), key.op, entry.meta["scales"], dict(self.scales)
+        import step_recalibrate
+
+        mc = ew.retarget(
+            bytes(_mcode_initializer(model).raw_data),
+            key.op,
+            entry.meta["scales"],
+            dict(self.scales),
         )
-        return model
+        return step_recalibrate.with_mcode(model, mc)
 
     def to_json(self):
         return {"type": "elementwise_scales", "scales": dict(self.scales)}
@@ -1108,16 +1113,27 @@ def plan_node(rec: Mapping, cache: TemplateCache | None = None) -> tuple[str, st
                     "bias flatten fuses into its neighbour (reshape_emit.py, "
                     "Relu-neighbour pairs only)",
                 )
-            try:
-                rre.step_template(shape, out)
-            except ValueError:
+            forms = []
+            for form, find in (
+                ("Identity", rre.step_template_identity),
+                ("zero-point-0", rre.step_template_zp0),
+                ("Relu", rre.step_template),
+            ):
+                try:
+                    find(shape, out)
+                    forms.append(form)
+                except ValueError:
+                    pass
+            if not forms:
                 return ("refused", "non-fused Reshape: no validated step template")
             # reshape_record_emit.retarget_scale: scale lanes and zero point;
-            # a zero point of 0 compiles to a different program.
+            # a zero point of 0 compiles to a different program, and a nonzero
+            # one (a signed input) needs the Identity form: the Relu form clips
             return (
                 "conditional",
-                "Reshape step template retargeted to the calibration if its "
-                "zero point is nonzero",
+                f"Reshape step templates ({', '.join(forms)}): the Identity one "
+                "retargeted if the zero point is nonzero, the zero-point-0 one "
+                "if it is 0",
             )
         return ("refused", f"no template or edit for {op}")
     except ValueError as exc:
@@ -1223,6 +1239,9 @@ def _at_calibration_matmul(rec: Mapping, calib: Mapping) -> str:
             real[step_name] = (q["consumer_int8_scale"], 0.0)
         else:
             real[step_name] = (q["scale"], float(q["zero_point"]))
+        if "consumer_int8_scale" in q and name + mre.I8 in old:
+            # a uint8 tensor the MatMul requantizes: its int8 view
+            real[step_name + mre.I8] = (q["consumer_int8_scale"], 0.0)
     try:
         new = mre.step_node_scales(entry, old, real)
         mre.recalibrate(mre.load_model(entry["axmodel"]), old, new)
@@ -1288,8 +1307,18 @@ def plan_at_calibration(
                 f"misc_op_record_emit retarget of the fused chain {chain} "
                 f"(zero points x{zx},y{zy})"
             )
-        if op == "Reshape" and "bias flatten" not in detail:
+        if op in ("Reshape", "Squeeze") and "bias flatten" not in detail:
             zp = _u8_zp(calib, rec["inputs"][0])
+            if zp != 0:
+                # a nonzero zero point is a signed input: only the Identity
+                # form keeps it (a Reshape -> Relu template clips it)
+                try:
+                    rre.step_template_identity(rec["shapes"][0], attrs.get("out", []))
+                except ValueError as exc:
+                    raise _NotAtCalibration(
+                        f"signed input (zp {zp}) and no Reshape -> Identity "
+                        "template serves this shape"
+                    ) from exc
             if zp == 0:
                 try:
                     rre.step_template_zp0(rec["shapes"][0], attrs.get("out", []))
@@ -1299,7 +1328,9 @@ def plan_at_calibration(
                         "serves this shape"
                     ) from exc
                 return "covered", "reshape_record_emit zero-point-0 template"
-            return "covered", f"reshape_record_emit.retarget_scale (zp {zp})"
+            return "covered", (
+                f"reshape_record_emit.retarget_scale of the Identity template (zp {zp})"
+            )
     except _NotAtCalibration as exc:
         return "refused", f"at calibration: {exc}"
     return status, detail
@@ -1492,21 +1523,141 @@ def tinygrad_classes() -> dict[str, type]:
             return compile_request(src, self.cache, self.policy)
 
     class AXAllocator(Allocator):
-        def _alloc(self, size, options):
-            raise NotImplementedError("AXCL buffers: roadmap milestone 1 (device)")
+        """Host-staged AXCL buffers. AXCL binds device memory to one loaded
+        model's IO (``axclrtEngineSetInputBufferByIndex``), so a tinygrad
+        buffer lives in host memory and ``AXProgram`` stages it into that
+        model's IO on each call (``axcl_session.AXSession``). The storage is
+        host-visible, so ``Buffer.numpy()``/``initial_value`` need no copy
+        program."""
 
-        def _free(self, opaque, options):
-            raise NotImplementedError("AXCL buffers: roadmap milestone 1 (device)")
+        def __init__(self, dev):
+            super().__init__(
+                dev, supports_copy_from_disk=False, supports_transfer=False
+            )
+
+        def _alloc(self, size, options):
+            from tinygrad.device import BufferStorage
+            from tinygrad.runtime.support.memory import MMIOInterface
+
+            arr = np.zeros(size, np.uint8)
+            return BufferStorage(
+                arr, None, MMIOInterface(arr.ctypes.data, size, fmt="B")
+            )
+
+        def _free(self, storage, options):
+            pass  # numpy owns the memory
+
+        def _copyin(self, dest, src: memoryview):
+            dest[:] = np.frombuffer(src.cast("B"), np.uint8)
+
+        def _copyout(self, dest: memoryview, src):
+            dest.cast("B")[:] = src.tobytes()
+
+        def _as_buffer(self, src) -> memoryview:
+            return memoryview(src)
 
     class AXProgram(Program):
+        """A compiled ``.axmodel`` (``AXCompiler`` output) loaded into the
+        process-wide AXCL session (``ax_session``). tinygrad's convention: the
+        call's buffers are the model's outputs first, then its inputs, each
+        the raw bytes of the model's IO tensor."""
+
         def __init__(self, dev, obj):
-            raise NotImplementedError("AXCL load/run: roadmap milestone 1 (device)")
+            self.dev, self.obj = dev, bytes(obj)
+            self.session = ax_session()
+            self.model = self.session.load(self.obj)
+
+        def __call__(
+            self,
+            *bufs,
+            global_size=(1, 1, 1),
+            local_size=(1, 1, 1),
+            vals=(),
+            wait=False,
+        ):
+            m = self.model
+            n_out = len(m.outputs)
+            if len(bufs) != n_out + len(m.inputs):
+                raise ValueError(
+                    f"model has {n_out} outputs + {len(m.inputs)} inputs, got {len(bufs)} buffers"
+                )
+            ins = [
+                np.frombuffer(b, np.uint8, count=spec.nbytes).view(spec.dtype)
+                for b, spec in zip(bufs[n_out:], m.inputs)
+            ]
+            before = self.session.exec_us
+            outs = self.session.run(m, ins)
+            for b, y in zip(bufs[:n_out], outs):
+                b[: y.nbytes] = np.frombuffer(y.tobytes(), np.uint8)
+            return (self.session.exec_us - before) / 1e6 if wait else None
+
+        def __del__(self):
+            try:
+                if self.session._proc is not None:
+                    self.session.unload(self.model)
+            except Exception:
+                pass
 
     return {
         "AXCompiler": AXCompiler,
         "AXAllocator": AXAllocator,
         "AXProgram": AXProgram,
     }
+
+
+_AX_SESSION = None
+
+
+def ax_session():
+    """The process-wide ``axcl_session.AXSession`` the tinygrad ``AX`` device
+    runs on, opened on first use (it holds ``/tmp/axcl-device.lock`` until
+    ``close_ax_session``)."""
+    global _AX_SESSION
+    if _AX_SESSION is None:
+        import axcl_session
+
+        _AX_SESSION = axcl_session.AXSession().__enter__()
+    return _AX_SESSION
+
+
+def close_ax_session() -> None:
+    global _AX_SESSION
+    if _AX_SESSION is not None:
+        _AX_SESSION.close()
+        _AX_SESSION = None
+
+
+def register_ax_device() -> str:
+    """Make ``"AX"`` a tinygrad device (``Device["AX"]``, ``Buffer("AX", ...)``)
+    backed by ``AXAllocator``/``AXProgram``. The fork discovers devices as
+    ``tinygrad.runtime.ops_<name>`` modules, so this installs one in
+    ``sys.modules``. tinygrad's own scheduler cannot target it (there is no
+    renderer from UOps to templates); programs come from ``AXCompiler``."""
+    import types
+
+    from tinygrad.device import Compiled
+
+    name = "tinygrad.runtime.ops_ax"
+    if name not in sys.modules:
+        classes = tinygrad_classes()
+
+        class AXDevice(Compiled):
+            def __init__(self, device: str):
+                super().__init__(
+                    device, classes["AXAllocator"](self), [], classes["AXProgram"]
+                )
+                self.compiler_ = classes["AXCompiler"]()
+
+            def synchronize(self, timeout=None):
+                pass  # every AXProgram call is synchronous
+
+            def finalize(self):
+                close_ax_session()
+
+        mod = types.ModuleType(name)
+        mod.AXDevice = AXDevice
+        sys.modules[name] = mod
+    return "AX"
 
 
 def npu_params_of(model_bytes: bytes) -> bytes:

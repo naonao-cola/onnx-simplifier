@@ -29,7 +29,6 @@ Usage::
 
 from __future__ import annotations
 
-import fcntl
 import gzip
 import json
 import os
@@ -228,6 +227,8 @@ def run(model: onnx.ModelProto, feeds: Mapping) -> dict:
     with tempfile.TemporaryDirectory(dir=os.environ.get("EMITTER_CHECK_TMP")) as td:
         path = os.path.join(td, "m.axmodel")
         onnx.save(model, path)
+        import fcntl  # POSIX-only; imported here so this module (and its tests) import on Windows
+
         fd = os.open(_LOCK, os.O_CREAT | os.O_RDWR, 0o666)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -341,16 +342,20 @@ def relu_case(shape, step_node: str) -> Case:
 
 def reshape_case(key: str, target: tuple[float, int], label: str, zp0=False) -> Case:
     man = rre.step_manifest()
-    entry = (man["zero_point_0_templates"] if zp0 else man["templates"])[key]
+    # a nonzero zero point is a signed input: the Reshape -> Identity template
+    # (the Relu form clips it); zero point 0 keeps its Relu-form template, where
+    # the input is nonnegative. The reference is the step's plain Reshape
+    # either way, so a template that clips cannot pass.
+    entry = (man["zero_point_0_templates"] if zp0 else man["identity_templates"])[key]
     native = rre.load_axmodel(os.path.join(rre.STEP_TEMPLATE_DIR, entry["axmodel"]))
     (xn, xd), (yn, yd) = _io(native)[0][0], _io(native)[1][0]
     fm = parser.parse_model(
         f'<ir_version: 8, opset_import: ["": 17]> g (float[{_shape(xd)}] {xn}) '
         f"=> (float[{_shape(yd)}] {yn}) "
         f"<int64[{len(yd)}] target = {{{_shape(yd)}}}> "
-        f"{{ t = Reshape ({xn}, target) {yn} = Relu (t) }}"
+        f"{{ {yn} = Reshape ({xn}, target) }}"
     )
-    fm.graph.node[0].name, fm.graph.node[1].name = "reshape", "relu"
+    fm.graph.node[0].name = "reshape"
     s0, z0 = entry["scale"], entry["zero_point"]
     s, zp = target
     in_shape, out_shape = key.split("->")

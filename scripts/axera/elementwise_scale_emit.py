@@ -250,7 +250,9 @@ def load_template(
 
 
 def _write(model: onnx.ModelProto, mc: bytes, out_path: str) -> str:
-    _mcode_initializer(model).raw_data = mc
+    import step_recalibrate
+
+    model = step_recalibrate.with_mcode(model, mc)  # keeps the dims in step
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     onnx.save(model, out_path)
     return out_path

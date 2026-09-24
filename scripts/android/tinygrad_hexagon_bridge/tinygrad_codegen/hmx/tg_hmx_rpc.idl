@@ -1,0 +1,8 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface tg_hmx_rpc : remote_handle64 {
+  // run the tinygrad-generated HMX kernel (tg_kernel.c) iters times on a worker thread holding HVX + HMX
+  // times[0] = total us; codes: [0] power rc, [1] compute_res ctx, [2] hvx lock, [3] hmx lock, [4] vtcm bytes, [5] thread
+  long run(in long iters, in sequence<uint16> a, in sequence<uint16> b, rout sequence<uint16> c,
+           rout sequence<uint64> times, rout sequence<long> codes);
+};

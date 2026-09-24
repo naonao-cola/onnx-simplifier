@@ -295,15 +295,16 @@ def quantize_full_qdq(
             raise ValueError(
                 f"no calibration data and no ranges for {len(missing)} tensors, e.g. {missing[:3]}"
             )
-        ranges.update(
-            calibrate(
-                m,
-                calibration_data,
-                providers=providers,
-                method=method,
-                extra_tensor_names=missing,
-            )
+        # calibrate() reports every quantizable activation, not just the missing ones: the
+        # caller's precomputed ranges must win over it
+        calibrated = calibrate(
+            m,
+            calibration_data,
+            providers=providers,
+            method=method,
+            extra_tensor_names=missing,
         )
+        ranges = {**calibrated, **ranges}
 
     # Relu folding: producer -> Relu becomes producer -> Q(range of the Relu output, lo = 0).
     removed = set()

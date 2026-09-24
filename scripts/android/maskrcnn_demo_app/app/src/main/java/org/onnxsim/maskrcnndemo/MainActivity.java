@@ -72,7 +72,7 @@ public class MainActivity extends Activity {
 
     /** The demo's models: button label, then the activity (process) that runs it and its model extra. */
     static final String[][] MODELS = {{"Mask R-CNN", "", ""}, {"YOLO26n", "yolo", "yolo26n"}, {"YOLO11n", "yolo", "yolo11n"},
-            {"RT-DETR", "rtdetr", ""}, {"SAM", "sam", ""}, {"Super-res", "sr", ""}};
+            {"RT-DETR", "rtdetr", ""}, {"RF-DETR", "yolo", "rfdetr_nano"}, {"SAM", "sam", ""}, {"Super-res", "sr", ""}};
 
     // The fastest measured configuration (README "Optimizations"); pass --es pipe pipe_e_opt.txt
     // --es opts "" for the original #1841 path.

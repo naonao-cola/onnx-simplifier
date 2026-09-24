@@ -90,3 +90,10 @@ pass real representative batches (e.g. via
 `onnxsim.load_huggingface_calibration_data`) for a sensitivity ranking
 that reflects the model's own real activation statistics, since the
 INT8/INT4 split depends on `mean(X^2)`, not just the weight itself.
+
+## See also
+
+[quantization-sensitivity.md](quantization-sensitivity.md) -- which layers are usually sensitive (structural vs
+checkpoint-specific vs backend-specific), practical guidance, and the activation-quantization
+counterpart of this weight-only tool (`analyze_activation_sensitivity`,
+`search_activation_precision_for_budget`).

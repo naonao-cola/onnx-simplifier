@@ -193,6 +193,25 @@ def _u32(b, o: int) -> int:
     return struct.unpack_from("<I", b, o)[0]
 
 
+def _plausible_object(mc: bytes, at: int) -> bool:
+    """Whether a FlatBuffers uoffset could point at ``at``: an aligned table
+    (its soffset leads to a sane vtable) or a vector (its length fits). A
+    header word that is a scalar can look like an offset past the segment: the
+    fused ReduceSum -> flatten chain stores 0x1000 at byte 72, whose "target"
+    holds 0x000a0100, neither, and Pulsar2 keeps that word when the blob
+    shrinks (docs/axera-reshape-signed-templates.md)."""
+    n = len(mc)
+    if at % 4 or at + 4 > n:
+        return False
+    if at + 4 + _u32(mc, at) <= n:
+        return True
+    vt = at - struct.unpack_from("<i", mc, at)[0]
+    if vt < 0 or vt % 2 or vt + 4 > n:
+        return False
+    vsize, tsize = struct.unpack_from("<HH", mc, vt)
+    return vsize >= 4 and vsize % 2 == 0 and vt + vsize <= n and tsize >= 4
+
+
 def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
     """``mc`` with compressed segment ``index`` re-encoded from ``raw``, also
     when the new stream pads to a different multiple of 32 bytes.
@@ -207,7 +226,8 @@ def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
     * the total segment words (``header - 8``, or ``header - 4`` in larger
       programs) and the byte-vector length in the word before it;
     * every header uoffset (and the root table's negative soffset) whose
-      target lies past the segment.
+      target lies past the segment and is a plausible table or vector
+      (``_plausible_object``; a scalar header word is left alone).
 
     Tail tables use offsets relative to themselves and move as one block."""
     streams = codec.segment_streams(mc)
@@ -238,7 +258,7 @@ def relayout_segment(mc: bytes, index: int, raw: bytes) -> bytes:
                 struct.pack_into(
                     "<i", out, o, struct.unpack_from("<i", mc, o)[0] - delta
                 )
-        elif ins <= o + v < len(mc):
+        elif ins <= o + v < len(mc) and _plausible_object(mc, o + v):
             struct.pack_into("<I", out, o, v + delta)
     struct.pack_into("<I", out, lat, _u32(mc, lat) + delta)
     struct.pack_into("<I", out, wat, _u32(mc, wat) + delta // 8)
