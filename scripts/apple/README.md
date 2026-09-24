@@ -126,6 +126,20 @@ The Core ML translator lowers the models' static nearest-neighbor Resize
 (`asymmetric` coordinates, `floor` rounding) to constant index gathers, which
 preserves ONNX's sampling rule and avoids a Core ML resize runtime limitation.
 
+## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
+
+Times small simplified models, per node and as a whole, on rustnn's native WebNN
+implementation (`cpu`, which is ONNX Runtime's CPU EP, and `npu`, which is Core ML)
+and on tinygrad (`CPU` and `METAL`, at BEAM widths 0 and 2). Each result is checked
+against onnx's reference evaluator. The script prints a Markdown table.
+
+    python3 scripts/apple/benchmark_webnn_tinygrad.py --require npu,METAL
+
+It needs `pip install pywebnn onnxruntime tinygrad==0.14.0` on Python 3.12. The
+`rustnn-webnn` job in `apple-integration.yml` runs it. See `docs/rustnn.md` for the
+device mapping and its caveats. In particular, `npu` means the Core ML path, not a
+confirmed placement on the Neural Engine.
+
 ## SAM Core ML + tinygrad Metal hybrid benchmark
 
 `benchmark_sam_hybrid.py` measures Core ML and tinygrad Metal on the two

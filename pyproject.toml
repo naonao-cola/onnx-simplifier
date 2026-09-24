@@ -118,6 +118,15 @@ torch-training = ["torch >= 2.5", "onnxscript"]
 # API) internals, and why no real GPU/dawn library is needed just to
 # generate a kernel. Built and verified against tinygrad==0.14.0.
 webgpu-codegen = ["tinygrad == 0.14.0"]
+# pywebnn is rustnn's (https://github.com/rustnn/rustnn) Python binding: a
+# native, out-of-browser implementation of the W3C WebNN API. Needed by
+# onnxsim.rustnn_runtime (run a simplified model as a WebNN graph) and
+# onnxsim.webnn_tinygrad_tuning (time nodes on WebNN vs. BEAM-tuned tinygrad,
+# which also needs tinygrad). pywebnn's ONNX Runtime backend dlopens the
+# libonnxruntime shipped in the onnxruntime package (or ORT_DYLIB_PATH).
+# Both modules import it lazily and report/skip without it. Verified against
+# pywebnn 0.5.12, onnxruntime 1.30 and tinygrad 0.14.0.
+webnn = ["pywebnn >= 0.5.12", "onnxruntime", "tinygrad == 0.14.0"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"

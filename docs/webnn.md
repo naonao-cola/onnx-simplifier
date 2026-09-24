@@ -81,6 +81,12 @@ in `test/webnn.test.mjs`):
 Nothing about the model conversion (Simplify / Optimize) path changes — WebNN is
 only an option for the post-conversion inference check.
 
+## Outside the browser
+
+For running a simplified model as a WebNN graph natively (no browser), through
+rustnn's Python bindings, and timing it per node against BEAM-tuned tinygrad,
+see [`docs/rustnn.md`](rustnn.md).
+
 ## References
 
 - WebNN API — https://www.w3.org/TR/webnn/

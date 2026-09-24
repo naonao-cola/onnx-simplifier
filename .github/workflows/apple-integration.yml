@@ -25,6 +25,10 @@ on:
       - "scripts/common/**"
       - "tests/test_coreml_compat.py"
       - "tests/test_tinygrad_hexagon_compat.py"
+      - "tests/test_rustnn_runtime.py"
+      - "tests/test_webnn_tinygrad_tuning.py"
+      - "onnxsim/rustnn_runtime.py"
+      - "onnxsim/webnn_tinygrad_tuning.py"
 
 concurrency:
   group: apple-integration-${{ github.ref }}
@@ -109,4 +113,70 @@ jobs:
         with:
           name: metal-compat-report
           path: ${{ runner.temp }}/metal-compat.csv
+          if-no-files-found: ignore
+
+  # rustnn (native W3C WebNN, via pywebnn) on Apple silicon, timed per node
+  # against tinygrad. pywebnn 0.5.12's device types on macOS:
+  #   cpu -> ONNX Runtime CPU EP
+  #   npu -> Core ML (MLComputeUnits.cpuAndNeuralEngine, falling back to .all)
+  #   gpu -> NOT a GPU: rustnn only registers ORT's CPU EP, so it's skipped here
+  # The GPU side comes from tinygrad's METAL device instead. Core ML decides
+  # per op where it really runs, and a virtualized runner may expose no
+  # Neural Engine, so "npu" proves the Core ML path works, not ANE placement.
+  # See docs/rustnn.md.
+  rustnn-webnn:
+    name: rustnn WebNN (CPU / Core ML) vs. tinygrad (CPU / Metal)
+    runs-on: macos-15
+    # ~21 min of this is building onnxsim from source on the runner; the
+    # benchmark adds tinygrad BEAM=2 searches on Metal on top.
+    timeout-minutes: 60
+    env:
+      # Only the core simplifier is needed; skip the quantization/pruning
+      # algorithm library to cut compile time (see CLAUDE.md).
+      ONNXSIM_NON_CORE_FEATURES: "0"
+      ONNXSIM_RUSTNN_DEVICE_TYPES: "cpu,npu"
+      ONNXSIM_TINYGRAD_DEVICES: "CPU,METAL"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          # pywebnn 0.5.12 ships a macOS arm64 wheel for CPython 3.12 only.
+          python-version: "3.12"
+      - name: Install onnxsim + pywebnn + onnxruntime + tinygrad
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest "pywebnn>=0.5.12" onnxruntime "tinygrad==0.14.0"
+          python3 -m pip install .
+      # Run from runner.temp so the checkout's onnxsim/ source dir (no
+      # compiled extension) doesn't shadow the installed package.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          sysctl -n machdep.cpu.brand_string || true
+          system_profiler SPDisplaysDataType | head -20 || true
+          python3 -c "import onnxsim; print('onnxsim', onnxsim.__version__); print('cpu', onnxsim.probe_rustnn('cpu')); print('npu', onnxsim.probe_rustnn('npu'))"
+          python3 -c "from tinygrad import Device; print('tinygrad devices', list(Device.get_available_devices()))"
+      - name: Run rustnn + WebNN/tinygrad tuning tests (cpu, npu / CPU, METAL)
+        working-directory: ${{ runner.temp }}
+        run: >-
+          pytest -v -rs
+          "$GITHUB_WORKSPACE/tests/test_rustnn_runtime.py"
+          "$GITHUB_WORKSPACE/tests/test_webnn_tinygrad_tuning.py"
+      - name: Benchmark WebNN vs. tinygrad
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/apple/benchmark_webnn_tinygrad.py" \
+            --webnn-device-types cpu,npu \
+            --tinygrad-devices CPU,METAL \
+            --beams 0,2 \
+            --require npu,METAL \
+            --output webnn-tinygrad.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: webnn-tinygrad-report
+          path: ${{ runner.temp }}/webnn-tinygrad.json
           if-no-files-found: ignore
