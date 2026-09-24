@@ -1,4 +1,4 @@
-# Arm Neural Super Sampling (NSS v1) on the Xiaomi 12S HTP
+# Arm Neural Super Sampling (NSS v1) on the Xiaomi 12S: CNN on the HTP, pre/post on the Adreno GPU
 
 DLSS, XeSS, FSR4 and MetalFX are closed. Arm's **NSS** is the open, mobile-targeted counterpart of a
 DLSS-2-style temporal super sampler: a small *parameter-prediction* CNN (a 12-channel, 148K-parameter
@@ -63,19 +63,76 @@ frame 0, +5.7 dB by frame 31). PTQ of the fp32 weights costs 1 dB once the error
 the history; Arm's QAT weights quantized by onnxsim lose nothing (slightly above fp32). So the HTP
 runs NSS's network at 2.7 ms per 540p frame -- ~8% of a 33 ms frame, and cheaper than the 10.1 ms fp16.
 
-### What is not on the phone yet: the pre/post-processing
+### The whole NSS on the phone: pre/post-processing on the Adreno GPU, CNN on the HTP
 
-Most of NSS is fixed-function work around the CNN: depth dilation/scatter, disocclusion masks, luma
-derivatives (pre), then history reprojection with motion vectors (Catmull-Rom), KPN filtering of the
-jittered low-res colour and the temporal blend (post). Arm deploys those as **GPU shaders** (the GLSL
-fragment/compute shaders in the HF repo's `scenario/`, run by the ML SDK for Vulkan). The gym's
-`processing_backend="torch"` port used here is a training/validation reference: 0.35-1.2 s (pre) and
-3-4.5 s (post) per frame on the host, and it doesn't trace to ONNX (Python `round()` on tensors). So
-a real-time NSS on this phone needs those shaders ported -- the natural split on a Snapdragon is
-Arm's GLSL on the Adreno GPU via Vulkan (plain fragment/compute shaders; only the CNN used the ML
-extension) with the CNN on the HTP, or a native/HVX port of the same math. That, and the "game
-upscaling" replay demo and NFRU (frame generation, the same shape: optical-flow and warp shaders
-around a small CNN) that depend on it, are the follow-ups.
+Most of NSS is fixed-function work around the CNN: depth scatter, disocclusion, luma derivatives
+(pre), then history reprojection with motion vectors (Catmull-Rom), KPN filtering of the jittered
+low-res colour and the temporal blend (post). Arm deploys those as GPU shaders; the shader sources in
+the HF repo carry a proprietary notice, so `nss_kernels.cl` is a fresh OpenCL translation of the gym's
+Apache-2.0 torch reference (`torch_preprocess` / `torch_postprocess`, the "high" path only).
+`nss_run.cpp` runs a whole frame in one process: depth scatter + preprocess on the GPU write the CNN's
+uint8 NHWC input into a mapped buffer, ORT + QNN EP runs the int8-QAT CNN on the HTP straight into
+mapped uint8 output buffers, postprocess reads them (the temporal map through an image view of the
+same memory) and writes next frame's history. `libOpenCL.so` is dlopen'ed from the vendor partition.
+
+**Correctness.** `nss_gpu.py golden` dumps every input, state and intermediate of the torch pipeline
+(int8-QAT CNN on host ORT); `nss_gpu.py host-cl` runs the kernels on a host OpenCL device against it:
+depth scatter exact, CNN input max abs 3e-5 (0-3 of 6.3M uint8 values off by one), postprocess 120 dB
+vs the golden output, and in closed loop (own state, host ORT CNN on the kernels' uint8 input) the
+PSNR vs GT equals the torch pipeline's to 0.01 dB on every frame. On the phone (8 frames, closed loop
+with the HTP CNN): PSNR vs GT equals the torch pipeline's (+-0.01 dB) every frame, 52-54 dB vs its
+output (the RGBA8 ceiling).
+
+**Speed**, Xiaomi 12S (Adreno 730 + HTP), 1920x1080 output, median over 8 frames x 4 passes, GPU times
+from OpenCL profiling events:
+
+| step | preprocess | HTP CNN | postprocess | frame |
+|---|---:|---:|---:|---:|
+| first version (planar fp32 buffers) | 56 ms | 6 ms | 170 ms | 238 ms |
+| vector layouts, uint8 temporal read directly, LUT in constant memory | 40 | 6 | 140 | 190 |
+| no dynamically indexed private arrays (unrolled) | 15 | 4 | 116 | 140 |
+| `fma1()`: no OpenCL `fma()` (software-emulated on Adreno) | 16 | 4 | 77 | 101 |
+| history as an RGBA32F image (texture path) | 13 | 4 | 28 | 49 |
+| lookup tables in `__local`, temporal map as an image view | 12 | 4 | 14 | 33 |
+| **colour + derivative state as images** | **5.9** | **3.3** | **13.0** | **25** |
+
+25 ms/frame is 40 FPS at 1080p output (the per-frame upload of colour/motion/depth from the CPU,
+~4 ms, is excluded: in a game those already live on the GPU). NSS is a recurrence -- frame t+1's
+preprocess needs frame t's output and CNN feedback -- so the GPU and the HTP cannot overlap across
+frames (only the depth scatter could). What mattered on the Adreno, in order: (1) dynamically indexed
+private arrays (spilled to memory, and one kernel's per-thread constant tables filled 32 KB of local
+memory); (2) OpenCL `fma()` -- the reference's single-rounding multiply-adds -- is software-emulated
+(no native fused fp32 FMA): ~50 ms of the postprocess; an error-free Dekker product + TwoSum instead;
+(3) 2D gathers through images rather than buffers; (4) divergent `__constant` lookups serialize --
+stage tables in `__local`. `-cl-fast-relaxed-math` and `cl_qcom_perf_hint` changed nothing measurable.
+The Adreno driver rejects `-cl-fp32-correctly-rounded-divide-sqrt`; its default divide/sqrt accuracy
+is what the phone numbers above use.
+
+### tinygrad-generated OpenCL vs hand-written
+
+`tg_nss.py` writes two stages in tinygrad, renders them with tinygrad's OpenCL backend on the host
+(`DEV=CL`, fork `onnxsim/tinygrad` @ `62d98031`, upstream's OpenCL renderer), captures every launched
+kernel (source, launch dims, buffers) and replays them on the phone with `cl_bench --plan`, next to
+hand-written twins with the same math (`tg_compare.cl`), on the same random inputs:
+
+| stage (Adreno 730) | tinygrad | hand-written | outputs |
+|---|---:|---:|---|
+| postprocess accumulate tail, 1080p (elementwise + per-pixel channel max) | 15.3 ms (7 kernels) | 5.1 ms (1) | identical (max 1.2e-7) |
+| preprocess YCoCg derivative, 540p (+-1 stencil + instability state machine) | 8.7 ms (2 kernels) | 1.0 ms (1) | identical |
+
+tinygrad's math is exact, but its schedule is the cost: the per-pixel max over 3 channels splits the
+accumulate graph into reduce kernels that materialize 1080p intermediates, and the derivative graph
+becomes one kernel per output, each recomputing the stencil. The rest of NSS -- the data-dependent
+gathers (motion-reprojected bilinear/Catmull-Rom, the KPN taps, the nearest-depth search) -- is not
+expressible efficiently: tinygrad lowers a data-dependent gather to one-hot compares (O(pixels^2)), so
+those kernels stay hand-written.
+
+### Not done yet
+
+NFRU (Arm's neural frame-rate upscaling: the same shape -- a small CNN plus warp/blend shaders) and the
+demo app's "game upscaling" replay mode build on this runner. The per-frame filter offset LUT is
+computed on the device from the jitter (`nss_lut.h`, bit-identical to the gym's `_compute_lut` over 512
+jitters, `lut_check.cpp`), so a frame needs only colour, motion, depth and a few scalars.
 
 ## Reproduce
 
@@ -86,4 +143,11 @@ $S python nss.py host --frames 32 # fp32 pipeline; saves the CNN inputs -> cnn_i
 $S python nss.py build            # ONNX: fp16 + int8 (fp32 weights) + int8 (Arm QAT weights)
 $S python nss.py host --frames 32 # again: adds the ONNX CNN variants (closed loop, host ORT)
 python nss.py phone --frames 16   # takes the phone lock itself per variant
+
+# GPU pre/post-processing (OpenCL) + HTP CNN
+$S python nss_gpu.py golden --frames 8   # torch golden dumps -> ~/.cache/arm-nss/golden/
+$S env PYTHONPATH=<pyopencl> python nss_gpu.py host-cl --frames 8   # kernels on a host OpenCL device
+CL_HEADERS=/usr/include python nss_gpu.py phone --frames 8 --iters 4   # builds nss_run, runs under the lock
+$S env DEV=CL TINYGRAD_PATH=<tinygrad> PYTHONPATH=<pyopencl> python tg_nss.py host   # tinygrad vs hand
+python tg_nss.py phone
 ```
