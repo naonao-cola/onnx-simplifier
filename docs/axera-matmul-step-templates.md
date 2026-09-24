@@ -138,7 +138,8 @@ Still refused, and why:
 
 A follow-up round (build scripts in `~/npu-scratch/t_step_dxB/`) closed the
 remaining MatMul and Gemm nodes. At the predicted calibration, totals go from
-481 covered / 623 refused to **513 / 591**: MatMul 36 -> 41 of 41, Gemm and
+481 covered / 623 refused to **513 / 591** (528 / 576 with #1946's Conv
+templates): MatMul 36 -> 41 of 41, Gemm and
 its ReduceMean covered, and Reshape 150 -> 170 of 170 (the int8 kernel
 Reshapes are inside the extended dX chains now). Mul 14 -> 19 and more
 Transpose/Squeeze nodes count too, because they are computed inside those
@@ -182,7 +183,16 @@ chains.
   point)` instead of its `#i8` view, so the reference quantized the weight
   wrong. A native build at a step-like fine output scale, and the template
   recalibrated onto it, were both exact on the device, which ruled out
-  both the emitter and the output scale. dX 325's batch split ran only
+  both the emitter and the output scale. The same reference bug made dX 121 look
+  3 LSB off (1.1% of outputs) with the refreshed chain reference from #1946;
+  with the `#i8` view it is exact (0 LSB). A second harness bug hid the Gemm
+  chain: the device runner returns output files in sorted filename order, so
+  `__side` outputs came first and the check compared the wrong tensor
+  (`_primary` now picks the graph output by name). The Gemm chain is within
+  1 LSB at the step's calibration and at a perturbed one. Every MatMul and
+  Conv case in `device_results.json` is within 1 LSB, except the 3x3
+  stage3 conv1 chain at 2 LSB on one element, which its native control
+  matches. dX 325's batch split ran only
   offline (a stub-session test).
 
 ## A fused bias Add has three more calibration words

@@ -649,6 +649,7 @@ def cases() -> list[Callable[[], Case]]:
     out.append(lambda: matmul_case("conv_resnetv15_stage2_conv4_fwd"))
     out.append(lambda: matmul_case("conv_resnetv15_stage4_conv3_fwd"))
     out.append(lambda: matmul_case("fc_fwd_resnetv15_dense0_fwd", "perturb"))
+    out.append(lambda: matmul_case("fc_fwd_resnetv15_dense0_fwd"))
     return out
 
 
@@ -697,11 +698,21 @@ def _out_scale(cfg: QConfig) -> float | None:
     return None if q is None else q[0]
 
 
+def _primary(outs: list, model: onnx.ModelProto, name: str):
+    """The device output for graph output ``name``: the runner returns the
+    output files in sorted filename order (one ``<name>.bin`` per output),
+    not graph order, so a template with ``__side`` outputs would otherwise
+    compare the wrong tensor."""
+    names = sorted(o.name for o in model.graph.output)
+    return outs[names.index(name)] if name in names else outs[0]
+
+
 def check_case(case: Case) -> dict:
     res: dict = {"case": case.name, "emitter": case.emitter, "target": case.target}
     if case.note:
         res["note"] = case.note
     # control: native template at its own calibration
+    main = case.float_model.graph.output[0].name
     feeds, spread = feeds_for(case, case.native_cfg)
     ref = qdq_reference(case.float_model, case.native_cfg, feeds)
     ctl = run(case.native, feeds)
@@ -710,7 +721,11 @@ def check_case(case: Case) -> dict:
         return res
     res["control"] = {
         "spread": spread,
-        **lsb_error(ctl["outputs"][0], ref[0], _out_scale(case.native_cfg)),
+        **lsb_error(
+            _primary(ctl["outputs"], case.native, main),
+            ref[0],
+            _out_scale(case.native_cfg),
+        ),
     }
     # emitted at the target calibration
     try:
@@ -726,7 +741,11 @@ def check_case(case: Case) -> dict:
     else:
         res["emitted"] = {
             "spread": tspread,
-            **lsb_error(out["outputs"][0], tref[0], _out_scale(case.target_cfg)),
+            **lsb_error(
+                _primary(out["outputs"], model, main),
+                tref[0],
+                _out_scale(case.target_cfg),
+            ),
         }
     health = run(case.native, feeds)
     res["health_after"] = health["outputs"] == ctl["outputs"]

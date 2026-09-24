@@ -162,6 +162,26 @@
    "health_after": true
   },
   {
+   "case": "misc_Log:16x1000",
+   "emitter": "misc_op_record_emit.emit_model",
+   "target": "step Log_3",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 0.0,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 16000
+   },
+   "emitted": {
+    "spread": 1.0,
+    "max_lsb": 0.0,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 16000
+   },
+   "health_after": true
+  },
+  {
    "case": "misc_MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1:zp",
    "emitter": "misc_op_record_emit.emit_model",
    "target": "step resnetv15_pool0_fwd",
@@ -359,26 +379,6 @@
    "health_after": true
   },
   {
-   "case": "misc_Log:16x1000",
-   "emitter": "misc_op_record_emit.emit_model",
-   "target": "step Log_3",
-   "control": {
-    "spread": 1.0,
-    "max_lsb": 0.0,
-    "p999_lsb": 0.0,
-    "frac_over_1lsb": 0.0,
-    "n": 16000
-   },
-   "emitted": {
-    "spread": 1.0,
-    "max_lsb": 0.0,
-    "p999_lsb": 0.0,
-    "frac_over_1lsb": 0.0,
-    "n": 16000
-   },
-   "health_after": true
-  },
-  {
    "case": "matmul_fc_dW_MatMul_38_step",
    "emitter": "matmul_record_emit.recalibrate",
    "target": "step MatMul_38 (predicted calibration)",
@@ -404,8 +404,8 @@
    "target": "step MatMul_121 (predicted calibration)",
    "control": {
     "spread": 1.0,
-    "max_lsb": 1.0000022848908545,
-    "p999_lsb": 1.0000022848908545,
+    "max_lsb": 1.0000021355009523,
+    "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
     "n": 802816
    },
@@ -415,6 +415,46 @@
     "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
     "n": 802816
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_dX_MatMul_240_step",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "step MatMul_240 (predicted calibration)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000009227370719,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 0.25,
+    "max_lsb": 0.9999998168187163,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_dX_MatMul_240_perturb",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "perturbed template calibration (seed 0)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000009227370719,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 1.0,
+    "max_lsb": 1.0000004221035361,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
    },
    "health_after": true
   },
@@ -455,26 +495,6 @@
     "p999_lsb": 0.0,
     "frac_over_1lsb": 1.2456154336734693e-06,
     "n": 802816
-   },
-   "health_after": true
-  },
-  {
-   "case": "matmul_fc_fwd_resnetv15_dense0_fwd_perturb",
-   "emitter": "matmul_record_emit.recalibrate",
-   "target": "perturbed template calibration (seed 0)",
-   "control": {
-    "spread": 1.0,
-    "max_lsb": 1.0000028090597797,
-    "p999_lsb": 0.9999983156877561,
-    "frac_over_1lsb": 0.0,
-    "n": 16000
-   },
-   "emitted": {
-    "spread": 1.0,
-    "max_lsb": 1.000002072540701,
-    "p999_lsb": 0.0,
-    "frac_over_1lsb": 0.0,
-    "n": 16000
    },
    "health_after": true
   },
@@ -539,62 +559,42 @@
    "health_after": true
   },
   {
-   "case": "matmul_conv_resnetv15_stage3_conv1_fwd_perturb",
+   "case": "matmul_fc_fwd_resnetv15_dense0_fwd_perturb",
    "emitter": "matmul_record_emit.recalibrate",
    "target": "perturbed template calibration (seed 0)",
    "control": {
-    "spread": 1.0,
-    "max_lsb": 1.0000085311800782,
-    "p999_lsb": 1.0000014403291042,
+    "spread": 0.5,
+    "max_lsb": 0.0,
+    "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
-    "n": 802816
+    "n": 16000
    },
    "emitted": {
     "spread": 1.0,
-    "max_lsb": 2.000002444082449,
-    "p999_lsb": 1.0000012220412244,
-    "frac_over_1lsb": 1.2456154336734693e-06,
-    "n": 802816
+    "max_lsb": 1.0000005827980172,
+    "p999_lsb": 0.9999998065110582,
+    "frac_over_1lsb": 0.0,
+    "n": 16000
    },
    "health_after": true
   },
   {
-   "case": "matmul_dX_MatMul_240_step",
+   "case": "matmul_fc_fwd_resnetv15_dense0_fwd_step",
    "emitter": "matmul_record_emit.recalibrate",
-   "target": "step MatMul_240 (predicted calibration)",
+   "target": "step resnetv15_dense0_fwd (predicted calibration)",
    "control": {
-    "spread": 1.0,
-    "max_lsb": 1.0000009227370719,
+    "spread": 0.5,
+    "max_lsb": 0.0,
     "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
-    "n": 1605632
+    "n": 16000
    },
    "emitted": {
     "spread": 0.25,
-    "max_lsb": 0.9999998168187163,
+    "max_lsb": 1.00000108050847,
     "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
-    "n": 1605632
-   },
-   "health_after": true
-  },
-  {
-   "case": "matmul_dX_MatMul_240_perturb",
-   "emitter": "matmul_record_emit.recalibrate",
-   "target": "perturbed template calibration (seed 0)",
-   "control": {
-    "spread": 1.0,
-    "max_lsb": 1.0000009227370719,
-    "p999_lsb": 0.0,
-    "frac_over_1lsb": 0.0,
-    "n": 1605632
-   },
-   "emitted": {
-    "spread": 0.5,
-    "max_lsb": 1.0000004221035361,
-    "p999_lsb": 1.0000004221035361,
-    "frac_over_1lsb": 0.0,
-    "n": 1605632
+    "n": 16000
    },
    "health_after": true
   }

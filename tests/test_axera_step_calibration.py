@@ -254,7 +254,7 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"covered": 496, "refused": 608}
+_EXPECTED_TOTALS = {"covered": 528, "refused": 576}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
     "Conv": {"covered": 20},
