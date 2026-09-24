@@ -163,6 +163,10 @@ class Segment:
     in_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
     out_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
     unsafe: str = ""  # why the template's semantics differ from the node's
+    # A template built at batch N/k runs k times on batch slices; ``split``
+    # marks the inputs that carry the batch axis (step_template batch_split).
+    batch_split: int = 1
+    split: list[bool] = dataclasses.field(default_factory=list)
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -176,6 +180,13 @@ def _scale_dict(calib, names: Mapping[str, str]) -> tuple[dict, dict]:
         s, z, _ = qparams_of(calib, t)
         sc[role], zp[role] = s, z
     return sc, zp
+
+
+def _dim0(model: onnx.ModelProto, name: str) -> int | None:
+    for vi in (*model.graph.input, *model.graph.value_info, *model.graph.output):
+        if vi.name == name and vi.type.tensor_type.shape.dim:
+            return vi.type.tensor_type.shape.dim[0].dim_value
+    return None
 
 
 def _segment_for(
@@ -206,11 +217,11 @@ def _segment_for(
                 inv[a] = inv[src]
         t_in = [inv[i.name] for i in tmpl.graph.input]
         t_out = [inv[o.name] for o in tmpl.graph.output if o.name not in aliases]
-        internal = [
-            s
-            for s, t in entry["names"].items()
-            if t not in {i.name for i in tmpl.graph.input}
-        ]
+        # A ``__pre`` input stands for its step tensor (the template's Relu
+        # is template-only), so that tensor is an input, not computed here.
+        t_inputs = {i.name for i in tmpl.graph.input}
+        t_inputs |= {src for a, src in aliases.items() if a in t_inputs}
+        internal = [s for s, t in entry["names"].items() if t not in t_inputs]
         producers = {o: n.name for n in model.graph.node for o in n.output}
         nodes = sorted({producers[t] for t in internal if t in producers})
 
@@ -238,9 +249,15 @@ def _segment_for(
                 in_q.append((float(qq["consumer_int8_scale"]), 0, True))
             else:
                 in_q.append(qparams_of(calib, t))
+        k = entry.get("batch_split", 1)
+        split = [
+            k > 1 and _dim0(model, t) == _dim0(tmpl, i.name) * k
+            for t, i in zip(t_in, tmpl.graph.input)
+        ]
         return Segment(
-            name, "matmul_chain", nodes, t_in, t_out, detail, emit_mm, in_q, q(t_out)
-        )
+            name, "matmul_chain", nodes, t_in, t_out, detail, emit_mm, in_q, q(t_out),
+            batch_split=k, split=split,
+        )  # fmt: skip
 
     if op in ("Greater", "Less"):
         key = rec["attrs"]["misc_key"]
@@ -428,12 +445,28 @@ def build_plan(
             continue
         candidates.append(seg)
     # multi-node segments (chains, fused pairs) claim their nodes first
+    # A node inside two chains (the fc Squeeze feeds both the forward Gemm
+    # chain and the fc dW chain) is recomputed by each; only a clash on a
+    # node whose output a segment exports keeps the smaller segment out.
+    exported: dict[str, set[str]] = {}
+    for seg in candidates:
+        exported[seg.name] = {
+            n.name for n in model.graph.node if set(n.output) & set(seg.outputs)
+        }
+    claimed: dict[str, str] = {}
     for seg in sorted(candidates, key=lambda s: -len(s.nodes)):
-        if taken & set(seg.nodes):
+        clash = [
+            n
+            for n in taken & set(seg.nodes)
+            if n in exported[seg.name] or n in exported[claimed[n]]
+        ]
+        if clash:
             for n in seg.nodes:
                 host.setdefault(n, f"covered, but inside another segment ({seg.name})")
             continue
         segs.append(seg)
+        for n in seg.nodes:
+            claimed.setdefault(n, seg.name)
         taken.update(seg.nodes)
     order = {r["name"]: k for k, r in enumerate(records)}
     segs.sort(key=lambda s: max(order.get(n, 0) for n in s.nodes))
@@ -593,7 +626,20 @@ class StepRunner:
         m = self.session.load(self.emitted(seg))
         try:
             ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
-            ys = self.session.run(m, ins)
+            if seg.batch_split > 1:
+                parts = [
+                    self.session.run(
+                        m,
+                        [
+                            np.array_split(x, seg.batch_split)[j] if s else x
+                            for x, s in zip(ins, seg.split)
+                        ],
+                    )
+                    for j in range(seg.batch_split)
+                ]
+                ys = [np.concatenate(p) for p in zip(*parts)]
+            else:
+                ys = self.session.run(m, ins)
         finally:
             self.session.unload(m)
         want = {o.name: o for o in self.model.graph.value_info}

@@ -80,3 +80,22 @@ def test_backend_plans_live_operand_nodes_from_the_manifest():
         assert MANIFEST["nodes"][node]["template"] in detail
     status, _ = tb.plan_node({"op": "MatMul", "name": "not_a_step_node", "attrs": {}})
     assert status == "refused"
+
+
+def test_mean_ratio_lane_is_float32():
+    """The Gemm chain's fused ReduceMean writes ``s_x / (s_y * 49)`` computed
+    in float32 (the native builds' lanes; float64 is one ulp off on one)."""
+    for sx, sy, want in (
+        (0.0721786692738533, 0.022852279245853424, 0x3D84030E),
+        (0.053489550948143005, 0.014638850465416908, 0x3D98B850),
+    ):
+        scales = {"x": (sx, 92.0), "y": (sy, 0.0)}
+        assert mre.evaluate(("meanr", "x", "y", 49), scales) == want
+
+
+def test_batch_split_node_is_served_by_a_smaller_batch_template():
+    split = {n: e for n, e in MANIFEST["nodes"].items() if e.get("batch_split", 1) > 1}
+    for node, e in split.items():
+        entry = mre.step_template(node)
+        assert entry["batch_split"] == e["batch_split"]
+        assert 16 % entry["batch_split"] == 0

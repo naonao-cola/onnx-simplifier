@@ -123,6 +123,77 @@ Still refused, and why:
   decoded (`zpk`).
 - **dX 325:** Pulsar2 does not finish it within 40 minutes (tried 4 times; the
   memory cap killed the first attempt).
+- **3x3 Conv stage2/3/4 conv1 (9 nodes):** the Concat header is not found.
+  With the Relu prefix, the taps' ratio into the Concat is above 1, and the
+  header then has a different form. That needs decoding.
+- **stage1 conv0 template (serves 4):** it fits the 2 nodes whose input is
+  the max pool. For the 2 whose input is an unfused Relu, the Concat ratio is
+  above 1 (a different program). Those need a Relu-prefix template of their
+  own.
+- **stage4 conv0 / stage4 conv2:** held-out pair mismatch. For conv2 the
+  `npu_params` DMA table differs by one tile rotation (#1836-style noise),
+  and a second build is needed to confirm. For conv0 the record structure
+  differs between the two calibrations.
+## The rest of the dX chains, the Gemm and dX 325
+
+A follow-up round (build scripts in `~/npu-scratch/t_step_dxB/`) closed the
+remaining MatMul and Gemm nodes. At the predicted calibration, totals go from
+481 covered / 623 refused to **513 / 591** (528 / 576 with #1946's Conv
+templates): MatMul 36 -> 41 of 41, Gemm and
+its ReduceMean covered, and Reshape 150 -> 170 of 170 (the int8 kernel
+Reshapes are inside the extended dX chains now). Mul 14 -> 19 and more
+Transpose/Squeeze nodes count too, because they are computed inside those
+chains.
+
+- **The "structure differs" was rebuild noise.** Rebuilding each extended dX
+  chain at the *same* calibration reproduced the other build's record
+  structure: Pulsar2 picks one of two tilings for these chains
+  nondeterministically (the `axera-matmul-table-order-coinflip` pattern, at
+  whole-program scale). In every case two of the four builds (template,
+  held-out, and one rebuild of each) share a structure and recalibrate onto
+  each other exactly both ways. The manifest records which builds form each
+  pair (`builds`): 54, 138, 223, 258 use the template's rebuild and the
+  original held-out build; 342 and 360 the original template and the
+  held-out rebuild.
+- **dX 240's tie.** Its template's two ratio roles
+  (`gather/mul` and `weight/reshape`) come out equal. The held-out build
+  does not tie, so it is the template now, with a third calibration
+  (`x0.95, zp +3`) as its held-out build.
+- **The Gemm's mean ratio.** The unexplained lane is the fused ReduceMean's
+  `s_x / (s_y * 49)`, computed in float32 (`meanr`; float64 is one ulp high
+  on one build). With it the Gemm chain recalibrates, but its first template
+  ties two zero points (`dense0_fwd_mm` and `dense0_fwd`, both 130), so the
+  held-out build is the template now and a third calibration the held-out
+  build; all three builds agree.
+- **dX 325 as four batch-4 runs.** Pulsar2 never finishes the batch-16 chain
+  (> 40 min, four tries). Every op in it is per-sample: the Gather indexes
+  the last axis, the mask is `[1,1,1,28224]`, and the kernel path has no
+  batch axis. So the node equals four runs of the same chain at batch 4
+  (only the gathered Reshape's shape constant changes). That compiles in
+  about 14 minutes, the pair is exact both ways, and it recalibrates onto the
+  step. The manifest marks the node `batch_split: 4`; `step_template`
+  returns it, and `step_runner` runs the segment on four batch slices of
+  the batch-carrying inputs and concatenates the outputs.
+- **On the device** (`emitter_device_check.py`, dX 240, each run between a
+  native control and a health run that matched it): within 1 LSB at the
+  step's predicted calibration and at a perturbed one, like the control.
+  A first step run looked up to 3 LSB off on 0.84% of outputs; that was the
+  check's reference, not the emitter. `retarget_config` gave the weight's
+  int8 consumer (the kernel Reshape) the weight's uint8 `(scale, zero
+  point)` instead of its `#i8` view, so the reference quantized the weight
+  wrong. A native build at a step-like fine output scale, and the template
+  recalibrated onto it, were both exact on the device, which ruled out
+  both the emitter and the output scale. The same reference bug made dX 121 look
+  3 LSB off (1.1% of outputs) with the refreshed chain reference from #1946;
+  with the `#i8` view it is exact (0 LSB). A second harness bug hid the Gemm
+  chain: the device runner returns output files in sorted filename order, so
+  `__side` outputs came first and the check compared the wrong tensor
+  (`_primary` now picks the graph output by name). The Gemm chain is within
+  1 LSB at the step's calibration and at a perturbed one. Every MatMul and
+  Conv case in `device_results.json` is within 1 LSB, except the 3x3
+  stage3 conv1 chain at 2 LSB on one element, which its native control
+  matches. dX 325's batch split ran only
+  offline (a stub-session test).
 
 ## A fused bias Add has three more calibration words
 

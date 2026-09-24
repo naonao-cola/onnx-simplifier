@@ -254,21 +254,21 @@ def test_coverage_at_the_predicted_step_calibration():
         assert report["per_op"][op] == counts, op
 
 
-_EXPECTED_TOTALS = {"covered": 496, "refused": 608}
+_EXPECTED_TOTALS = {"covered": 528, "refused": 576}
 _EXPECTED_PER_OP = {
     "Add": {"covered": 43, "refused": 101},
     "Conv": {"covered": 20},
     "Div": {"covered": 1, "refused": 51},
-    "Gemm": {"refused": 1},
+    "Gemm": {"covered": 1},
     "Log": {"covered": 2},
-    "MatMul": {"covered": 36, "refused": 5},
+    "MatMul": {"covered": 41},
     "MaxPool": {"covered": 1},
-    "Mul": {"covered": 14, "refused": 383},
-    "ReduceMean": {"refused": 1},
+    "Mul": {"covered": 19, "refused": 378},
+    "ReduceMean": {"covered": 1},
     "Neg": {"covered": 2},
     "ReduceSum": {"covered": 44},
     "Relu": {"covered": 17},
-    "Reshape": {"covered": 150, "refused": 20},
+    "Reshape": {"covered": 170},
     "Softmax": {"covered": 3},
     "Sqrt": {"covered": 42},
     "Sub": {"refused": 46},
