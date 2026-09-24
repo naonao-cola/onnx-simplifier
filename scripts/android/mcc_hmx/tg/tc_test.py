@@ -3,10 +3,9 @@
 import sys
 from pathlib import Path
 
+import capture
 import numpy as np
 from tinygrad import Tensor, dtypes
-
-import capture
 
 out, (B, M, K, N) = Path(sys.argv[1]), map(int, sys.argv[2:6])
 rng = np.random.default_rng(0)

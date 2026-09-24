@@ -147,11 +147,10 @@ def tg_block_t(xt, w):
 
 
 def cmd_check(a):
-    import torch
-    from tinygrad import Tensor
-
     import capture
     import ref as R
+    import torch
+    from tinygrad import Tensor
 
     torch.set_grad_enabled(False)
     import model as M

@@ -3,10 +3,9 @@
 import sys
 from pathlib import Path
 
+import capture
 import numpy as np
 from tinygrad import Tensor
-
-import capture
 
 out, op = Path(sys.argv[1]), sys.argv[2]
 rng = np.random.default_rng(0)
