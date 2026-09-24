@@ -136,10 +136,16 @@ def tg_block_t(xt, w):
     s = T(w["km"]).matmul(q.contiguous(), dtype=dtypes.half).contiguous().float() + T(w["mask"])  # S^T, (16, 224, Q)
     ss = (q.float() * k.float()).sum(1, keepdim=True) * (HD**-0.5)  # (16, 1, Q)
     m = s.max(1, keepdim=True).maximum(ss)
-    e, es = (s - m).exp(), (ss - m).exp()
-    inv = 1.0 / (e.sum(1, keepdim=True) + es)
-    o = T(w["vt"]).matmul((e * inv).cast(dtypes.half).contiguous(), dtype=dtypes.half).float() + (es * inv) * v.float()  # (16, 32, Q)
-    o = o.cast(dtypes.half).reshape(D, q_n).contiguous()
+    # e = exp(s - m) once, stored half (in (0, 1]); the row sums read it back, and the normalization happens after P V, in
+    # its epilogue (o = (V^T e) / sum): fused into both the sum and a separate P = e / sum kernel, the exp ran twice
+    e, es = (s - m).exp().cast(dtypes.half).contiguous(), (ss - m).exp()
+    inv = (1.0 / (e.float().sum(1, keepdim=True) + es)).contiguous()
+    # the self term's weight is materialized (16 x Q): fused into P V's epilogue it was a scalar exp per output element
+    ps = (es * inv).contiguous()
+    o = T(w["vt"]).matmul(e, dtype=dtypes.half).float() * inv + ps * v.float()  # (16, 32, Q)
+    # materialized as (16, 32, Q) and only then viewed as (512, Q): a (512, Q) kernel output merges head and d into one
+    # axis, P's index then depends on it (row // 32) and P V isn't a matmul the tensor core takes (13 ms on HVX, 5.8 on HMX)
+    o = o.cast(dtypes.half).contiguous().reshape(D, q_n)
     xt = xt + T(w["wproj"]).matmul(o, dtype=dtypes.half) + T(w["bproj"])
     h = (T(w["w1"]).matmul(ln(xt, w["ln2"]), dtype=dtypes.half) + T(w["b1"])).contiguous()
     g = h.float().gelu(approximate="tanh").cast(dtypes.half).contiguous()

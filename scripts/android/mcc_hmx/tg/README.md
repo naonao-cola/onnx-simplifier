@@ -5,7 +5,7 @@ directory runs the same block as **plain tinygrad Tensor code** through the onnx
 (`hvx-hmx`: HVX codegen, qfloat, the HMX TensorCore) on the phone, checks it kernel by kernel, and fixes what that
 turned up in the fork (onnxsim/tinygrad#7, branch `hvx-hmx-mcc`). The hand kernel is the target to match.
 
-**Status: correct on the phone (cos 0.9999986 vs float64 at 1024 queries), 77 ms per block** -- about 30x the hand
+**Status: correct on the phone (cos 0.9999997 vs float64 at 1024 queries), 48.8 ms per block** -- about 19x the hand
 kernel. It started at "doesn't compile / wrong / faults on the phone"; the table at the end has the steps and the
 remaining gap.
 
@@ -58,6 +58,15 @@ now emits (`decode_packet: assertion failed`). So the kernels are captured and r
    through an 8-way tag cache). `HMX_VTCM_KB=4096`: one pool in 4 MB of VTCM, K panels at a stride that keeps every
    load pair inside a 256 KB window; weights and activation panels are packed once per call. The capture records it
    (`vtcm_kb.txt`) and the replay skel acquires that much VTCM.
+10. **P V on HVX** (model code): `o.reshape(512, Q).contiguous()` made the kernel's output 512 rows, tinygrad merged head
+    and head_dim into that axis, P's index depended on it (row // 32) and the tensor core didn't apply. Materialized as
+    (16, 32, Q) first, P V is an HMX matmul (13 -> 5.8 ms, and closer to float64).
+11. **HMX epilogues** (fork): a bias / residual after an HMX matmul cost 2.5-5x the matmul itself -- a column-major
+    accumulator for single-M-tile outputs (expanded axes now ordered by store stride), a deal clang scalarized through the
+    stack (now one vdealh per register), clang forwarding those registers into the row loads and rebuilding every row with
+    vinserts (asm stores), 64-byte row loads with no prefetch. fc1 + bias 10 -> 3.8 ms, fc2 + residual 5.8 -> 4.0.
+12. **Softmax exp twice** (model code): e = exp(s - m) fused into both the row sum and the P = e / sum kernel. Now e is
+    stored once (half), the sum reads it, and the 1 / sum moves into P V's epilogue (o = (V^T e) / sum): -1 kernel.
 
 ## Phone (Xiaomi 12S, one decoder block, 1024 queries, `run.sh`)
 
@@ -70,21 +79,23 @@ now emits (`decode_packet: assertion failed`). So the kernels are captured and r
 | + DSP upcast heuristic: no gathers (7) | 258.5 | cos 0.9999986 |
 | + vector float max (8) | 160.8 | |
 | + contiguous upcast before the reduce unroll (7: self score 37.8 -> 0.7 ms) | 123.4 | |
-| + 4 MB HMX tile pool (9) | **77.2** | cos 0.9999986 |
+| + 4 MB HMX tile pool (9) | 77.2 | cos 0.9999986 |
+| + P V on HMX (10) | 70.4 | cos 0.9999997 |
+| + exp once, normalize in P V's epilogue (12) | 64.0 | |
+| + HMX epilogue fixes (11) | **48.8** | cos 0.9999997 |
 | hand kernel (`../mcc_block.h`) | 2.6 | cos 0.9999996 |
 
-Per kernel now (ms): HVX -- P V 13.1 (on HVX: its 7-tile K didn't take the HMX path), softmax sum of exp 8.9, softmax
-normalize 8.9, GELU 8.4, softmax row max 2.8, LayerNorm 2 x (0.6 + 1.9 statistics, 1.9 apply), self score 0.7; HMX --
-fc1 9.9, qkv 7.5, fc2 5.8, proj 4.5, S 2.0 (the hand kernel's HMX work is 1.14 ms in total, at 3.07 TMAC/s).
+Per kernel now (ms): HVX -- softmax exp 9.0, GELU 8.4, softmax row max 2.9 + row sum 2.9, LayerNorm 2 x (0.8 + 1.9
+statistics, 2.0 apply), self score 0.7; HMX (with epilogues) -- P V 4.5, fc2 4.0, fc1 3.8, qkv 2.9, proj 2.7, S 2.0 (the
+hand kernel's HMX work is 1.14 ms in total, at 3.07 TMAC/s).
 
 ## The remaining gap, largest first
 
-1. **HMX kernels from DDR**: every matmul still packs its operands from row-major DDR into VTCM tiles once per call and
-   unpacks the output (29.7 ms for 3.5 GMAC); the hand kernel keeps activations in VTCM between steps in the tile layout
-   and streams prepacked weights (see `../../tinygrad_hexagon_bridge/tinygrad_codegen/hmx`: 2.1x the hand GEMM for one
-   GEMM, far more for small K). P V (K = 224 = 7 tiles) runs on HVX, not HMX.
-2. **The softmax / GELU element-wise work** (27 ms vs the hand kernel's ~0.9 ms on 4 threads): each step is its own
-   kernel through DDR in fp32, where the hand kernel works in hf / qf32 on VTCM tiles.
+1. **The transcendental element-wise work** (exp 9.0 + GELU 8.4 ms vs the hand kernel's ~0.9 ms on 4 threads): the fork's
+   qfloat exp2 / reciprocal are fp32 (32 lanes); the hand kernel's are hf (64 lanes) on VTCM tiles.
+2. **HMX kernels from DDR**: every matmul still packs its operands from row-major DDR into VTCM tiles once per call and
+   unpacks the output through DDR (19.9 ms for 3.6 GMAC, bare matmuls ~2 ms each); the hand kernel keeps activations in
+   VTCM between steps in the tile layout and streams prepacked weights.
 3. **No fusion across ops**: 15 kernels, every intermediate through DDR (the hand kernel: one fused block).
 4. **One thread**: the backend runs one HVX context; the hand kernel splits row blocks over 4 and overlaps HMX with HVX.
 
