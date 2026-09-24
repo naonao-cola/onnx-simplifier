@@ -5,12 +5,13 @@
 //   nss_run <dir> <cnn.onnx> <cnn_ctx.onnx> <frames> [iters]
 //
 // <dir> holds nss_kernels.cl and per-frame inputs from `nss_gpu.py phone` (frameNNN.bin: colour float4 RGBA,
-// motion float2 (y, x), depth float; frameNNN.txt: jitter y x, exposure, render size y x, depth params x4, reset,
-// LUT modulo h w, taps, then the LUT floats). Writes outNNN.bin (the tonemapped RGBA8 output) and prints
+// motion float2 (y, x), depth float; frameNNN.txt: jitter y x, exposure, render size y x, depth params x4, reset;
+// the filter offset LUT is computed here from the jitter, nss_lut.h). Writes outNNN.bin (the tonemapped RGBA8 output) and prints
 // per-stage GPU times (OpenCL profiling events) and HTP / wall times per frame.
 #include <onnxruntime_cxx_api.h>
 
 #include "cl_dl.h"
+#include "nss_lut.h"
 
 #include <algorithm>
 #include <chrono>
@@ -236,9 +237,13 @@ int main(int argc, char** argv) try {
       std::ifstream tf(dir + nb + ".txt");
       float jy, jx, e, rs0, rs1, dp[4], reset;
       int mh, mw, taps;
-      tf >> jy >> jx >> e >> rs0 >> rs1 >> dp[0] >> dp[1] >> dp[2] >> dp[3] >> reset >> mh >> mw >> taps;
-      std::vector<float> lut(6 * mh * mw * taps);
-      for (auto& v : lut) tf >> v;
+      tf >> jy >> jx >> e >> rs0 >> rs1 >> dp[0] >> dp[1] >> dp[2] >> dp[3] >> reset;
+      // the filter offset LUT from this frame's jitter, on the device (nss_lut.h; 9 taps = "high")
+      NssLut L = nss_offset_lut(H, W, Ho, Wo, jy, jx, 9);
+      mh = L.mod_h;
+      mw = L.mod_w;
+      taps = L.taps;
+      const std::vector<float>& lut = L.lut;
       if (t == 0) zero_state();
       cl_float4 dtv = {{dp[0], dp[1], dp[2], dp[3]}};
       int cur = t & 1, nxt = cur ^ 1;

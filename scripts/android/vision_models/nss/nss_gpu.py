@@ -96,7 +96,7 @@ QNN = HERE.parent.parent / "htp_exploration" / "qnn_shell"
 
 
 def _frames_for_phone(n: int, out: Path) -> None:
-    """golden/ inputs -> frameNNN.bin (colour float4 RGBA, motion float2, depth) + frameNNN.txt (scalars, LUT)."""
+    """golden/ inputs -> frameNNN.bin (colour float4 RGBA, motion float2, depth) + frameNNN.txt (scalars)."""
     out.mkdir(parents=True, exist_ok=True)
     for t in range(n):
         z = np.load(GOLD / f"f{t:03d}.npz")
@@ -106,17 +106,14 @@ def _frames_for_phone(n: int, out: Path) -> None:
             f.write(ck.rgba(z["colour"][0]).tobytes())
             f.write(ck.yx2(z["motion"][0]).tobytes())
             f.write(np.ascontiguousarray(z["depth"][0, 0], np.float32).tobytes())
-        lut = z["offset_lut"][0]
-        mh, mw = (int(v) for v in z["idx_modulo"].ravel()[:2])
         s = [
             *z["jitter"].ravel()[:2],
             z["exposure"].ravel()[0],
             *z["render_size"].ravel()[:2],
         ]
         s += [*z["depth_params"].ravel()[:4], z["reset"].ravel()[0]]
-        head = " ".join(repr(float(v)) for v in s) + f" {mh} {mw} {lut.shape[-1]}\n"
         (out / f"frame{t:03d}.txt").write_text(
-            head + " ".join(repr(float(v)) for v in lut.reshape(-1)) + "\n"
+            " ".join(repr(float(v)) for v in s) + "\n"
         )
 
 

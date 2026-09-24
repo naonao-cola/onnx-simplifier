@@ -130,8 +130,9 @@ those kernels stay hand-written.
 ### Not done yet
 
 NFRU (Arm's neural frame-rate upscaling: the same shape -- a small CNN plus warp/blend shaders) and the
-demo app's "game upscaling" replay mode build on this runner; the offset LUT (a tiny per-frame table
-from the jitter) is still computed by the host script and shipped per frame.
+demo app's "game upscaling" replay mode build on this runner. The per-frame filter offset LUT is
+computed on the device from the jitter (`nss_lut.h`, bit-identical to the gym's `_compute_lut` over 512
+jitters, `lut_check.cpp`), so a frame needs only colour, motion, depth and a few scalars.
 
 ## Reproduce
 
