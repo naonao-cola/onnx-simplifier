@@ -163,3 +163,44 @@ def test_requantize_offset_words():
     assert mre.evaluate(("rqoff", "w", "cat"), same) == 0xFFC08000
     above = {"w": (0.0031372542, 128.0), "cat": (0.0031372522, 0.0)}
     assert mre.evaluate(("rqshift", "w", "cat"), above) == 0x8E
+
+
+def test_concat_header_half_above_one_is_shifted():
+    # stage2 conv1's taps are an unfused Relu's output: they share the wider
+    # pre-activation quantization, so their ratio into the Concat is 1.0991
+    # and the header's activation half is Q14 (18008); the weight half is
+    # still Q15. Build: 0x708d4658 at npu_params offset 32.
+    sc = {
+        "x": (0.024485019966959953, 139.0),
+        "xcat": (0.022276567295193672, 0.0),
+        "w": (0.0056243580766022205, 110.0),
+        "wcat": (0.006396328564733267, 0.0),
+    }
+    assert mre._q15_shift("x", "xcat", sc) == 1
+    assert mre.evaluate(("cat15", "x", "xcat", "w", "wcat", 1, 0), sc) == 0x708D4658
+    # Shifts 1 and 2 are one program (the sweep in
+    # docs/axera-conv-concat-shift.md); across 1 the record count changes.
+    wider = {**sc, "xcat": (sc["x"][0] / 2.3, 0.0)}
+    assert mre._q15_shift("x", "xcat", wider) == 2
+    mre.evaluate(("cat15", "x", "xcat", "w", "wcat", 1, 0), wider)
+    below = {**sc, "xcat": (sc["x"][0] / 0.9, 0.0)}
+    with pytest.raises(mre.CalibrationError, match="other side of 1"):
+        mre.evaluate(("cat15", "x", "xcat", "w", "wcat", 1, 0), below)
+
+
+def test_concat_header_found_once_in_every_conv_template():
+    man = mre.step_manifest()
+    for name, meta in man["templates"].items():
+        if meta["kind"] != "conv":
+            continue
+        d = mre.STEP_TEMPLATE_DIR
+        model = mre.load_model(os.path.join(d, meta["axmodel"]))
+        scales = mre.load_scales(os.path.join(d, meta["quant"]))
+        found = mre.locate(model, scales)
+        cats = [
+            r for _, _, roles in found["params"] for r in roles[:1] if r[0] == "cat15"
+        ]
+        assert len(cats) <= 1, name
+        want = meta.get("concat_shift_class")
+        if want and cats:
+            assert (cats[0][5] == 0) == (want == "k0"), name

@@ -439,20 +439,20 @@
    "health_after": true
   },
   {
-   "case": "matmul_conv_resnetv15_stage3_conv1_fwd_perturb",
+   "case": "matmul_conv_resnetv15_stage3_conv1_fwd_step",
    "emitter": "matmul_record_emit.recalibrate",
-   "target": "perturbed template calibration (seed 0)",
+   "target": "step resnetv15_stage3_conv1_fwd (predicted calibration)",
    "control": {
     "spread": 1.0,
-    "max_lsb": 1.0000085311800782,
-    "p999_lsb": 1.0000014403291042,
-    "frac_over_1lsb": 0.0,
+    "max_lsb": 2.000001063858809,
+    "p999_lsb": 1.000002963606682,
+    "frac_over_1lsb": 3.736846301020408e-06,
     "n": 802816
    },
    "emitted": {
-    "spread": 1.0,
-    "max_lsb": 2.000002444082449,
-    "p999_lsb": 1.0000012220412244,
+    "spread": 0.1,
+    "max_lsb": 2.0000003271309845,
+    "p999_lsb": 0.0,
     "frac_over_1lsb": 1.2456154336734693e-06,
     "n": 802816
    },
@@ -475,6 +475,66 @@
     "p999_lsb": 0.0,
     "frac_over_1lsb": 0.0,
     "n": 16000
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_conv_resnetv15_stage2_conv1_fwd_step",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "step resnetv15_stage2_conv1_fwd (predicted calibration)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.000008140621279,
+    "p999_lsb": 1.000008140621279,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 0.1,
+    "max_lsb": 1.0000018800844535,
+    "p999_lsb": 1.0000018800844535,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_conv_resnetv15_stage2_conv4_fwd_step",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "step resnetv15_stage2_conv4_fwd (predicted calibration)",
+   "control": {
+    "spread": 0.5,
+    "max_lsb": 1.0000051458277943,
+    "p999_lsb": 1.0000051458277943,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 0.05,
+    "max_lsb": 1.0000014638131318,
+    "p999_lsb": 0.9999978605808073,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_conv_resnetv15_stage4_conv3_fwd_step",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "step resnetv15_stage4_conv3_fwd (predicted calibration)",
+   "control": {
+    "spread": 0.25,
+    "max_lsb": 2.000000446292127,
+    "p999_lsb": 1.0000014132584019,
+    "frac_over_1lsb": 0.00038115832270408165,
+    "n": 401408
+   },
+   "emitted": {
+    "spread": 0.05,
+    "max_lsb": 1.00000155120251,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 401408
    },
    "health_after": true
   }
@@ -521,6 +581,27 @@
    },
    "health_after": true,
    "note": "independent per-tensor factors: breaks s_xcat = 2 s_x; recalibrate now refuses this calibration"
+  },
+  {
+   "case": "matmul_conv_resnetv15_stage3_conv1_fwd_perturb",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "perturbed template calibration (seed 0)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000085311800782,
+    "p999_lsb": 1.0000014403291042,
+    "frac_over_1lsb": 0.0,
+    "n": 802816
+   },
+   "emitted": {
+    "spread": 1.0,
+    "max_lsb": 2.000002444082449,
+    "p999_lsb": 1.0000012220412244,
+    "frac_over_1lsb": 1.2456154336734693e-06,
+    "n": 802816
+   },
+   "health_after": true,
+   "superseded_by": "the step-real stage3 conv1 template (#1942 + Concat-shift classes); its perturbation now crosses the weight half over 1, which recalibrate refuses"
   }
  ]
 }

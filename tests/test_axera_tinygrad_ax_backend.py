@@ -334,12 +334,16 @@ def test_coverage_report_on_the_resnet18_step():
 
 
 def test_trainable_conv_is_refused_even_with_a_template():
+    # Every step Conv now has a live-weight chain template (planned through
+    # matmul_record_emit); one without such a template is still refused, the
+    # frozen-weight Conv template notwithstanding.
     rec = next(
         r
         for r in _step_records()
         if r["op"] == "Conv" and r["attrs"]["w"] == [64, 64, 3, 3]
     )
-    status, detail = axb.plan_node(rec)
+    assert axb.plan_node(rec)[0] == "conditional"
+    status, detail = axb.plan_node({**rec, "name": "Conv_without_live_template"})
     assert status == "refused" and "graph input" in detail
 
 
