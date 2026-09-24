@@ -229,8 +229,8 @@ inline float depth_clip(__global const int* dtm1, int Hd, int Wd, float uvy, flo
   return wsum > 0.0f ? satf(1.0f - acc / wsum) : 0.0f;
 }
 
-inline float4 ycocg_load(__global const float4* col, int H, int W, int y, int x, float e) {
-  float4 c = sqrt(fmax(col[reflect1(y, H) * W + reflect1(x, W)] * e, 0.0f));
+inline float4 ycocg_load(__read_only image2d_t col, int H, int W, int y, int x, float e) {
+  float4 c = sqrt(fmax(read_imagef(col, NEAREST, (int2)(reflect1(x, W), reflect1(y, H))) * e, 0.0f));
   float co = c.x - c.z;
   float tmp = c.z + co * 0.5f;
   float cg = c.y - tmp;
@@ -246,11 +246,11 @@ inline float ydelta(float4 a, float4 b) {
 // the disocclusion mask (if disocc_out != 0) and the nearest-depth offset code the postprocess needs.
 // feedback is the previous frame's uint8 NHWC temporal CNN output (Hp x Wp x 4).
 __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void preprocess(
-    __global const float4* color, __read_only image2d_t history, __global const float2* motion,
-    __global const float* depth, __read_only image2d_t feedback_tm1, __global const float4* derivative_tm1,
+    __read_only image2d_t color, __read_only image2d_t history, __global const float2* motion,
+    __global const float* depth, __read_only image2d_t feedback_tm1, __read_only image2d_t derivative_tm1,
     __global const int* recon_depth, int H, int W, int Hp, int Wp, int Hh, int Wh, int Hd, int Wd,
     float jy, float jx, float exposure, float rs0, float rs1, float4 dtv,
-    __global float* cnn_in, __global uchar* cnn_in_u8, __global float4* derivative_out,
+    __global float* cnn_in, __global uchar* cnn_in_u8, __write_only image2d_t derivative_out,
     __global float* disocc_out, __global uchar* nearest_code) {
   __local float u8f[256];
   u8f[get_local_id(1) * 32 + get_local_id(0)] = U8F[get_local_id(1) * 32 + get_local_id(0)];
@@ -295,10 +295,10 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void preprocess(
 #else
   float dis = depth_clip(recon_depth, Hd, Wd, rdy, rdx, rs0, rs1, nd, dtv);
 #endif
-  float4 uc = karis4(bil4(color, H, W, ujy, ujx, 1) * exposure);
+  float4 uc = karis4(bil4i(color, H, W, ujy, ujx, 1) * exposure);
   float4 wh = karis4(bil4i(history, Hh, Wh, rpy, rpx, 0) * exposure);
   // calculate_ycocg_derivative (not low/mid)
-  float4 dt = bil4(derivative_tm1, H, W, rpy, rpx, 0);
+  float4 dt = bil4i(derivative_tm1, H, W, rpy, rpx, 0);
   float4 yc = ycocg_load(color, H, W, ry, rx, exposure);
   float d_c = ydelta(yc, dt);
   float d_n = ydelta(yc, ycocg_load(color, H, W, ry, rx - 1, exposure));
@@ -361,7 +361,7 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void preprocess(
   vstore4(convert_uchar4(clamp(rint(i2 * 255.0f), 0.0f, 255.0f)), 0, cnn_in_u8 + p * 12 + 8);
   if (py < H && px < W) {
     int q = py * W + px;
-    derivative_out[q] = state;
+    write_imagef(derivative_out, (int2)(px, py), state);
     if (disocc_out) disocc_out[q] = dis;
     nearest_code[q] = (uchar)(((clampi(ox, -2, 2) + 2) << 3) | (clampi(oy, -2, 2) + 2));
   }
@@ -416,7 +416,7 @@ inline float4 catmull_rom(__read_only image2d_t t, int H, int W, float uvy, floa
 // One thread per output pixel (Ho x Wo): the filtered + temporally accumulated output (linear, an RGBA32F
 // image that is also next frame's history) and its reinhard-tonemapped RGBA8 display copy. lut: (6, mod_h * mod_w * taps).
 __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
-    __global const float4* color, __read_only image2d_t history, __global const float2* motion,
+    __read_only image2d_t color, __read_only image2d_t history, __global const float2* motion,
     __global const uchar* nearest_code, __global const uchar* kpn_u8, __read_only image2d_t temporal_u8,
     __constant float* offset_lut, int H, int W, int Ho, int Wo, int Hk, int Wk, int Kc, int Ht, int Wt,
     int mod_h, int mod_w, int taps, float exposure, float reset, __write_only image2d_t out_linear,
@@ -454,7 +454,7 @@ __kernel __attribute__((reqd_work_group_size(32, 8, 1))) void postprocess(
     int lx = (int)floor(((float)(ox + (int)t4) + 0.5f) * isx + 0.001f) + (int)t1;
     ly = clampi(ly, 0, H - 1);
     lx = clampi(lx, 0, W - 1);
-    float4 ct = fmin(color[ly * W + lx] * e, MAX_HALF);
+    float4 ct = fmin(read_imagef(color, NEAREST, (int2)(lx, ly)) * e, MAX_HALF);
     if (t3 == 0.0f && t4 == 0.0f) {
       cc = ct;
       cv = 1.0f;

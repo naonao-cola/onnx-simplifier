@@ -98,6 +98,12 @@ class NssCL:
             hostbuf=a,
         )
 
+    def get_img(self, a, b):
+        self.cl.enqueue_copy(
+            self.q, a, b, origin=(0, 0), region=(a.shape[1], a.shape[0])
+        )
+        return a
+
     def get(self, a, b):
         self.cl.enqueue_copy(self.q, a, b)
         return a
@@ -128,7 +134,8 @@ class NssCL:
         Hd, Wd = recon.shape[-2:]
         cin, cb = self.out((12, Hp, Wp), np.float32)
         cu8, cub = self.out((Hp, Wp, 12), np.uint8)
-        der, db = self.out((H, W, 4), np.float32)
+        der = np.empty((H, W, 4), np.float32)
+        db = self.img((H, W), write=True)
         dis, disb = self.out((H, W), np.float32)
         code, codeb = self.out((H, W), np.uint8)
         j = z["jitter"].ravel()
@@ -138,12 +145,12 @@ class NssCL:
             self.q,
             (Wp, Hp),
             (32, 8),
-            self.buf(rgba(z["colour"][0])),
+            self.img(rgba(z["colour"][0])),
             self.img(history),
             self.buf(yx2(z["motion"][0])),
             self.buf(z["depth"]),
             self.img_u8(feedback_u8),
-            self.buf(derivative_tm1),
+            self.img(derivative_tm1),
             self.buf(recon.astype(np.int32)),
             np.int32(H),
             np.int32(W),
@@ -168,7 +175,7 @@ class NssCL:
         return (
             self.get(cin, cb),
             self.get(cu8, cub),
-            self.get(der, db),
+            self.get_img(der, db),
             self.get(dis, disb),
             self.get(code, codeb),
         )
@@ -188,7 +195,7 @@ class NssCL:
             self.q,
             (Wo, Ho),
             (32, 8),
-            self.buf(rgba(z["colour"][0])),
+            self.img(rgba(z["colour"][0])),
             self.img(history),
             self.buf(yx2(z["motion"][0])),
             self.buf(code),

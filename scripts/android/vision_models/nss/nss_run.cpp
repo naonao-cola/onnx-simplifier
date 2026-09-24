@@ -159,7 +159,7 @@ int main(int argc, char** argv) try {
   };
   // colour / history / derivative float4 RGBA, motion float2 (y, x), depth float; the previous frame's
   // uint8 NHWC temporal CNN output doubles as this frame's feedback
-  cl_mem b_color = B(H * W * 16), b_motion = B(H * W * 8), b_depth = B(H * W * 4);
+  cl_mem b_motion = B(H * W * 8), b_depth = B(H * W * 4);
   cl_mem b_recon = B(Hd * Wd * 4), b_lut = B(6 * 64 * 4 * 4, CL_MEM_READ_ONLY);
   // history (= the linear output): RGBA32F images, read through the texture path
   auto IMG = [&](int w, int h) {
@@ -173,8 +173,9 @@ int main(int argc, char** argv) try {
     return m;
   };
   cl_mem b_hist[2] = {IMG(Wo, Ho), IMG(Wo, Ho)};
+  cl_mem b_color = IMG(W, H), b_deriv[2] = {IMG(W, H), IMG(W, H)};  // colour, derivative state: RGBA32F too
   cl_mem i_tmp = nullptr;  // RGBA8 image view of b_tmp (cl_khr_image2d_from_buffer), created below
-  cl_mem b_deriv[2] = {B(H * W * 16), B(H * W * 16)};
+
   const cl_mem_flags mapped = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
   cl_mem b_in_u8 = B(Hp * Wp * 12, mapped), b_code = B(H * W);
   cl_mem b_kpn = B(Hk * Wk * Kc, mapped), b_tmp = B(Ht * Wt * 4, mapped), b_rgba = B(Ho * Wo * 4, mapped);
@@ -194,7 +195,8 @@ int main(int argc, char** argv) try {
   auto zero_state = [&]() {  // the gym's zero history buffers at the start of a sequence
     size_t org[3] = {0, 0, 0}, reg[3] = {(size_t)Wo, (size_t)Ho, 1};
     CK(p_clEnqueueWriteImage(q, b_hist[0], CL_TRUE, org, reg, 0, 0, zeros.data(), 0, nullptr, nullptr));
-    CK(p_clEnqueueWriteBuffer(q, b_deriv[0], CL_TRUE, 0, H * W * 16, zeros.data(), 0, nullptr, nullptr));
+    size_t rg2[3] = {(size_t)W, (size_t)H, 1};
+    CK(p_clEnqueueWriteImage(q, b_deriv[0], CL_TRUE, org, rg2, 0, 0, zeros.data(), 0, nullptr, nullptr));
     CK(p_clEnqueueWriteBuffer(q, b_tmp, CL_TRUE, 0, Ht * Wt * 4, zeros.data(), 0, nullptr, nullptr));
   };
   auto set = [&](cl_kernel k, std::vector<Arg> args) {
@@ -273,7 +275,10 @@ int main(int argc, char** argv) try {
 
       double f0 = now_ms();
       size_t o = 0;
-      CK(p_clEnqueueWriteBuffer(q, b_color, CL_FALSE, 0, H * W * 16, bin.data() + o, 0, nullptr, nullptr));
+      {
+        size_t org[3] = {0, 0, 0}, reg[3] = {(size_t)W, (size_t)H, 1};
+        CK(p_clEnqueueWriteImage(q, b_color, CL_FALSE, org, reg, 0, 0, bin.data() + o, 0, nullptr, nullptr));
+      }
       o += H * W * 16;
       CK(p_clEnqueueWriteBuffer(q, b_motion, CL_FALSE, 0, H * W * 8, bin.data() + o, 0, nullptr, nullptr));
       o += H * W * 8;
