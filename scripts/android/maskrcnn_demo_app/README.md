@@ -1,6 +1,6 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, YOLO26n-seg / YOLO11n-seg (instance masks), RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
 upscaling, each engine in its own process (one model loaded at a time); see the YOLO, RT-DETR, SAM, MCC,
 super-resolution and game-upscaling sections below for the newer modes. The first button, "Camera" / "Images",
 switches the current model between the live camera and the test images (restarting it in a fresh process,
@@ -55,6 +55,39 @@ bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI
 The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree
 rotation, as in the Mask R-CNN path. Box placement was checked visually on COCO val2017 #139.
 YOLO26's end-to-end top-k is cheaper than YOLO11's NMS here too (0.3 vs 0.6 ms on images).
+
+## Instance segmentation: YOLO26n-seg / YOLO11n-seg
+
+The "YOLO26n-seg" / "YOLO11n-seg" buttons run Ultralytics' segmentation models in the YOLO mode
+(same activity, camera path and HTP session; `../deploy/models/yolo26n-seg.yaml`, `yolo11n-seg.yaml`).
+The HTP graph adds 32 mask coefficients per anchor to the head output, `(1, 4+80+32, 8400)`, and a
+second output with the `(1, 32, 160, 160)` mask prototypes. `yolo_engine.cpp` picks boxes as for the
+detection models (YOLO26's NMS-free top-k, YOLO11's NMS). For each shown detection it combines the
+prototypes with the coefficients over the prototype cells the box covers, samples a 40x40 grid over
+the box (bilinear on the logits, then the sigmoid: Ultralytics' `process_mask`, box-cropped), and the
+overlay blends that into the box. Seg models colour detections by instance, not class, so a crowd of
+one class stays readable.
+
+- Models: `ULTRALYTICS_PYTHON=<venv with ultralytics> ../deploy/deploy.py ../deploy/models/yolo26n-seg.yaml
+  --stages fetch,simplify,quantize,rewrite,post,pipe` (and `yolo11n-seg.yaml`), then
+  `YOLO="<deploy work>/yolo26n-seg/pipe/yolo26n-seg.onnx <deploy work>/yolo11n-seg/pipe/yolo11n-seg.onnx" ./deploy.sh`.
+- Quantization as the detection models' (percentile 99.999 + the class-logit path at its range for
+  YOLO26, mse for YOLO11), the final `Concat` of boxes / scores / coefficients in float.
+
+On the phone (medians of the running averages):
+
+| model, mode | end-to-end FPS | inference | pre | HTP | post (incl. masks) |
+|---|---:|---:|---:|---:|---:|
+| YOLO26n-seg, test images | 85 | 4.1 ms | 0.1 | 3.4 | 0.7 |
+| YOLO11n-seg, test images | 70 | 4.7 ms | 0.1 | 3.4 | 1.2 |
+| YOLO26n-seg, camera, fixed 30 FPS AE | 30 (camera-capped) | 8.7-9.0 ms | 4.2-4.3 | 3.9-4.0 | 0.6-0.7 |
+
+Host check of the int8 HTP graph vs fp32 on the 20 eval images (the app's decode in numpy,
+`seg_check.py <deploy work> <name> [--ultralytics]`): YOLO26n-seg matches 69/84 fp32 detections (class + box IoU > 0.5) with mask IoU
+median 0.955 (10th percentile 0.84); YOLO11n-seg 78/91, median 0.922 (10th percentile 0.71). The
+decode itself agrees with Ultralytics' `predict` masks at IoU 0.96-0.98.
+
+<img src="docs/yolo11n_seg_images.jpg" width="240" alt="YOLO11n-seg on a COCO val2017 image in the app">
 
 ## RT-DETR mode (RT-DETR-r18, NMS-free, HTP + HVX)
 
