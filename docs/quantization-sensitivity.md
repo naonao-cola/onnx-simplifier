@@ -37,11 +37,14 @@ broke across unrelated trainings):
   different calibration methods (MSE vs percentile with the score path at
   exact range).
 
-A controlled measurement of how much block rankings move between
-checkpoints of the same architecture (ResNet-50 V1/V2 and timm recipes,
-ViT-S AugReg vs DeiT, with a calibration-noise floor and policy transfer)
-is in `scripts/quantization_studies/sensitivity_stability/` once that
-study lands.
+Measured in `scripts/quantization_studies/sensitivity_stability/` (ResNet-50
+torchvision V1/V2 + timm A1/A2/A3, ViT-S DeiT vs AugReg): block rankings
+largely agree across training recipes (Spearman 0.66-0.92) but less than the
+calibration-noise floor (0.97-0.99), with 2-3 of the top-3 blocks shared (the
+first bottleneck and stem; ViT blocks 7-9). How *much* quantization hurts is
+checkpoint-specific (all-uint8 16-33 dB across the five ResNet-50s). A searched
+policy transfers only from a harder checkpoint to an easier one, so re-run the
+search per checkpoint (or use the union of the checkpoints' policies).
 
 **The target backend adds its own failures** -- found only by comparing
 device against host per tensor, never by a host sweep:
