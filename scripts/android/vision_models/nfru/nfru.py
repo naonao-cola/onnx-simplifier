@@ -5,6 +5,11 @@ with the network on the HTP and the pre/post-processing on the Adreno GPU (see R
                                  sequence (Arm/neural-graphics-dataset nfru/test, 2.9 GB) -> ~/.cache/arm-nfru
   nfru.py golden [--windows N]   the gym's torch pipeline (QAT weights, torch backend) window by window;
                                  dumps every GPU-kernel input, intermediate and output -> golden/
+  nfru.py build                  the network -> int8 QDQ ONNX with uint8 NHWC I/O (onnx/net_int8_qat.onnx)
+  nfru.py host-net               open loop: golden postprocess with the int8 network's logits (host ORT)
+  nfru.py phone [--windows N]    nfru_run on the phone: OpenCL kernels on the Adreno + the int8 network on
+                                 the HTP, closed loop from the rendered frames; PSNR vs torch and GT
+(nfru_cl_check.py runs the same kernels on a host OpenCL device, stage by stage against golden/.)
 """
 
 import argparse
@@ -452,16 +457,118 @@ def host_net() -> None:
         )
 
 
+SERIAL = os.environ.get("ANDROID_SERIAL", "239dbd8f")
+REMOTE = os.environ.get("NFRU_REMOTE", "/data/local/tmp/codex-android-nfru-gpu")
+LOCK = [str(Path.home() / ".cache/android-phone/phone-run")]
+QNN = HERE.parent.parent / "htp_exploration" / "qnn_shell"
+
+
+def _frames_for_phone(n: int, out: Path) -> None:
+    """golden/ + the test sequence -> rendered frames fNNN.bin (float32 linear rgb, depth, motion in pixels,
+    the sy hint; frame k is m1 of window k and p1 of window k - 1) + per-window wNNN.txt (motion matrices,
+    depth params, seed)."""
+    import nfru_cl_check as ck
+
+    out.mkdir(parents=True, exist_ok=True)
+    frames = {}  # k -> dict
+
+    def put(k, key, v):
+        d = frames.setdefault(k, {})
+        if key in d:
+            assert np.array_equal(d[key], v), (k, key)
+        d[key] = np.ascontiguousarray(v, np.float32)
+
+    for w in range(n):
+        z = np.load(GOLD / f"w{w:03d}.npz")
+        c = int(z["seed"]) - ck.SEED0
+        put(w, "lin", ck.linear_rgb(c - 1)[0])
+        put(w + 1, "lin", ck.linear_rgb(c + 1)[0])
+        put(w, "depth", z["depth_m1"][0, 0])
+        put(w + 1, "depth", z["depth_p1"][0, 0])
+        put(w, "mv", z["mv_m1_f30_m3"][0])
+        put(w + 1, "mv", z["mv_p1_f30_m1"][0])
+        put(w, "sy", z["sy_m1_f30_p1"][0])
+        mm = z["motion_mat"][0]
+        v = [
+            *mm[0].ravel(),
+            *mm[1].ravel(),
+            *z["motion_mat_m3"][0].ravel(),
+            *z["depth_params"].ravel(),
+        ]
+        (out / f"w{w:03d}.txt").write_text(
+            " ".join(repr(float(x)) for x in v) + f" {int(z['seed'])}\n"
+        )
+    for k, d in frames.items():
+        sy = d.get("sy", np.zeros_like(d["mv"]))
+        with open(out / f"f{k:03d}.bin", "wb") as f:
+            for a in (d["lin"], d["depth"], d["mv"], sy):
+                f.write(a.tobytes())
+
+
+def phone(n: int, iters: int) -> None:
+    """Build nfru_run, push it with the kernels, the int8 network, the QNN/ORT libs and n windows' frames,
+    run it on the phone (under the phone lock) and compare the generated frames with torch and GT."""
+    import subprocess
+
+    import nfru_cl_check as ck
+
+    build = HERE / "build"
+    subprocess.run(
+        [str(HERE / "build_gpu.sh")], check=True, env={**os.environ, "OUT": str(build)}
+    )
+    stage = WORK / "phone_gpu"
+    _frames_for_phone(n, stage)
+    adb = " ".join(["adb", "-s", SERIAL])
+    env = {**os.environ, "PHONE_LOCK_OWNER": "codex/android-nfru-gpu"}
+    files = [
+        build / "nfru_run",
+        HERE / "nfru_kernels.cl",
+        WORK / "onnx" / "net_int8_qat.onnx",
+    ]
+    files += sorted((QNN / "libs").glob("*.so"))
+    files += [stage / f"f{k:03d}.bin" for k in range(n + 1)] + [
+        stage / f"w{w:03d}.txt" for w in range(n)
+    ]
+    push = " && ".join(f"{adb} push -q {f} {REMOTE}/" for f in files)
+    run = (
+        f"cd {REMOTE} && {os.environ.get('NFRU_ENV', '')} LD_LIBRARY_PATH={REMOTE} ADSP_LIBRARY_PATH='{REMOTE};"
+        f"/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' ./nfru_run . net_int8_qat.onnx"
+        f" net_ctx.onnx {n} {iters}"
+    )
+    pull = " && ".join(
+        f"{adb} pull -q {REMOTE}/out{w:03d}.bin {stage}/" for w in range(n)
+    )
+    cmd = f'{adb} shell mkdir -p {REMOTE} && {push} && {adb} shell "{run}" && {pull}'
+    r = subprocess.run(
+        LOCK + ["bash", "-c", cmd], env=env, capture_output=True, text=True
+    )
+    print(r.stdout)
+    if r.returncode:
+        sys.exit(r.stderr[-3000:])
+    for w in range(n):
+        z = np.load(GOLD / f"w{w:03d}.npz")
+        o = np.fromfile(stage / f"out{w:03d}.bin", np.uint8).reshape(1080, 1920, 4)[
+            ..., :3
+        ]
+        o = o.transpose(2, 0, 1).astype(np.float32) / 255
+        print(
+            f"w{w:03d} phone psnr vs fp32 torch {ck.psnr(o, z['out'][0]):.2f} dB (RGBA8), vs GT"
+            f" {ck.psnr(o, z['gt'][0]):.2f} (torch fp32 {ck.psnr(z['out'][0], z['gt'][0]):.2f})"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["fetch", "golden", "build", "host-net"])
+    ap.add_argument("cmd", choices=["fetch", "golden", "build", "host-net", "phone"])
     ap.add_argument("--windows", type=int, default=8)
+    ap.add_argument("--iters", type=int, default=5)
     a = ap.parse_args()
     {
         "fetch": fetch,
         "golden": lambda: golden(a.windows),
         "build": build,
         "host-net": host_net,
+        "phone": lambda: phone(a.windows, a.iters),
     }[a.cmd]()
 
 

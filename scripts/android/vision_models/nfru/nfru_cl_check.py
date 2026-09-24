@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERE))
 WORK = Path(os.environ.get("NFRU_WORK", Path.home() / ".cache/arm-nfru"))
 GOLD = WORK / "golden"
 T = 0.5
+EXPO = 7.389056205749512  # exp(2.0): the test colour pipeline's fixed exposure
 PSC, PZP = (
     0.35356706380844116,
     172.0,
@@ -164,7 +165,24 @@ class NfruCL:
         return r
 
 
+SEED0 = 12345  # nfru.py golden: seed = SEED0 + the window's centre frame
+
+
+def linear_rgb(frame: int):
+    """rgb_linear of a test-sequence frame (float32, 1 x 3 x H x W)."""
+    import safetensors
+
+    with safetensors.safe_open(WORK / "test.safetensors", framework="numpy") as f:
+        return f.get_slice("rgb_linear")[frame : frame + 1]
+
+
 def check_stages(g: NfruCL, z, report):
+    # the colour pipeline (exposure exp(2), clamp, reinhard) + luma, from the frame's linear rgb
+    lin = linear_rgb(int(z["seed"]) - SEED0 - 1)
+    _, _, cH, cW = lin.shape
+    rgb, y8 = g.empty(3 * cH * cW * 4), g.empty(cH * cW)
+    g.run("colour_luma", (cH * cW,), g.buf(f32(lin)), EXPO, cH * cW, rgb, y8)
+    report("colour m1", g.get(rgb, (1, 3, cH, cW), np.float32), z["rgb_m1"])
     # pyramid (templates = m1)
     pm, pp = g.pyramid(z["rgb_m1"]), g.pyramid(z["rgb_p1"])
     for lvl, (b, h, w, _, _) in enumerate(pm):
