@@ -24,7 +24,8 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * MCC single-image 3D reconstruction (its own process, see the manifest; mcc_engine.cpp): tap an
  * object to segment it (SAM), then "3D" runs MoGe-2 (monocular point map) and MCC (encoder + a
  * coarse-to-fine decoder) and shows the reconstructed colored points, turned by dragging.
- *   camera: live preview; a tap freezes that frame (SAM encoder) and segments; "Live" unfreezes.
+ *   camera: live preview; a tap captures the object under it: freezes that frame (SAM encoder), segments it and
+ *           reconstructs it in 3D. Taps on the frozen photo re-segment ("3D" then rebuilds); "Live" goes back.
  *   images: the test images, center-cropped to 3:4 / 4:3; "Next image" moves on.
  * Extras: "tap" ("fx,fy", fractions of the frame) taps after each encode and "recon" (boolean) then
  * reconstructs (scripted runs); "image" (a file name in imgs) starts there; "opts" (mcc_engine.cpp: gran,
@@ -34,6 +35,7 @@ public class MccActivity extends MainActivity {
     private static final String TAG = "MccDemo";
     private final ConcurrentLinkedQueue<float[]> taps = new ConcurrentLinkedQueue<>();
     private volatile boolean frozen, next, reconRequested;
+    private boolean captureRecon;  // worker thread only
     private PointCloudView cloud;
     private Button view3d;
 
@@ -155,9 +157,10 @@ public class MccActivity extends MainActivity {
                     needEncode = true;
                 }
                 float[] tap = taps.poll();
-                if (cameraMode && !frozen && tap != null) {  // a tap on the live preview: freeze + encode it
+                if (cameraMode && !frozen && tap != null) {  // a tap on the live preview: freeze, encode, segment, 3D
                     frozen = true;
                     needEncode = true;
+                    captureRecon = true;
                 }
                 if (cameraMode && (!frozen || needEncode)) {
                     Image im = reader != null ? reader.acquireLatestImage() : null;
@@ -183,7 +186,7 @@ public class MccActivity extends MainActivity {
                     maskBmp = null;
                     mx = -1;
                     if (!needEncode) {
-                        overlay.update(r, "MCC 3D  camera: live preview\ntap an object to freeze the frame and segment it",
+                        overlay.update(r, "MCC 3D  camera: live preview\ntap an object to capture it in 3D",
                                 null, 0, 0, -1, -1);
                         continue;
                     }
@@ -230,6 +233,10 @@ public class MccActivity extends MainActivity {
                                     "mask IoU %.3f -- \"3D\" reconstructs it", iou[slot]));
                     overlay.update(r, photoLine, maskBmp, maskBmp != null ? maskBmp.getWidth() : 0,
                             maskBmp != null ? maskBmp.getHeight() : 0, mx, my);
+                }
+                if (captureRecon && mx >= 0) {  // the capturing tap: its mask straight into 3D
+                    captureRecon = false;
+                    reconRequested = true;
                 }
                 if (autoRecon && !autoReconDone && mx >= 0) {
                     autoReconDone = true;

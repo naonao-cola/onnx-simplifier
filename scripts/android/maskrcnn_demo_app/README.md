@@ -2,7 +2,9 @@
 
 Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
 upscaling, each engine in its own process (one model loaded at a time); see the YOLO, RT-DETR, SAM, MCC,
-super-resolution and game-upscaling sections below for the newer modes.
+super-resolution and game-upscaling sections below for the newer modes. The first button, "Camera" / "Images",
+switches the current model between the live camera and the test images (restarting it in a fresh process,
+`RelaunchActivity`); the model buttons keep the current mode.
 
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
@@ -152,7 +154,9 @@ on the HTP from EP-context models:
   is encoded and is done by the time "3D" is pressed. There is no gravity alignment yet (see `../vision_models/mcc` on the
   17.5 deg rotation this leaves against the iPhone demo cloud).
 - **images:** the test images; tap an object (SAM mask in blue), "3D" reconstructs, "Photo" goes back,
-  "Next image" moves on. **camera:** live preview; a tap freezes the frame and segments, "Live" unfreezes.
+  "Next image" moves on. **camera:** live preview; one tap captures the object under it -- freezes the frame, segments
+  it and reconstructs it (1.2-1.7 s, MoGe-2 then runs while the tap is segmented, so ~0.42 s of it is waited for);
+  taps on the frozen photo re-segment ("3D" rebuilds), "Live" goes back to the preview.
 - 3D view: z-buffered colored splats of the points with p > 0.3; drag to turn, pinch to zoom; the photo
   with its mask sits in the corner.
 - Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge MCC_HMX=<../mcc_hmx/ref.py weights dir> ./deploy.sh`
