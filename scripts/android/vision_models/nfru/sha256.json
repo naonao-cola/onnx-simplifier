@@ -1,0 +1,7 @@
+{
+ "nfru_v1_fp32.pt": "cd1b785a162b8559f3f3308c3706f6875757bfc01542e33ec888e9daffc06b83",
+ "nfru_v1_int8.pt": "1dff0713ce8856c5b0e8c4cd7e7f7ecd632a716ec800fe466fa29d8521bde78a",
+ "nfru_v1_int8_metadata.json": "5383df4900d3472b4160db1f11ea4b3adcc5e14553ca633b8494f4dd0f98e326",
+ "LICENSE_Arm_AI_Model_Community.pdf": "e34c816e4e032194c493fa0519ea604dccbd0b3a49906abe90b42409c9a2dc58",
+ "test.safetensors": "eb90b32f707f204f8d76b327f70b654dc9f0613af7d7f00772037422cb6f1504"
+}
