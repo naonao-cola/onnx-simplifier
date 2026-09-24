@@ -39,6 +39,12 @@
             android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
         <activity
+            android:name=".MccActivity"
+            android:process=":mcc"
+            android:exported="true"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+        <activity
             android:name=".SrActivity"
             android:process=":sr"
             android:exported="true"

@@ -1,8 +1,8 @@
 # Mask R-CNN live demo app (Android, Hexagon HTP + HVX)
 
-Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR, SAM and Super-res, each engine in
-its own process (one model loaded at a time); see the YOLO, RT-DETR, SAM and super-resolution sections
-below for the newer modes.
+Model buttons (top): Mask R-CNN, YOLO26n, YOLO11n, RT-DETR, RF-DETR, SAM, MCC 3D, Super-res and Game
+upscaling, each engine in its own process (one model loaded at a time); see the YOLO, RT-DETR, SAM, MCC,
+super-resolution and game-upscaling sections below for the newer modes.
 
 An Android app that runs the full Mask R-CNN (ONNX model zoo `MaskRCNN-12-qdq`) on the phone
 (Xiaomi 12S, Snapdragon 8+ Gen 1), frame by frame, from the camera or a set of test images, with
@@ -130,6 +130,59 @@ the HTP from EP-context models.
 
 (phone, under the shared phone lock; the encoder matches #1876's 41.8 ms.) Each extra tap costs
 ~11 ms, so segmenting feels immediate after the one-off encode.
+
+## MCC 3D mode (one photo -> tap -> the object's full 3D shape)
+
+The "MCC 3D" button (`MccActivity`, its own process `:mcc`, `native/mcc_engine.cpp` -> `libmcc_demo.so`)
+is the follow-up that `../vision_models/mcc` left open: tap an object, press "3D", and get its
+reconstructed colored point cloud, including the sides the photo doesn't show. Every network runs strict
+on the HTP from EP-context models:
+
+| step | model | where |
+|---|---|---|
+| segment the tapped object | EfficientViT-SAM-L0 encoder + decoder (the SAM mode's `sam_l0_enc/dec`) | HTP |
+| monocular metric point map | MoGe-2 ViT-S, static 640x480 / 480x640 (`depth.py static`) | HTP, fp16 |
+| upstream `prep` + XYZ window partition (`model.py`) | ported to C++ | CPU |
+| encoder -> the decoder's seen K/V | MCC `enc.onnx` (`model.py` K/V-cache split) | HTP, fp16 |
+| occupancy + color queries, coarse-to-fine as `mcc.py recon` (15^3 -> 30^3 -> 60^3, refine where p > 0.05) | MCC `dec_q1024.onnx`, 1024 queries a run | HTP, fp16 |
+
+- The working image is 480x640 (portrait) or 640x480 (landscape): camera frames (4:3) scaled, test
+  images center-cropped to 3:4 / 4:3. MoGe-2's points are flipped into MCC's frame (y up, z toward the
+  viewer), as `depth.py` does; there is no gravity alignment yet (see `../vision_models/mcc` on the
+  17.5 deg rotation this leaves against the iPhone demo cloud).
+- **images:** the test images; tap an object (SAM mask in blue), "3D" reconstructs, "Photo" goes back,
+  "Next image" moves on. **camera:** live preview; a tap freezes the frame and segments, "Live" unfreezes.
+- 3D view: z-buffered colored splats of the points with p > 0.3; drag to turn, pinch to zoom; the photo
+  with its mask sits in the corner.
+- Models: `SAM=... MCC=$HOME/.cache/onnxsim-mcc/work MOGE=$HOME/.cache/onnxsim-mcc/moge ./deploy.sh`
+  (`mcc.py export --chunks 1024`; `depth.py static` at `--h 640 --w 480` and `--h 480 --w 640`).
+  Scripted: `--es image quest2.jpg --es tap 0.506,0.491 --ez recon true`; `--es opts` takes `gran`,
+  `levels`, `lo`, `thr` (defaults 0.1 / 2 / 0.05 / 0.3) and `dump=1`.
+- **License:** MCC's code and weights are CC BY-NC 4.0 (non-commercial); nothing of it is in the APK,
+  `deploy.sh` pushes the exported models. The screenshot's input is upstream MCC's `demo/quest2.jpg`.
+
+Phone (Xiaomi 12S), upstream's quest2 photo, the tap on the headset:
+
+| | ms |
+|---|---:|
+| SAM encoder (once per image) / decoder (per tap) | 43-53 / 12-15 |
+| MoGe-2 ViT-S 640x480 | 268-276 |
+| prep (C++) | 6-21 |
+| MCC encoder | 205-207 |
+| MCC decoder, 59 chunks x 1024 queries (59,212 of the 216,000 dense queries), 64 ms a chunk | 3,340-3,790 |
+| **total, "3D" to points** (19,652 points; smaller objects need fewer chunks: 1.6 s at 17) | **3.9-4.3 s** |
+| init, first launch (compiles MCC's two graphs: encoder 42 s, decoder 5.5 s) / later launches | 48.7 s / 1.6 s |
+| MoGe-2 compile, first "3D" per orientation | 17-24 s |
+
+**Checked against the Python pipeline** (`../vision_models/mcc/app_check.py` on the app's `dump=1`
+tensors -- its own mask and MoGe-2 points): the C++ prep's image input is identical (max abs 0), the
+valid-point pattern identical, xyz within 1.9e-6; the phone encoder's K / V cos 0.999985 / 0.99988 vs
+host fp32; the coarse-to-fine phone reconstruction vs the dense host fp32 grid: recall 0.993, precision
+0.992, chamfer 0.0008, color L1 0.46/255 (19,652 vs 19,634 points).
+
+<img src="docs/mcc_quest2.jpg" width="480" alt="MCC 3D mode: the headset's reconstruction from the photo's viewpoint and turned to show its far side">
+
+(left: from the photo's viewpoint; right: turned by a drag, showing the visor's back and inside.)
 
 ## Super-resolution mode (x4 neural upscaling, XLSR int8 on the HTP)
 

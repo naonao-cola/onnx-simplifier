@@ -8,11 +8,14 @@
 #                                   the RF-DETR button (pushed as rfdetr_nano.onnx)
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
 #   SAM=<sam.py work dir, e.g. ~/.cache/onnxsim-sam/efficientvit_sam_l0> ./deploy.sh   the SAM mode
+#   MCC=<mcc.py work dir, e.g. ~/.cache/onnxsim-mcc/work> MOGE=<depth.py static dir, e.g. ~/.cache/onnxsim-mcc/moge>
+#       ./deploy.sh                 the MCC 3D mode (also needs the SAM mode's models: SAM=...)
 #   SR=<superres.py models dir, e.g. ~/.cache/superres/models> ./deploy.sh   the super-resolution mode
 #   GAME=<game_seq.py --out dir, e.g. ~/.cache/arm-nss/game> ./deploy.sh   the game-upscaling mode (NSS + NFRU)
 # Then:  adb shell am start -n org.onnxsim.maskrcnndemo/.MainActivity [--es mode images] [--es pipe pipe_e_opt.txt]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.YoloActivity [--es mode images] [--es model yolo11n]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.SamActivity [--es mode images] [--es tap 0.5,0.5]
+#        adb shell am start -n org.onnxsim.maskrcnndemo/.MccActivity [--es mode images] [--es tap 0.5,0.5 --ez recon true]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.SrActivity [--es mode images] [--es ref original]
 #        adb shell am start -n org.onnxsim.maskrcnndemo/.GameActivity [--ez nfru true]
 #
@@ -80,6 +83,20 @@ if [ -n "${SAM:-}" ]; then
   "${A[@]}" push -q "$SAM/dec.sim.onnx" "$STAGE/sam/sam_l0_dec.onnx"
   for b in sam_l0_enc.onnx sam_l0_dec.onnx; do
     RA "cmp -s $STAGE/sam/$b files/models/$b || { cp $STAGE/sam/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# MCC 3D mode: MCC's pieces from ../vision_models/mcc (mcc.py export --chunks 1024; MCC=its work dir):
+# enc.onnx -> mcc_enc.onnx, dec_q1024.onnx -> mcc_dec_q1024.onnx; and MoGe-2 ViT-S in both orientations
+# (depth.py static --h 640 --w 480 and --h 480 --w 640; MOGE=their dir) -> moge_640x480.onnx,
+# moge_480x640.onnx. The segmentation is the SAM mode's sam_l0_enc/dec. EP-context models are compiled on
+# the app's first MCC launch (MoGe-2 on its first use per orientation).
+if [ -n "${MCC:-}" ]; then
+  "${A[@]}" shell "mkdir -p $STAGE/mcc"
+  "${A[@]}" push -q "$MCC/enc.onnx" "$STAGE/mcc/mcc_enc.onnx"
+  "${A[@]}" push -q "$MCC/dec_q1024.onnx" "$STAGE/mcc/mcc_dec_q1024.onnx"
+  for hw in 640x480 480x640; do "${A[@]}" push -q "$MOGE/model.$hw.t1200.onnx" "$STAGE/mcc/moge_$hw.onnx"; done
+  for b in mcc_enc.onnx mcc_dec_q1024.onnx moge_640x480.onnx moge_480x640.onnx; do
+    RA "cmp -s $STAGE/mcc/$b files/models/$b || { cp $STAGE/mcc/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
   done
 fi
 # RT-DETR mode: the pieces from ../vision_models/rtdetr/msda_hvx/split.py (export + quant --policy

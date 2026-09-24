@@ -171,15 +171,15 @@ Phone budget for one photo -> 3D: MoGe 257 ms + MCC encoder 202 ms + ~36 x 64 ms
 | `numcc_ref.py` | NU-MCC upstream inference on the host, same input, cost/accuracy comparison |
 | `depth.py` | MoGe-2 static-shape ONNX (+ erf-GELU -> Gelu), MCC fed MoGe vs iPhone points |
 | `queries.py` | query-reduction strategies scored exactly against the dense references |
+| `app_check.py` | the demo app's MCC mode (its `dump=1` tensors) vs `model.prep` + the host fp32 model |
 | `phone.sh` | one ONNX piece on the phone (ORT + QNN EP), under the shared phone lock; md5-skips unchanged inputs |
 
 ## Follow-ups
 
-- **Demo-app mode** (photo -> tap (SAM mask) -> MoGe-2 -> MCC -> rotatable colored point cloud):
-  not built here. The pieces and their phone costs are measured above; the app needs a long-lived
-  session per piece (the per-chunk process start in `phone.sh` is a benchmark artifact), the
-  host-side preprocessing (`model.prep` crop/pad/resize, XYZ window partition, coarse-to-fine
-  bookkeeping) in C++, and a gravity-aligned frame from the phone's accelerometer.
+- **Demo-app mode: built** -- `../../maskrcnn_demo_app` "MCC 3D" (photo -> tap (SAM mask) -> MoGe-2 -> MCC
+  -> rotatable colored point cloud, 3.9-4.3 s for the quest2 headset; see its README). `app_check.py`
+  checks the app's C++ prep and its reconstruction against this directory's pipeline. Still open: a
+  gravity-aligned frame from the phone's accelerometer.
 - uint8/int8 decoder and encoder (`onnxsim.full_qdq`, uint8 NHWC image input) -- fp16 only so far.
 
 - The decoder is dense attention + MLP over many queries: a natural target for the HMX GEMM
