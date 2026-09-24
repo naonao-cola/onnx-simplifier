@@ -633,6 +633,8 @@ def cases() -> list[Callable[[], Case]]:
     # 3x3 per-tap requant (Conv as MatMul) and the dense-head Gemm perturbed
     out.append(lambda: matmul_case("fc_dW_MatMul_38"))
     out.append(lambda: matmul_case("dX_MatMul_121"))
+    out.append(lambda: matmul_case("dX_MatMul_240"))
+    out.append(lambda: matmul_case("dX_MatMul_240", "perturb"))
     out.append(lambda: matmul_case("dW_MatMul_142"))
     out.append(lambda: matmul_case("conv_resnetv15_stage3_conv1_fwd"))
     # 3x3 Conv chains whose Concat header half is above 1 (k >= 1) and at

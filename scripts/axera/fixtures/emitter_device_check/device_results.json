@@ -537,6 +537,66 @@
     "n": 401408
    },
    "health_after": true
+  },
+  {
+   "case": "matmul_conv_resnetv15_stage3_conv1_fwd_perturb",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "perturbed template calibration (seed 0)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000085311800782,
+    "p999_lsb": 1.0000014403291042,
+    "frac_over_1lsb": 0.0,
+    "n": 802816
+   },
+   "emitted": {
+    "spread": 1.0,
+    "max_lsb": 2.000002444082449,
+    "p999_lsb": 1.0000012220412244,
+    "frac_over_1lsb": 1.2456154336734693e-06,
+    "n": 802816
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_dX_MatMul_240_step",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "step MatMul_240 (predicted calibration)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000009227370719,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 0.25,
+    "max_lsb": 0.9999998168187163,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "health_after": true
+  },
+  {
+   "case": "matmul_dX_MatMul_240_perturb",
+   "emitter": "matmul_record_emit.recalibrate",
+   "target": "perturbed template calibration (seed 0)",
+   "control": {
+    "spread": 1.0,
+    "max_lsb": 1.0000009227370719,
+    "p999_lsb": 0.0,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "emitted": {
+    "spread": 0.5,
+    "max_lsb": 1.0000004221035361,
+    "p999_lsb": 1.0000004221035361,
+    "frac_over_1lsb": 0.0,
+    "n": 1605632
+   },
+   "health_after": true
   }
  ],
  "superseded": [

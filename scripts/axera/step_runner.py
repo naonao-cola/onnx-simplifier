@@ -163,6 +163,10 @@ class Segment:
     in_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
     out_q: list[tuple[float, int, bool]] = dataclasses.field(default_factory=list)
     unsafe: str = ""  # why the template's semantics differ from the node's
+    # A template built at batch N/k runs k times on batch slices; ``split``
+    # marks the inputs that carry the batch axis (step_template batch_split).
+    batch_split: int = 1
+    split: list[bool] = dataclasses.field(default_factory=list)
 
 
 _RETARGET_KEY = re.compile(r"retarget of (\S+) \(")
@@ -176,6 +180,13 @@ def _scale_dict(calib, names: Mapping[str, str]) -> tuple[dict, dict]:
         s, z, _ = qparams_of(calib, t)
         sc[role], zp[role] = s, z
     return sc, zp
+
+
+def _dim0(model: onnx.ModelProto, name: str) -> int | None:
+    for vi in (*model.graph.input, *model.graph.value_info, *model.graph.output):
+        if vi.name == name and vi.type.tensor_type.shape.dim:
+            return vi.type.tensor_type.shape.dim[0].dim_value
+    return None
 
 
 def _segment_for(
@@ -238,9 +249,15 @@ def _segment_for(
                 in_q.append((float(qq["consumer_int8_scale"]), 0, True))
             else:
                 in_q.append(qparams_of(calib, t))
+        k = entry.get("batch_split", 1)
+        split = [
+            k > 1 and _dim0(model, t) == _dim0(tmpl, i.name) * k
+            for t, i in zip(t_in, tmpl.graph.input)
+        ]
         return Segment(
-            name, "matmul_chain", nodes, t_in, t_out, detail, emit_mm, in_q, q(t_out)
-        )
+            name, "matmul_chain", nodes, t_in, t_out, detail, emit_mm, in_q, q(t_out),
+            batch_split=k, split=split,
+        )  # fmt: skip
 
     if op in ("Greater", "Less"):
         key = rec["attrs"]["misc_key"]
@@ -593,7 +610,20 @@ class StepRunner:
         m = self.session.load(self.emitted(seg))
         try:
             ins = [np.asarray(env[t], dtype=np.float32) for t in seg.inputs]
-            ys = self.session.run(m, ins)
+            if seg.batch_split > 1:
+                parts = [
+                    self.session.run(
+                        m,
+                        [
+                            np.array_split(x, seg.batch_split)[j] if s else x
+                            for x, s in zip(ins, seg.split)
+                        ],
+                    )
+                    for j in range(seg.batch_split)
+                ]
+                ys = [np.concatenate(p) for p in zip(*parts)]
+            else:
+                ys = self.session.run(m, ins)
         finally:
             self.session.unload(m)
         want = {o.name: o for o in self.model.graph.value_info}

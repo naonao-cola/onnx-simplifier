@@ -221,3 +221,42 @@ def test_tinygrad_ax_device_runs_a_relu_and_a_matmul_chain():
             assert lsb <= 2.01
     finally:
         axb.close_ax_session()
+
+
+class _EchoSession:
+    """Stands in for AXSession: records each run's input shapes and returns
+    the first input times two."""
+
+    def __init__(self):
+        self.calls = []
+
+    def load(self, blob):
+        return object()
+
+    def unload(self, m):
+        pass
+
+    def run(self, m, ins):
+        self.calls.append([x.shape for x in ins])
+        return [ins[0] * 2]
+
+
+def test_batch_split_segment_runs_on_batch_slices_and_concatenates():
+    model = parser.parse_model(
+        """<ir_version: 8, opset_import: ["" : 13]>
+        g (float[4, 3] x, float[5, 3] w) => (float[4, 3] y) {
+            y = Identity(x)
+        }"""
+    )
+    seg = sr.Segment(
+        "y", "matmul_chain", [model.graph.node[0].name or "n0"], ["x", "w"], ["y"],
+        "test", lambda: model, batch_split=2, split=[True, False],
+    )  # fmt: skip
+    model.graph.node[0].name = seg.nodes[0]
+    session = _EchoSession()
+    runner = sr.StepRunner(model, [seg], session=session)
+    x = np.arange(12, dtype=np.float32).reshape(4, 3)
+    w = np.ones((5, 3), np.float32)
+    (y,) = runner._device(seg, {"x": x, "w": w})
+    assert session.calls == [[(2, 3), (5, 3)], [(2, 3), (5, 3)]]
+    np.testing.assert_array_equal(y, x * 2)

@@ -192,6 +192,11 @@ def evaluate(role: Role, scales: Scales) -> int:
         return _bits(s[role[1]] / s[role[2]])
     if kind == "mult":
         return _bits(s[role[1]] * s[role[2]] / s[role[3]])
+    if kind == "meanr":
+        # float32 arithmetic: in float64 the Gemm chain's lane comes out one
+        # ulp high (0x3d84030f for the native 0x3d84030e).
+        a, b = np.float32(s[role[1]]), np.float32(s[role[2]])
+        return _bits(a / (b * np.float32(role[3])))
     if kind == "zpf":
         return _bits(scales[role[1]][1])
     if kind == "nzpf":
@@ -338,6 +343,11 @@ def float_roles(tensors: Iterable[str]) -> list[Role]:
         for a, b in itertools.combinations_with_replacement(ts, 2)
         for c in ts
     ]
+    roles += [
+        ("meanr", a, b, k)
+        for a, b in itertools.permutations(ts, 2)
+        for k in POOL_WINDOWS
+    ]
     return roles
 
 
@@ -407,8 +417,10 @@ MIN_LANE_RUN = 4
 POOL_WINDOWS = (49, 196, 784, 3136)
 """A mean pool fused into a chain (the classifier's ReduceMean over 7x7)
 writes its input zero point times the window size to a zero-point
-register (``zpk``): 4508 = 92 * 49 in the Gemm chain. The step's global
-pools are these spatial sizes."""
+register (``zpk``): 4508 = 92 * 49 in the Gemm chain. Its mean ratio,
+``s_x / (s_y * N)`` in float32, is a scale lane (``meanr``): 0.064459 =
+0.072179 / (0.022852 * 49) there. The step's global pools are these
+spatial sizes."""
 
 
 def _zp8_lanes(params: bytes, scales: Scales, taken_lanes: list) -> list:
@@ -623,6 +635,7 @@ PRECEDENCE = (
     "inv",
     "ratio",
     "mult",
+    "meanr",
     "zpoff",
     "qshift",
     "q15",
@@ -862,6 +875,10 @@ def step_template(node: str, manifest: dict | None = None) -> dict:
         "names": dict(zip(entry["names"], t["names"])),
         "constants": list(t.get("constants", [])),
         "aliases": dict(t.get("aliases", {})),
+        # The node runs as ``batch_split`` invocations of a template built at
+        # batch ``N / batch_split`` (dX MatMul_325: Pulsar2 does not finish
+        # the batch-16 chain; every op in it is per-sample).
+        "batch_split": int(entry.get("batch_split", 1)),
     }
 
 
