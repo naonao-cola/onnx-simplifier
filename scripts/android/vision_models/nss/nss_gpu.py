@@ -96,13 +96,16 @@ QNN = HERE.parent.parent / "htp_exploration" / "qnn_shell"
 
 
 def _frames_for_phone(n: int, out: Path) -> None:
-    """golden/ inputs -> frameNNN.bin (colour, motion, depth float32 planar) + frameNNN.txt (scalars, LUT)."""
+    """golden/ inputs -> frameNNN.bin (colour float4 RGBA, motion float2, depth) + frameNNN.txt (scalars, LUT)."""
     out.mkdir(parents=True, exist_ok=True)
     for t in range(n):
         z = np.load(GOLD / f"f{t:03d}.npz")
+        import nss_cl_check as ck
+
         with open(out / f"frame{t:03d}.bin", "wb") as f:
-            for k in ("colour", "motion", "depth"):
-                f.write(np.ascontiguousarray(z[k][0], np.float32).tobytes())
+            f.write(ck.rgba(z["colour"][0]).tobytes())
+            f.write(ck.yx2(z["motion"][0]).tobytes())
+            f.write(np.ascontiguousarray(z["depth"][0, 0], np.float32).tobytes())
         lut = z["offset_lut"][0]
         mh, mw = (int(v) for v in z["idx_modulo"].ravel()[:2])
         s = [
@@ -135,8 +138,9 @@ def phone(n: int, iters: int) -> None:
     ]
     files += sorted((QNN / "libs").glob("*.so")) + sorted(stage.glob("frame*"))
     push = " && ".join(f"{' '.join(adb)} push -q {f} {REMOTE}/" for f in files)
+    flags = os.environ.get("NSS_CLFLAGS", "")
     run = (
-        f"cd {REMOTE} && LD_LIBRARY_PATH={REMOTE} ADSP_LIBRARY_PATH='{REMOTE};/vendor/dsp/cdsp;"
+        f"cd {REMOTE} && NSS_CLFLAGS='{flags}' {os.environ.get('NSS_ENV', '')} LD_LIBRARY_PATH={REMOTE} ADSP_LIBRARY_PATH='{REMOTE};/vendor/dsp/cdsp;"
         f"/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' ./nss_run . cnn_int8_qat.onnx cnn_ctx.onnx {n} {iters}"
     )
     pull = " && ".join(

@@ -4,8 +4,8 @@
 //
 //   nss_run <dir> <cnn.onnx> <cnn_ctx.onnx> <frames> [iters]
 //
-// <dir> holds nss_kernels.cl and per-frame inputs from `nss_gpu.py phone` (frameNNN.bin: colour, motion,
-// depth float32 planar; frameNNN.txt: jitter y x, exposure, render size y x, depth params x4, reset,
+// <dir> holds nss_kernels.cl and per-frame inputs from `nss_gpu.py phone` (frameNNN.bin: colour float4 RGBA,
+// motion float2 (y, x), depth float; frameNNN.txt: jitter y x, exposure, render size y x, depth params x4, reset,
 // LUT modulo h w, taps, then the LUT floats). Writes outNNN.bin (the tonemapped RGBA8 output) and prints
 // per-stage GPU times (OpenCL profiling events) and HTP / wall times per frame.
 #define CL_TARGET_OPENCL_VERSION 200
@@ -36,7 +36,7 @@ static double now_ms() {
   X(clCreateBuffer) X(clCreateProgramWithSource) X(clBuildProgram) X(clGetProgramBuildInfo)                 \
   X(clCreateKernel) X(clSetKernelArg) X(clEnqueueNDRangeKernel) X(clEnqueueWriteBuffer)                     \
   X(clEnqueueReadBuffer) X(clEnqueueMapBuffer) X(clEnqueueUnmapMemObject) X(clFinish)                       \
-  X(clGetEventProfilingInfo) X(clReleaseEvent) X(clWaitForEvents)
+  X(clGetEventProfilingInfo) X(clReleaseEvent) X(clWaitForEvents) X(clGetKernelWorkGroupInfo) X(clCreateImage) X(clEnqueueWriteImage)
 CLFNS(CLFN)
 
 static void load_cl() {
@@ -102,8 +102,10 @@ int main(int argc, char** argv) try {
   CK(err);
   double tb = now_ms();
   // Correctly rounded divide/sqrt where the driver offers it (Adreno rejects the option: spec accuracy)
-  if (p_clBuildProgram(prog, 1, &dev, "-cl-fp32-correctly-rounded-divide-sqrt", nullptr, nullptr) != CL_SUCCESS &&
-      p_clBuildProgram(prog, 1, &dev, "", nullptr, nullptr) != CL_SUCCESS) {
+  std::string extra = getenv("NSS_CLFLAGS") ? getenv("NSS_CLFLAGS") : "";  // e.g. ablation -D switches
+  std::string o1 = "-cl-fp32-correctly-rounded-divide-sqrt " + extra;
+  if (p_clBuildProgram(prog, 1, &dev, o1.c_str(), nullptr, nullptr) != CL_SUCCESS &&
+      p_clBuildProgram(prog, 1, &dev, extra.c_str(), nullptr, nullptr) != CL_SUCCESS) {
     std::vector<char> log(1 << 16);
     p_clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
     fprintf(stderr, "%s\n", log.data());
@@ -116,25 +118,52 @@ int main(int argc, char** argv) try {
     return k;
   };
   cl_kernel k_init = K("depth_scatter_init"), k_ds = K("depth_scatter"), k_pre = K("preprocess"),
-            k_post = K("postprocess"), k_fb = K("temporal_to_feedback");
-  auto B = [&](size_t bytes, cl_mem_flags fl = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR) {
+            k_post = K("postprocess");
+  // Only the CNN's input/output (mapped for ORT) need host-visible memory; everything else is plain device
+  // memory (NSS_HOSTBUF=1 puts all buffers in ALLOC_HOST_PTR memory, for comparison)
+  const bool hostbuf = getenv("NSS_HOSTBUF") != nullptr;
+  for (auto [k, n] : {std::pair{k_ds, "depth_scatter"}, {k_pre, "preprocess"}, {k_post, "postprocess"}}) {
+    cl_ulong pm = 0, lm = 0;
+    size_t wg = 0;
+    p_clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_PRIVATE_MEM_SIZE, sizeof pm, &pm, nullptr);
+    p_clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_LOCAL_MEM_SIZE, sizeof lm, &lm, nullptr);
+    p_clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr);
+    printf("kernel %s: private %llu B, local %llu B, max wg %zu\n", n, (unsigned long long)pm,
+           (unsigned long long)lm, wg);
+  }
+  auto B = [&](size_t bytes, cl_mem_flags fl = CL_MEM_READ_WRITE) {
+    if (hostbuf) fl |= CL_MEM_ALLOC_HOST_PTR;
     cl_mem m = p_clCreateBuffer(ctx, fl, bytes, nullptr, &err);
     CK(err);
     return m;
   };
-  cl_mem b_color = B(3 * H * W * 4), b_motion = B(2 * H * W * 4), b_depth = B(H * W * 4);
-  cl_mem b_recon = B(Hd * Wd * 4), b_lut = B(6 * 64 * 4 * 4);
-  cl_mem b_hist[2] = {B(3 * Ho * Wo * 4), B(3 * Ho * Wo * 4)};
-  cl_mem b_deriv[2] = {B(4 * H * W * 4), B(4 * H * W * 4)};
-  cl_mem b_fb = B(4 * Hp * Wp * 4);  // feedback_tm1 as float planar (from the previous temporal output)
-  cl_mem b_in_u8 = B(Hp * Wp * 12), b_code = B(H * W);
-  cl_mem b_kpn = B(Hk * Wk * Kc), b_tmp = B(Ht * Wt * 4), b_rgba = B(Ho * Wo * 4);
+  // colour / history / derivative float4 RGBA, motion float2 (y, x), depth float; the previous frame's
+  // uint8 NHWC temporal CNN output doubles as this frame's feedback
+  cl_mem b_color = B(H * W * 16), b_motion = B(H * W * 8), b_depth = B(H * W * 4);
+  cl_mem b_recon = B(Hd * Wd * 4), b_lut = B(6 * 64 * 4 * 4, CL_MEM_READ_ONLY);
+  // history (= the linear output): RGBA32F images, read through the texture path
+  auto IMG = [&](int w, int h) {
+    cl_image_format f{CL_RGBA, CL_FLOAT};
+    cl_image_desc d{};
+    d.image_type = CL_MEM_OBJECT_IMAGE2D;
+    d.image_width = w;
+    d.image_height = h;
+    cl_mem m = p_clCreateImage(ctx, CL_MEM_READ_WRITE, &f, &d, nullptr, &err);
+    CK(err);
+    return m;
+  };
+  cl_mem b_hist[2] = {IMG(Wo, Ho), IMG(Wo, Ho)};
+  cl_mem b_deriv[2] = {B(H * W * 16), B(H * W * 16)};
+  const cl_mem_flags mapped = CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR;
+  cl_mem b_in_u8 = B(Hp * Wp * 12, mapped), b_code = B(H * W);
+  cl_mem b_kpn = B(Hk * Wk * Kc, mapped), b_tmp = B(Ht * Wt * 4, mapped), b_rgba = B(Ho * Wo * 4, mapped);
   cl_mem nullmem = nullptr;
-  std::vector<char> zeros(3 * Ho * Wo * 4, 0);
+  std::vector<char> zeros(Ho * Wo * 16, 0);
   auto zero_state = [&]() {  // the gym's zero history buffers at the start of a sequence
-    CK(p_clEnqueueWriteBuffer(q, b_hist[0], CL_TRUE, 0, 3 * Ho * Wo * 4, zeros.data(), 0, nullptr, nullptr));
-    CK(p_clEnqueueWriteBuffer(q, b_deriv[0], CL_TRUE, 0, 4 * H * W * 4, zeros.data(), 0, nullptr, nullptr));
-    CK(p_clEnqueueWriteBuffer(q, b_fb, CL_TRUE, 0, 4 * Hp * Wp * 4, zeros.data(), 0, nullptr, nullptr));
+    size_t org[3] = {0, 0, 0}, reg[3] = {(size_t)Wo, (size_t)Ho, 1};
+    CK(p_clEnqueueWriteImage(q, b_hist[0], CL_TRUE, org, reg, 0, 0, zeros.data(), 0, nullptr, nullptr));
+    CK(p_clEnqueueWriteBuffer(q, b_deriv[0], CL_TRUE, 0, H * W * 16, zeros.data(), 0, nullptr, nullptr));
+    CK(p_clEnqueueWriteBuffer(q, b_tmp, CL_TRUE, 0, Ht * Wt * 4, zeros.data(), 0, nullptr, nullptr));
   };
   auto set = [&](cl_kernel k, std::vector<Arg> args) {
     for (cl_uint i = 0; i < args.size(); i++) CK(p_clSetKernelArg(k, i, args[i].size, args[i].p));
@@ -148,6 +177,21 @@ int main(int argc, char** argv) try {
     return (b - a) * 1e-6;
   };
 
+  {  // bandwidth probe: 1920x1080 float4 copy (33 MB read + 33 MB write), 1-D and a few local sizes
+    cl_kernel kc = K("copy4");
+    cl_mem pa = B((size_t)Ho * Wo * 16), pb = B((size_t)Ho * Wo * 16);
+    size_t n = (size_t)Ho * Wo;
+    for (size_t ls : {(size_t)0, (size_t)64, (size_t)128, (size_t)256}) {
+      set(kc, {A(pa), A(pb)});
+      double best = 1e9;
+      for (int r = 0; r < 5; r++) {
+        cl_event ev;
+        CK(p_clEnqueueNDRangeKernel(q, kc, 1, nullptr, &n, ls ? &ls : nullptr, 0, nullptr, &ev));
+        best = std::min(best, ev_ms(ev));
+      }
+      printf("probe copy4 lws %zu: %.2f ms (%.1f GB/s)\n", ls, best, 2.0 * n * 16 / best / 1e6);
+    }
+  }
   // ---------------- HTP (ORT + QNN EP)
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "nss_run");
   Ort::SessionOptions so;
@@ -178,7 +222,7 @@ int main(int argc, char** argv) try {
   const char* out_names[] = {"kpn", "temporal"};
   int64_t in_shape[] = {1, Hp, Wp, 12}, kpn_shape[] = {1, Hk, Wk, Kc}, tmp_shape[] = {1, Ht, Wt, 4};
 
-  printf("frame upload_ms ds_ms pre_ms htp_ms post_ms fb_ms gpu_wall_ms frame_ms\n");
+  printf("frame upload_ms ds_ms pre_ms htp_ms post_ms gpu_wall_ms frame_ms\n");
   std::vector<double> tot;
   for (int it = 0; it < iters; it++) {
     for (int t = 0; t < frames; t++) {
@@ -197,10 +241,10 @@ int main(int argc, char** argv) try {
 
       double f0 = now_ms();
       size_t o = 0;
-      CK(p_clEnqueueWriteBuffer(q, b_color, CL_FALSE, 0, 3 * H * W * 4, bin.data() + o, 0, nullptr, nullptr));
-      o += 3 * H * W * 4;
-      CK(p_clEnqueueWriteBuffer(q, b_motion, CL_FALSE, 0, 2 * H * W * 4, bin.data() + o, 0, nullptr, nullptr));
-      o += 2 * H * W * 4;
+      CK(p_clEnqueueWriteBuffer(q, b_color, CL_FALSE, 0, H * W * 16, bin.data() + o, 0, nullptr, nullptr));
+      o += H * W * 16;
+      CK(p_clEnqueueWriteBuffer(q, b_motion, CL_FALSE, 0, H * W * 8, bin.data() + o, 0, nullptr, nullptr));
+      o += H * W * 8;
       CK(p_clEnqueueWriteBuffer(q, b_depth, CL_FALSE, 0, H * W * 4, bin.data() + o, 0, nullptr, nullptr));
       CK(p_clEnqueueWriteBuffer(q, b_lut, CL_FALSE, 0, lut.size() * 4, lut.data(), 0, nullptr, nullptr));
       CK(p_clFinish(q));
@@ -214,11 +258,12 @@ int main(int argc, char** argv) try {
       set(k_ds, {A(b_motion), A(b_depth), A(H), A(W), A(b_recon), A(Hd), A(Wd)});
       size_t gds[2] = {(size_t)Wd, (size_t)Hd};
       CK(p_clEnqueueNDRangeKernel(q, k_ds, 2, nullptr, gds, nullptr, 0, nullptr, &e_ds));
-      set(k_pre, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_depth), A(b_fb), A(b_deriv[cur]), A(b_recon),
+      set(k_pre, {A(b_color), A(b_hist[cur]), A(b_motion), A(b_depth), A(b_tmp), A(b_deriv[cur]), A(b_recon),
                   A(H), A(W), A(Hp), A(Wp), A(Ho), A(Wo), A(Hd), A(Wd), A(jy), A(jx), A(e), A(rs0), A(rs1),
                   A(dtv), A(nullmem), A(b_in_u8), A(b_deriv[nxt]), A(nullmem), A(b_code)});
       size_t gp[2] = {(size_t)Wp, (size_t)Hp};
-      CK(p_clEnqueueNDRangeKernel(q, k_pre, 2, nullptr, gp, nullptr, 0, nullptr, &e_pre));
+      size_t lws[2] = {32, 8};
+      CK(p_clEnqueueNDRangeKernel(q, k_pre, 2, nullptr, gp, lws, 0, nullptr, &e_pre));
       CK(p_clFinish(q));
       double pre_wall = now_ms() - g0;
 
@@ -249,19 +294,13 @@ int main(int argc, char** argv) try {
                    A(Ho), A(Wo), A(Hk), A(Wk), A(Kc), A(Ht), A(Wt), A(mh), A(mw), A(ntaps), A(e), A(reset),
                    A(b_hist[nxt]), A(b_rgba)});
       size_t go[2] = {(size_t)Wo, (size_t)Ho};
-      CK(p_clEnqueueNDRangeKernel(q, k_post, 2, nullptr, go, nullptr, 0, nullptr, &e_post));
-      // next frame's feedback_tm1: the temporal output as float planar
-      cl_event e_fb;
-      int nfb = Hp * Wp;
-      size_t gf = nfb;
-      set(k_fb, {A(b_tmp), A(b_fb), A(nfb)});
-      CK(p_clEnqueueNDRangeKernel(q, k_fb, 1, nullptr, &gf, nullptr, 0, nullptr, &e_fb));
+      CK(p_clEnqueueNDRangeKernel(q, k_post, 2, nullptr, go, lws, 0, nullptr, &e_post));
       CK(p_clFinish(q));
       double post_wall = now_ms() - p0;
       double frame_ms = now_ms() - f0 - up_ms;
-      double ds = ev_ms(e_init) + ev_ms(e_ds), pre = ev_ms(e_pre), post = ev_ms(e_post), fbm = ev_ms(e_fb);
-      printf("%3d %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", t, up_ms, ds, pre, htp_ms, post, fbm,
-             pre_wall + post_wall, frame_ms);
+      double ds = ev_ms(e_init) + ev_ms(e_ds), pre = ev_ms(e_pre), post = ev_ms(e_post);
+      printf("%3d %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n", t, up_ms, ds, pre, htp_ms, post, pre_wall + post_wall,
+             frame_ms);
       (void)htp_wall;
       if (it > 0 || iters == 1) tot.push_back(frame_ms);
       if (it == iters - 1) {

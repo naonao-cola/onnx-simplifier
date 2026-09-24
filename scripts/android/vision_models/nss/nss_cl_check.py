@@ -12,6 +12,23 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 
 
+def rgba(a):  # (C, H, W) planar -> (H, W, 4) float32 interleaved (float4 buffers)
+    c, h, w = a.shape
+    o = np.zeros((h, w, 4), np.float32)
+    o[..., :c] = a.transpose(1, 2, 0)
+    return o
+
+
+def yx2(a):  # (2, H, W) -> (H, W, 2)
+    return np.ascontiguousarray(a.transpose(1, 2, 0), np.float32)
+
+
+def fb_u8(
+    a,
+):  # golden float feedback_tm1 (4, H, W) = k / 255 -> the HTP's uint8 NHWC temporal output
+    return np.ascontiguousarray(np.rint(a.transpose(1, 2, 0) * 255).astype(np.uint8))
+
+
 def _psnr(a, b) -> float:
     d = np.clip(a, 0, 1).astype(np.float64) - np.clip(b, 0, 1).astype(np.float64)
     return float(10 * np.log10(1 / max(float((d * d).mean()), 1e-12)))
@@ -52,6 +69,23 @@ class NssCL:
         a = np.empty(shape, dtype)
         return a, self.cl.Buffer(self.ctx, self.cl.mem_flags.READ_WRITE, a.nbytes)
 
+    def img(
+        self, a4, write=False
+    ):  # (H, W, 4) float32 -> RGBA32F image2d (None -> uninitialized)
+        cl = self.cl
+        fmt = cl.ImageFormat(cl.channel_order.RGBA, cl.channel_type.FLOAT)
+        mf = cl.mem_flags
+        if write:
+            return cl.Image(self.ctx, mf.READ_WRITE, fmt, shape=(a4[1], a4[0]))
+        a4 = np.ascontiguousarray(a4, np.float32)
+        return cl.Image(
+            self.ctx,
+            mf.READ_ONLY | mf.COPY_HOST_PTR,
+            fmt,
+            shape=(a4.shape[1], a4.shape[0]),
+            hostbuf=a4,
+        )
+
     def get(self, a, b):
         self.cl.enqueue_copy(self.q, a, b)
         return a
@@ -65,7 +99,7 @@ class NssCL:
             self.q,
             (Wd, Hd),
             None,
-            self.buf(z["motion"]),
+            self.buf(yx2(z["motion"][0])),
             self.buf(z["depth"]),
             np.int32(H),
             np.int32(W),
@@ -75,14 +109,14 @@ class NssCL:
         )
         return self.get(rec, rb)
 
-    def preprocess(self, z, recon, feedback_tm1, derivative_tm1, history):
+    def preprocess(self, z, recon, feedback_u8, derivative_tm1, history):
         _, _, H, W = z["colour"].shape
-        Hp, Wp = feedback_tm1.shape[-2:]
-        Hh, Wh = history.shape[-2:]
+        Hp, Wp = feedback_u8.shape[:2]
+        Hh, Wh = history.shape[:2]
         Hd, Wd = recon.shape[-2:]
         cin, cb = self.out((12, Hp, Wp), np.float32)
         cu8, cub = self.out((Hp, Wp, 12), np.uint8)
-        der, db = self.out((4, H, W), np.float32)
+        der, db = self.out((H, W, 4), np.float32)
         dis, disb = self.out((H, W), np.float32)
         code, codeb = self.out((H, W), np.uint8)
         j = z["jitter"].ravel()
@@ -91,12 +125,12 @@ class NssCL:
         self.prg.preprocess(
             self.q,
             (Wp, Hp),
-            None,
-            self.buf(z["colour"]),
-            self.buf(history),
-            self.buf(z["motion"]),
+            (32, 8),
+            self.buf(rgba(z["colour"][0])),
+            self.img(history),
+            self.buf(yx2(z["motion"][0])),
             self.buf(z["depth"]),
-            self.buf(feedback_tm1),
+            self.buf(feedback_u8),
             self.buf(derivative_tm1),
             self.buf(recon.astype(np.int32)),
             np.int32(H),
@@ -129,21 +163,22 @@ class NssCL:
 
     def postprocess(self, z, history, code, kpn_u8, temporal_u8):
         _, _, H, W = z["colour"].shape
-        Ho, Wo = history.shape[-2:]
+        Ho, Wo = history.shape[:2]
         _, Hk, Wk, Kc = kpn_u8.shape
         _, Ht, Wt, _ = temporal_u8.shape
         lut = z["offset_lut"][0]  # (6, tiles, taps)
         taps = lut.shape[-1]
         mh, mw = (int(v) for v in z["idx_modulo"].ravel()[:2])
-        lin, lb = self.out((3, Ho, Wo), np.float32)
-        rgba, rgb = self.out((Ho, Wo, 4), np.uint8)
+        lin = np.empty((Ho, Wo, 4), np.float32)
+        lb = self.img((Ho, Wo), write=True)
+        rgba_, rgb = self.out((Ho, Wo, 4), np.uint8)
         self.prg.postprocess(
             self.q,
             (Wo, Ho),
-            None,
-            self.buf(z["colour"]),
-            self.buf(history),
-            self.buf(z["motion"]),
+            (32, 8),
+            self.buf(rgba(z["colour"][0])),
+            self.img(history),
+            self.buf(yx2(z["motion"][0])),
             self.buf(code),
             self.buf(kpn_u8),
             self.buf(temporal_u8),
@@ -165,7 +200,8 @@ class NssCL:
             lb,
             rgb,
         )
-        return self.get(lin, lb), self.get(rgba, rgb)
+        self.cl.enqueue_copy(self.q, lin, lb, origin=(0, 0), region=(Wo, Ho))
+        return lin[..., :3].transpose(2, 0, 1), self.get(rgba_, rgb)
 
 
 def _tm(lin, e):  # the golden's reinhard tonemap of the linear output
@@ -195,13 +231,14 @@ def run(gold: Path, n: int) -> None:
         cin, cu8, der, dis, code = k.preprocess(
             z,
             z["recon_depth"][0, 0],
-            z["feedback_tm1"][0],
-            z["derivative_tm1"][0],
-            z["history"][0],
+            fb_u8(z["feedback_tm1"][0]),
+            rgba(z["derivative_tm1"][0]),
+            rgba(z["history"][0]),
         )
+        der = der.transpose(2, 0, 1)
         g_code = np.rint(z["nearest_offset"][0, 0] * 255).astype(np.uint8)
         lin, _ = k.postprocess(
-            z, z["history"][0], g_code, z["kpn_u8"], z["temporal_u8"]
+            z, rgba(z["history"][0]), g_code, z["kpn_u8"], z["temporal_u8"]
         )
         print(
             f"f{t:03d} open  | depth_scatter mism {ds_mis} | pre: cnn_in max {np.abs(cin - z['cnn_in'][0]).max():.2e}"
@@ -215,17 +252,17 @@ def run(gold: Path, n: int) -> None:
         )
         # --- closed loop: our own state, host ORT CNN on our uint8 input
         if state is None:
-            state = (z["history"][0], z["feedback_tm1"][0], z["derivative_tm1"][0])
+            state = (
+                rgba(z["history"][0]),
+                fb_u8(z["feedback_tm1"][0]),
+                rgba(z["derivative_tm1"][0]),
+            )
         hist, fb, dtm1 = state
         rec_c = k.depth_scatter(z)
         _, cu8c, derc, _, codec = k.preprocess(z, rec_c, fb, dtm1, hist)
         kpn_u8, tmp_u8 = cnn.run(None, {"x": cu8c[None]})
         linc, _ = k.postprocess(z, hist, codec, kpn_u8, tmp_u8)
-        state = (
-            linc,
-            (tmp_u8[0].astype(np.float32) / 255).transpose(2, 0, 1).copy(),
-            derc,
-        )
+        state = (rgba(linc), np.ascontiguousarray(tmp_u8[0]), derc)
         print(
             f"f{t:03d} closed| psnr vs GT {_psnr(_tm(linc, e), z['ground_truth'][0]):.2f} dB"
             f" (golden {_psnr(z['output'][0], z['ground_truth'][0]):.2f})"
