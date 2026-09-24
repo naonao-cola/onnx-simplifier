@@ -1,0 +1,201 @@
+{
+ "roundtrip": [
+  {
+   "fixture": "binary_op_registers/add_c2.axmodel.gz",
+   "reencoded_segments_that_differ": [
+    2,
+    3
+   ],
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  },
+  {
+   "fixture": "binary_op_registers/sub_c3.axmodel.gz",
+   "reencoded_segments_that_differ": [
+    2,
+    3
+   ],
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  },
+  {
+   "fixture": "step_recalib/toyf_A1.axmodel.gz",
+   "reencoded_segments_that_differ": [
+    0,
+    2,
+    3
+   ],
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  }
+ ],
+ "scale_edit": [
+  {
+   "reg": "0x0f60",
+   "old": 0.007058816496282816,
+   "new": 0.014117632992565632,
+   "error": null,
+   "lanes": {
+    "0": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "1": {
+     "changed": 12491,
+     "n": 50176,
+     "ratio_min": 2.0,
+     "ratio_max": 2.0
+    },
+    "2": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "3": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    }
+   },
+   "health_after": true
+  },
+  {
+   "reg": "0x0f70",
+   "old": 0.007058816496282816,
+   "new": 0.014117632992565632,
+   "error": null,
+   "lanes": {
+    "0": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "1": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "2": {
+     "changed": 12449,
+     "n": 50176,
+     "ratio_min": 2.0,
+     "ratio_max": 2.0
+    },
+    "3": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    }
+   },
+   "health_after": true
+  },
+  {
+   "reg": "0x0f80",
+   "old": 0.007058816496282816,
+   "new": 0.014117632992565632,
+   "error": null,
+   "lanes": {
+    "0": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "1": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "2": {
+     "changed": 0,
+     "n": 50176,
+     "ratio_min": null,
+     "ratio_max": null
+    },
+    "3": {
+     "changed": 12471,
+     "n": 50176,
+     "ratio_min": 2.0,
+     "ratio_max": 2.0
+    }
+   },
+   "health_after": true
+  }
+ ],
+ "transplant": [
+  {
+   "name": "relu_zp127_to_zp100",
+   "moved_records": {
+    "0": 4,
+    "2": 19
+   },
+   "native_a_vs_native_b": {
+    "equal": false,
+    "max_abs_diff": 0.1898031234741211
+   },
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  },
+  {
+   "name": "relu_zp127_to_zp64",
+   "moved_records": {
+    "0": 2,
+    "2": 19
+   },
+   "native_a_vs_native_b": {
+    "equal": false,
+    "max_abs_diff": 0.04862666130065918
+   },
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  },
+  {
+   "name": "relu_zp127_to_zp200",
+   "moved_records": {
+    "0": 4,
+    "2": 19
+   },
+   "native_a_vs_native_b": {
+    "equal": false,
+    "max_abs_diff": 0.5819599628448486
+   },
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  },
+  {
+   "name": "step_A1_to_Dmom100",
+   "moved_records": {
+    "0": 4,
+    "2": 128
+   },
+   "native_a_vs_native_b": {
+    "equal": false,
+    "max_abs_diff": 0.5977197885513306
+   },
+   "equal": true,
+   "max_abs_diff": 0.0,
+   "error": null,
+   "health_after": true
+  }
+ ]
+}

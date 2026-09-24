@@ -240,3 +240,66 @@ def test_simplify_keeps_qdq_nodes_in_default_domain():
     assert check_ok
     assert _op_domains(sim_model, "QuantizeLinear") == [""] * 2
     assert _op_domains(sim_model, "DequantizeLinear") == [""] * 2
+
+
+@pytest.mark.parametrize(
+    "weight_dtype", [TensorProto.FLOAT8E4M3FN, TensorProto.INT8], ids=["fp8", "int8"]
+)
+def test_simplify_keeps_prequantized_weight_dequantize(weight_dtype):
+    # TensorRT Edge-LLM's fp8 / int8_sq exports (and ModelOpt's) store weights already
+    # quantized -- a FLOAT8E4M3FN / INT8 initializer feeding DequantizeLinear. The
+    # DequantizeLinear is a constant expression, but folding it would turn the weight
+    # into a dense fp16 initializer and silently drop the quantization; simplify() must
+    # keep it (regardless of the weight's size -- this one is tiny).
+    rng = np.random.default_rng(0)
+    vals = rng.standard_normal((8, 8)).clip(-1, 1)
+    if weight_dtype == TensorProto.INT8:
+        wq = onnx.helper.make_tensor(
+            "Wq", weight_dtype, [8, 8], (vals * 100).astype(np.int8).flatten().tolist()
+        )
+    else:
+        wq = onnx.helper.make_tensor(
+            "Wq", weight_dtype, [8, 8], vals.astype(np.float32).flatten().tolist()
+        )
+    model = _model(
+        """
+        g (float16[2,8] X) => (float16[2,8] Y)
+        {
+          Wdq = DequantizeLinear(Wq, w_scale)
+          Y = MatMul(X, Wdq)
+        }
+        """,
+        [wq, _tensor(0.01, "w_scale", np.float16)],
+        opset=21,
+        ir_version=10,
+    )
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    assert [n.op_type for n in sim_model.graph.node] == ["DequantizeLinear", "MatMul"]
+    assert {t.data_type for t in sim_model.graph.initializer} == {
+        weight_dtype,
+        TensorProto.FLOAT16,
+    }
+
+
+def test_simplify_passes_through_tensorrt_domain_quantize_ops():
+    # Edge-LLM's nvfp4 / mxfp8 exports use TensorRT-only ops with no ONNX schema
+    # (trt::TRT_FP4DynamicQuantize, trt::TRT_MXFP8DynamicQuantize, trt::DequantizeLinear):
+    # simplify() must keep them, their attributes and their inputs verbatim.
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 21, "trt": 1]>
+        g (float16[2,32] X) => (float16[2,32] Y) {
+          Xq, Xs = trt.TRT_FP4DynamicQuantize<axis = -1, block_size = 16>(X, gs)
+          Y = trt.DequantizeLinear<axis = -1, block_size = 16>(Xq, Xs)
+        }
+        """
+    )
+    model.graph.initializer.append(_tensor(1.0, "gs", np.float32))
+    before = [
+        (n.domain, n.op_type, list(n.input), n.attribute) for n in model.graph.node
+    ]
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    after = [
+        (n.domain, n.op_type, list(n.input), n.attribute) for n in sim_model.graph.node
+    ]
+    assert after == before

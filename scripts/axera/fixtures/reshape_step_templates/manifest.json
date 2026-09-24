@@ -1,0 +1,1425 @@
+{
+ "identity_templates": {
+  "1024x112896->1024x9x12544": {
+   "axmodel": "identity_1024x112896_to_1024x9x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1024x112896_to_1024x9x12544_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1024x112896_to_1024x9x12544",
+   "nodes": [
+    "Reshape_459"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x12544->16x64x112x112": {
+   "axmodel": "identity_1024x12544_to_16x64x112x112_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1024x12544_to_16x64x112x112_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1024x12544_to_16x64x112x112",
+   "nodes": [
+    "Reshape_461"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x9x3136->1024x28224": {
+   "axmodel": "identity_1024x9x3136_to_1024x28224_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1024x9x3136_to_1024x28224_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1024x9x3136_to_1024x28224",
+   "nodes": [
+    "Reshape_456"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x128x3x3->1x128x128x9": {
+   "axmodel": "identity_128x128x3x3_to_1x128x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_128x128x3x3_to_1x128x128x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "128x128x3x3_to_1x128x128x9",
+   "nodes": [
+    "Reshape_255",
+    "Reshape_277",
+    "Reshape_300"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x1x1->1x128x64x1": {
+   "axmodel": "identity_128x64x1x1_to_1x128x64x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_128x64x1x1_to_1x128x64x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "128x64x1x1_to_1x128x64x1",
+   "nodes": [
+    "Reshape_339"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x3x3->1x128x64x9": {
+   "axmodel": "identity_128x64x3x3_to_1x128x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_128x64x3x3_to_1x128x64x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "128x64x3x3_to_1x128x64x9",
+   "nodes": [
+    "Reshape_322"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x128x28x28->16x1x128x784": {
+   "axmodel": "identity_16x128x28x28_to_16x1x128x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x128x28x28_to_16x1x128x784_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x128x28x28_to_16x1x128x784",
+   "nodes": [
+    "Reshape_251",
+    "Reshape_273",
+    "Reshape_296",
+    "Reshape_318"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x784->16x128x28x28": {
+   "axmodel": "identity_16x1x128x784_to_16x128x28x28_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x1x128x784_to_16x128x28x28_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x1x128x784_to_16x128x28x28",
+   "nodes": [
+    "Reshape_224",
+    "Reshape_241",
+    "Reshape_259",
+    "Reshape_281",
+    "Reshape_304"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x196->16x256x14x14": {
+   "axmodel": "identity_16x1x256x196_to_16x256x14x14_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x1x256x196_to_16x256x14x14_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x1x256x196_to_16x256x14x14",
+   "nodes": [
+    "Reshape_122",
+    "Reshape_139",
+    "Reshape_157",
+    "Reshape_179",
+    "Reshape_202"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x49->16x512x7x7": {
+   "axmodel": "identity_16x1x512x49_to_16x512x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x1x512x49_to_16x512x7x7_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x1x512x49_to_16x512x7x7",
+   "nodes": [
+    "Reshape_55",
+    "Reshape_77",
+    "Reshape_100"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x3136->16x64x56x56": {
+   "axmodel": "identity_16x1x64x3136_to_16x64x56x56_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x1x64x3136_to_16x64x56x56_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x1x64x3136_to_16x64x56x56",
+   "nodes": [
+    "Reshape_326",
+    "Reshape_343",
+    "Reshape_361",
+    "Reshape_383",
+    "Reshape_406",
+    "Reshape_428"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x256x14x14->16x1x256x196": {
+   "axmodel": "identity_16x256x14x14_to_16x1x256x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x256x14x14_to_16x1x256x196_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x256x14x14_to_16x1x256x196",
+   "nodes": [
+    "Reshape_149",
+    "Reshape_171",
+    "Reshape_194",
+    "Reshape_216"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x3x224x224->16x1x3x50176": {
+   "axmodel": "identity_16x3x224x224_to_16x1x3x50176_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x3x224x224_to_16x1x3x50176_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x3x224x224_to_16x1x3x50176",
+   "nodes": [
+    "Reshape_466"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512->16x512x1x1": {
+   "axmodel": "identity_16x512_to_16x512x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x512_to_16x512x1x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x512_to_16x512x1x1",
+   "nodes": [
+    "Reshape_42"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512x7x7->16x1x512x49": {
+   "axmodel": "identity_16x512x7x7_to_16x1x512x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x512x7x7_to_16x1x512x49_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x512x7x7_to_16x1x512x49",
+   "nodes": [
+    "Reshape_47",
+    "Reshape_69",
+    "Reshape_92",
+    "Reshape_114"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->1024x12544": {
+   "axmodel": "identity_16x64x112x112_to_1024x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x64x112x112_to_1024x12544_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x64x112x112_to_1024x12544",
+   "nodes": [
+    "Reshape_440"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->16x1x64x12544": {
+   "axmodel": "identity_16x64x112x112_to_16x1x64x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x64x112x112_to_16x1x64x12544_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x64x112x112_to_16x1x64x12544",
+   "nodes": [
+    "Reshape_465"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->1024x1x3136": {
+   "axmodel": "identity_16x64x56x56_to_1024x1x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x64x56x56_to_1024x1x3136_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x64x56x56_to_1024x1x3136",
+   "nodes": [
+    "Reshape_454"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->16x1x64x3136": {
+   "axmodel": "identity_16x64x56x56_to_16x1x64x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_16x64x56x56_to_16x1x64x3136_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "16x64x56x56_to_16x1x64x3136",
+   "nodes": [
+    "Reshape_353",
+    "Reshape_375",
+    "Reshape_398",
+    "Reshape_420"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x1152->128x128x3x3": {
+   "axmodel": "identity_1x128x1152_to_128x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x1152_to_128x128x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x1152_to_128x128x3x3",
+   "nodes": [
+    "Reshape_267",
+    "Reshape_289",
+    "Reshape_312"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x128x9->1x1x128x1152": {
+   "axmodel": "identity_1x128x128x9_to_1x1x128x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x128x9_to_1x1x128x1152_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x128x9_to_1x1x128x1152",
+   "nodes": [
+    "Reshape_257",
+    "Reshape_279",
+    "Reshape_302"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x1->1x1x128x256": {
+   "axmodel": "identity_1x128x256x1_to_1x1x128x256_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x256x1_to_1x1x128x256_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x256x1_to_1x1x128x256",
+   "nodes": [
+    "Reshape_239"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x9->1x1x128x2304": {
+   "axmodel": "identity_1x128x256x9_to_1x1x128x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x256x9_to_1x1x128x2304_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x256x9_to_1x1x128x2304",
+   "nodes": [
+    "Reshape_222"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x576->128x64x3x3": {
+   "axmodel": "identity_1x128x576_to_128x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x576_to_128x64x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x576_to_128x64x3x3",
+   "nodes": [
+    "Reshape_334"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x64->128x64x1x1": {
+   "axmodel": "identity_1x128x64_to_128x64x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x128x64_to_128x64x1x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x128x64_to_128x64x1x1",
+   "nodes": [
+    "Reshape_348"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x1152->256x128x3x3": {
+   "axmodel": "identity_1x256x1152_to_256x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x1152_to_256x128x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x1152_to_256x128x3x3",
+   "nodes": [
+    "Reshape_232"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x128->256x128x1x1": {
+   "axmodel": "identity_1x256x128_to_256x128x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x128_to_256x128x1x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x128_to_256x128x1x1",
+   "nodes": [
+    "Reshape_246"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x2304->256x256x3x3": {
+   "axmodel": "identity_1x256x2304_to_256x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x2304_to_256x256x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x2304_to_256x256x3x3",
+   "nodes": [
+    "Reshape_165",
+    "Reshape_187",
+    "Reshape_210"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x256x9->1x1x256x2304": {
+   "axmodel": "identity_1x256x256x9_to_1x1x256x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x256x9_to_1x1x256x2304_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x256x9_to_1x1x256x2304",
+   "nodes": [
+    "Reshape_155",
+    "Reshape_177",
+    "Reshape_200"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x1->1x1x256x512": {
+   "axmodel": "identity_1x256x512x1_to_1x1x256x512_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x512x1_to_1x1x256x512_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x512x1_to_1x1x256x512",
+   "nodes": [
+    "Reshape_137"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x9->1x1x256x4608": {
+   "axmodel": "identity_1x256x512x9_to_1x1x256x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x256x512x9_to_1x1x256x4608_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x256x512x9_to_1x1x256x4608",
+   "nodes": [
+    "Reshape_120"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x2304->512x256x3x3": {
+   "axmodel": "identity_1x512x2304_to_512x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x512x2304_to_512x256x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x512x2304_to_512x256x3x3",
+   "nodes": [
+    "Reshape_130"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x256->512x256x1x1": {
+   "axmodel": "identity_1x512x256_to_512x256x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x512x256_to_512x256x1x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x512x256_to_512x256x1x1",
+   "nodes": [
+    "Reshape_144"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x4608->512x512x3x3": {
+   "axmodel": "identity_1x512x4608_to_512x512x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x512x4608_to_512x512x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x512x4608_to_512x512x3x3",
+   "nodes": [
+    "Reshape_63",
+    "Reshape_85",
+    "Reshape_108"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x512x9->1x1x512x4608": {
+   "axmodel": "identity_1x512x512x9_to_1x1x512x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x512x512x9_to_1x1x512x4608_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x512x512x9_to_1x1x512x4608",
+   "nodes": [
+    "Reshape_53",
+    "Reshape_75",
+    "Reshape_98"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x1->1x1x64x128": {
+   "axmodel": "identity_1x64x128x1_to_1x1x64x128_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x64x128x1_to_1x1x64x128_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x64x128x1_to_1x1x64x128",
+   "nodes": [
+    "Reshape_341"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x9->1x1x64x1152": {
+   "axmodel": "identity_1x64x128x9_to_1x1x64x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x64x128x9_to_1x1x64x1152_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x64x128x9_to_1x1x64x1152",
+   "nodes": [
+    "Reshape_324"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x147->64x3x7x7": {
+   "axmodel": "identity_1x64x147_to_64x3x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x64x147_to_64x3x7x7_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x64x147_to_64x3x7x7",
+   "nodes": [
+    "Reshape_473"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x576->64x64x3x3": {
+   "axmodel": "identity_1x64x576_to_64x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x64x576_to_64x64x3x3_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x64x576_to_64x64x3x3",
+   "nodes": [
+    "Reshape_369",
+    "Reshape_391",
+    "Reshape_414",
+    "Reshape_436"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x64x9->1x1x64x576": {
+   "axmodel": "identity_1x64x64x9_to_1x1x64x576_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_1x64x64x9_to_1x1x64x576_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "1x64x64x9_to_1x1x64x576",
+   "nodes": [
+    "Reshape_359",
+    "Reshape_381",
+    "Reshape_404",
+    "Reshape_426"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x1x1->1x256x128x1": {
+   "axmodel": "identity_256x128x1x1_to_1x256x128x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_256x128x1x1_to_1x256x128x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "256x128x1x1_to_1x256x128x1",
+   "nodes": [
+    "Reshape_237"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x3x3->1x256x128x9": {
+   "axmodel": "identity_256x128x3x3_to_1x256x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_256x128x3x3_to_1x256x128x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "256x128x3x3_to_1x256x128x9",
+   "nodes": [
+    "Reshape_220"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x256x3x3->1x256x256x9": {
+   "axmodel": "identity_256x256x3x3_to_1x256x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_256x256x3x3_to_1x256x256x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "256x256x3x3_to_1x256x256x9",
+   "nodes": [
+    "Reshape_153",
+    "Reshape_175",
+    "Reshape_198"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x1x1->1x512x256x1": {
+   "axmodel": "identity_512x256x1x1_to_1x512x256x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_512x256x1x1_to_1x512x256x1_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "512x256x1x1_to_1x512x256x1",
+   "nodes": [
+    "Reshape_135"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x3x3->1x512x256x9": {
+   "axmodel": "identity_512x256x3x3_to_1x512x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_512x256x3x3_to_1x512x256x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "512x256x3x3_to_1x512x256x9",
+   "nodes": [
+    "Reshape_118"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x512x3x3->1x512x512x9": {
+   "axmodel": "identity_512x512x3x3_to_1x512x512x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_512x512x3x3_to_1x512x512x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "512x512x3x3_to_1x512x512x9",
+   "nodes": [
+    "Reshape_51",
+    "Reshape_73",
+    "Reshape_96"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "64x64x3x3->1x64x64x9": {
+   "axmodel": "identity_64x64x3x3_to_1x64x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "identity_64x64x3x3_to_1x64x64x9_b.axmodel.gz",
+    "scale": 0.007843137718737125,
+    "zero_point": 38
+   },
+   "name": "64x64x3x3_to_1x64x64x9",
+   "nodes": [
+    "Reshape_357",
+    "Reshape_379",
+    "Reshape_402",
+    "Reshape_424"
+   ],
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  }
+ },
+ "squeeze_builds": {
+  "16x512x1x1->16x512": "squeeze_16x512x1x1_to_16x512_a.axmodel.gz"
+ },
+ "templates": {
+  "1024x112896->1024x9x12544": {
+   "axmodel": "1024x112896_to_1024x9x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x112896_to_1024x9x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x112896_to_1024x9x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x12544->16x64x112x112": {
+   "axmodel": "1024x12544_to_16x64x112x112_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x12544_to_16x64x112x112_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x12544_to_16x64x112x112",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x28224->1024x9x3136": {
+   "axmodel": "1024x28224_to_1024x9x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x28224_to_1024x9x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x28224_to_1024x9x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1024x9x3136->1024x28224": {
+   "axmodel": "1024x9x3136_to_1024x28224_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x9x3136_to_1024x28224_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1024x9x3136_to_1024x28224",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x128x3x3->1x128x128x9": {
+   "axmodel": "128x128x3x3_to_1x128x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x128x3x3_to_1x128x128x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x128x3x3_to_1x128x128x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x1x1->1x128x64x1": {
+   "axmodel": "128x64x1x1_to_1x128x64x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x64x1x1_to_1x128x64x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x64x1x1_to_1x128x64x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "128x64x3x3->1x128x64x9": {
+   "axmodel": "128x64x3x3_to_1x128x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "128x64x3x3_to_1x128x64x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "128x64x3x3_to_1x128x64x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x128x28x28->16x1x128x784": {
+   "axmodel": "16x128x28x28_to_16x1x128x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x128x28x28_to_16x1x128x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x128x28x28_to_16x1x128x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x1764->16x1x1152x196": {
+   "axmodel": "16x1x128x1764_to_16x1x1152x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x1764_to_16x1x1152x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x1764_to_16x1x1152x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x28224->16x1x1152x3136": {
+   "axmodel": "16x1x128x28224_to_16x1x1152x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x28224_to_16x1x1152x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x28224_to_16x1x1152x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x7056->16x1x1152x784": {
+   "axmodel": "16x1x128x7056_to_16x1x1152x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x7056_to_16x1x1152x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x7056_to_16x1x1152x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x128x784->16x128x28x28": {
+   "axmodel": "16x1x128x784_to_16x128x28x28_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x128x784_to_16x128x28x28_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x128x784_to_16x128x28x28",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x1764->16x1x2304x196": {
+   "axmodel": "16x1x256x1764_to_16x1x2304x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x1764_to_16x1x2304x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x1764_to_16x1x2304x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x196->16x256x14x14": {
+   "axmodel": "16x1x256x196_to_16x256x14x14_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x196_to_16x256x14x14_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x196_to_16x256x14x14",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x441->16x1x2304x49": {
+   "axmodel": "16x1x256x441_to_16x1x2304x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x441_to_16x1x2304x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x441_to_16x1x2304x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x256x7056->16x1x2304x784": {
+   "axmodel": "16x1x256x7056_to_16x1x2304x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x256x7056_to_16x1x2304x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x256x7056_to_16x1x2304x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x3x614656->16x1x147x12544": {
+   "axmodel": "16x1x3x614656_to_16x1x147x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x3x614656_to_16x1x147x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x3x614656_to_16x1x147x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x1764->16x1x4608x196": {
+   "axmodel": "16x1x512x1764_to_16x1x4608x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x1764_to_16x1x4608x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x1764_to_16x1x4608x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x441->16x1x4608x49": {
+   "axmodel": "16x1x512x441_to_16x1x4608x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x441_to_16x1x4608x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x441_to_16x1x4608x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x512x49->16x512x7x7": {
+   "axmodel": "16x1x512x49_to_16x512x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x512x49_to_16x512x7x7_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x512x49_to_16x512x7x7",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x28224->16x1x576x3136": {
+   "axmodel": "16x1x64x28224_to_16x1x576x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x28224_to_16x1x576x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x28224_to_16x1x576x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x3136->16x64x56x56": {
+   "axmodel": "16x1x64x3136_to_16x64x56x56_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x3136_to_16x64x56x56_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x3136_to_16x64x56x56",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x1x64x7056->16x1x576x784": {
+   "axmodel": "16x1x64x7056_to_16x1x576x784_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x1x64x7056_to_16x1x576x784_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x1x64x7056_to_16x1x576x784",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x256x14x14->16x1x256x196": {
+   "axmodel": "16x256x14x14_to_16x1x256x196_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x256x14x14_to_16x1x256x196_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x256x14x14_to_16x1x256x196",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x3x224x224->16x1x3x50176": {
+   "axmodel": "16x3x224x224_to_16x1x3x50176_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x3x224x224_to_16x1x3x50176_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x3x224x224_to_16x1x3x50176",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512->16x512x1x1": {
+   "axmodel": "16x512_to_16x512x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512_to_16x512x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512_to_16x512x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512x1x1->16x512": {
+   "axmodel": "16x512x1x1_to_16x512_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512x1x1_to_16x512_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512x1x1_to_16x512",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x512x7x7->16x1x512x49": {
+   "axmodel": "16x512x7x7_to_16x1x512x49_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x512x7x7_to_16x1x512x49_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x512x7x7_to_16x1x512x49",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->1024x12544": {
+   "axmodel": "16x64x112x112_to_1024x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x112x112_to_1024x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x112x112_to_1024x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x112x112->16x1x64x12544": {
+   "axmodel": "16x64x112x112_to_16x1x64x12544_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x112x112_to_16x1x64x12544_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x112x112_to_16x1x64x12544",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->1024x1x3136": {
+   "axmodel": "16x64x56x56_to_1024x1x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x56x56_to_1024x1x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x56x56_to_1024x1x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "16x64x56x56->16x1x64x3136": {
+   "axmodel": "16x64x56x56_to_16x1x64x3136_a.axmodel.gz",
+   "check": {
+    "axmodel": "16x64x56x56_to_16x1x64x3136_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "16x64x56x56_to_16x1x64x3136",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x1152->128x128x3x3": {
+   "axmodel": "1x128x1152_to_128x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x1152_to_128x128x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x1152_to_128x128x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x128x9->1x1x128x1152": {
+   "axmodel": "1x128x128x9_to_1x1x128x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x128x9_to_1x1x128x1152_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x128x9_to_1x1x128x1152",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x1->1x1x128x256": {
+   "axmodel": "1x128x256x1_to_1x1x128x256_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x256x1_to_1x1x128x256_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x256x1_to_1x1x128x256",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x256x9->1x1x128x2304": {
+   "axmodel": "1x128x256x9_to_1x1x128x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x256x9_to_1x1x128x2304_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x256x9_to_1x1x128x2304",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x576->128x64x3x3": {
+   "axmodel": "1x128x576_to_128x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x576_to_128x64x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x576_to_128x64x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x128x64->128x64x1x1": {
+   "axmodel": "1x128x64_to_128x64x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x128x64_to_128x64x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x128x64_to_128x64x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x1152->256x128x3x3": {
+   "axmodel": "1x256x1152_to_256x128x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x1152_to_256x128x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x1152_to_256x128x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x128->256x128x1x1": {
+   "axmodel": "1x256x128_to_256x128x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x128_to_256x128x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x128_to_256x128x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x2304->256x256x3x3": {
+   "axmodel": "1x256x2304_to_256x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x2304_to_256x256x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x2304_to_256x256x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x256x9->1x1x256x2304": {
+   "axmodel": "1x256x256x9_to_1x1x256x2304_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x256x9_to_1x1x256x2304_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x256x9_to_1x1x256x2304",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x1->1x1x256x512": {
+   "axmodel": "1x256x512x1_to_1x1x256x512_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x512x1_to_1x1x256x512_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x512x1_to_1x1x256x512",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x256x512x9->1x1x256x4608": {
+   "axmodel": "1x256x512x9_to_1x1x256x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x256x512x9_to_1x1x256x4608_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x256x512x9_to_1x1x256x4608",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x2304->512x256x3x3": {
+   "axmodel": "1x512x2304_to_512x256x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x2304_to_512x256x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x2304_to_512x256x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x256->512x256x1x1": {
+   "axmodel": "1x512x256_to_512x256x1x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x256_to_512x256x1x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x256_to_512x256x1x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x4608->512x512x3x3": {
+   "axmodel": "1x512x4608_to_512x512x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x4608_to_512x512x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x4608_to_512x512x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x512x512x9->1x1x512x4608": {
+   "axmodel": "1x512x512x9_to_1x1x512x4608_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x512x512x9_to_1x1x512x4608_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x512x512x9_to_1x1x512x4608",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x1->1x1x64x128": {
+   "axmodel": "1x64x128x1_to_1x1x64x128_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x128x1_to_1x1x64x128_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x128x1_to_1x1x64x128",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x128x9->1x1x64x1152": {
+   "axmodel": "1x64x128x9_to_1x1x64x1152_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x128x9_to_1x1x64x1152_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x128x9_to_1x1x64x1152",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x147->64x3x7x7": {
+   "axmodel": "1x64x147_to_64x3x7x7_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x147_to_64x3x7x7_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x147_to_64x3x7x7",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x576->64x64x3x3": {
+   "axmodel": "1x64x576_to_64x64x3x3_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x576_to_64x64x3x3_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x576_to_64x64x3x3",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "1x64x64x9->1x1x64x576": {
+   "axmodel": "1x64x64x9_to_1x1x64x576_a.axmodel.gz",
+   "check": {
+    "axmodel": "1x64x64x9_to_1x1x64x576_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "1x64x64x9_to_1x1x64x576",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x1x1->1x256x128x1": {
+   "axmodel": "256x128x1x1_to_1x256x128x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x128x1x1_to_1x256x128x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x128x1x1_to_1x256x128x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x128x3x3->1x256x128x9": {
+   "axmodel": "256x128x3x3_to_1x256x128x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x128x3x3_to_1x256x128x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x128x3x3_to_1x256x128x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "256x256x3x3->1x256x256x9": {
+   "axmodel": "256x256x3x3_to_1x256x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "256x256x3x3_to_1x256x256x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "256x256x3x3_to_1x256x256x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x1x1->1x512x256x1": {
+   "axmodel": "512x256x1x1_to_1x512x256x1_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x256x1x1_to_1x512x256x1_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x256x1x1_to_1x512x256x1",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x256x3x3->1x512x256x9": {
+   "axmodel": "512x256x3x3_to_1x512x256x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x256x3x3_to_1x512x256x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x256x3x3_to_1x512x256x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "512x512x3x3->1x512x512x9": {
+   "axmodel": "512x512x3x3_to_1x512x512x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "512x512x3x3_to_1x512x512x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "512x512x3x3_to_1x512x512x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  },
+  "64x64x3x3->1x64x64x9": {
+   "axmodel": "64x64x3x3_to_1x64x64x9_a.axmodel.gz",
+   "check": {
+    "axmodel": "64x64x3x3_to_1x64x64x9_b.axmodel.gz",
+    "scale": 0.003921568859368563,
+    "zero_point": 128
+   },
+   "name": "64x64x3x3_to_1x64x64x9",
+   "scale": 0.0070588234812021255,
+   "zero_point": 128
+  }
+ },
+ "zero_point_0_templates": {
+  "1024x28224->1024x9x3136": {
+   "axmodel": "1024x28224_to_1024x9x3136_zp0_a.axmodel.gz",
+   "check": {
+    "axmodel": "1024x28224_to_1024x9x3136_zp0_b.axmodel.gz",
+    "scale": 0.009803921915590763,
+    "zero_point": 0
+   },
+   "scale": 0.019577646628022194,
+   "zero_point": 0
+  }
+ },
+ "zero_point_probes": {
+  "zp_16x1x64x3136_to_16x64x56x56": {
+   "axmodel": "zp_16x1x64x3136_to_16x64x56x56.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "16x1x64x3136->16x64x56x56",
+   "zero_point": 64
+  },
+  "zp_16x64x56x56_to_16x1x64x3136": {
+   "axmodel": "zp_16x64x56x56_to_16x1x64x3136.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "16x64x56x56->16x1x64x3136",
+   "zero_point": 64
+  },
+  "zp_1x128x64_asym": {
+   "axmodel": "zp_1x128x64_asym.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "1x128x64->128x64x1x1",
+   "zero_point": 64
+  },
+  "zp_1x128x64_asym2": {
+   "axmodel": "zp_1x128x64_asym2.axmodel.gz",
+   "scale": 0.0035294117406010628,
+   "template": "1x128x64->128x64x1x1",
+   "zero_point": 113
+  },
+  "zp_1x512x4608_to_512x512x3x3": {
+   "axmodel": "zp_1x512x4608_to_512x512x3x3.axmodel.gz",
+   "scale": 0.004705882165580988,
+   "template": "1x512x4608->512x512x3x3",
+   "zero_point": 64
+  }
+ }
+}

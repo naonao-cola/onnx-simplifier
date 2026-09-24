@@ -23,7 +23,7 @@ That semantic layer is what this file starts.
 ## Segment layout
 
 `adam_update_fp32.mcode.gz` (2288 bytes, `mcode.check()` == `[]`) has 5
-segments: `(292,64)`, `(356,32)`, `(388,832)`, `(1220,32)`, `(1252,576)`.
+segments: `(288,64)`, `(352,32)`, `(384,832)`, `(1216,32)`, `(1248,576)`.
 Segment 2 (832 bytes) is the largest, dense with `S`/`raw`/`B` records
 (120/79/40, plus 15 `V`) -- not characterized further here, genuinely
 open. Segment 4 (576 bytes) is 70 `V` (verb) records plus 4 `raw` bytes
@@ -171,9 +171,11 @@ class TestAdamUpdateFP32IsWellFormed(unittest.TestCase):
 
     def test_segment_layout(self):
         _, segs = mcode.segments(load("adam_update_fp32.mcode.gz"))
+        # Four bytes earlier than the (292, 64), ... this pinned before
+        # docs/axera-mcode-segments-fix.md: the blob has 4-byte tail padding.
         self.assertEqual(
             [(pos, length) for pos, length, _ in segs],
-            [(292, 64), (356, 32), (388, 832), (1220, 32), (1252, 576)],
+            [(288, 64), (352, 32), (384, 832), (1216, 32), (1248, 576)],
         )
 
 

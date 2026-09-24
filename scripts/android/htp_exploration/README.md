@@ -119,6 +119,84 @@ against either the tiny probe model or the real backbone.
    real-backbone TVM/HVX baseline -- the comparison this whole exploration exists
    to make.
 
+## Result: the whole backbone runs on the HTP, 58 ms (`qnn_shell_findings.md`)
+
+Items 2 and 3 above are done. PR #1810's `libQnnHtp.so` "not found" wall was the *vendor's*
+copy being hidden from apps; bundling Qualcomm's own QNN runtime (`com.qualcomm.qti:qnn-runtime`
+2.50.0 from Maven Central, matching the QNN 2.50 the ORT QNN EP plugin 2.6.0 was built against)
+and driving it from a plain `adb shell` native harness (`qnn_shell/`) needs no root and no
+system-app status. All 578 backbone nodes run on the HTP (strict mode, no CPU fallback), in an
+unsigned PD with our own `libQnnHtpV69Skel.so`:
+
+| Backbone on the phone | steady state |
+|---|---:|
+| QNN HTP, burst | **53 ms** (~3.0 TMAC/s) |
+| QNN HTP, default | 57 ms |
+| ORT CPU, 4 threads | 635 ms |
+| TVM int8 on HVX | 3.7 s (43 GMAC/s) |
+
+Accuracy is in the same band as the TVM int8 pipeline (FPN max abs err 1.03 vs host ORT); on
+`cats.jpg` all 3 detections match the all-ORT pipeline (box IoU 0.986, mask IoU 0.982). Graph
+compile costs ~6 s per process; an EP-context model cuts session creation to ~440 ms.
+
+## Result: `rest.onnx`'s heads on the HTP, the rest on the CPU (`rest_htp_findings.md`)
+
+The other half of the model (`rest.onnx`, 2405 nodes, 300 ms/image on the phone's CPU):
+
+- **Whole graph with CPU fallback: the wrong way.** Only 6 small partitions (static per-level RPN
+  arithmetic) go to the HTP; every head node is rejected with `Cannot get shape` (the RoI count
+  is dynamic inside the graph). It runs slower than CPU only (364 vs 284 ms) and perturbs the
+  proposals (box IoU 0.913 on `cats.jpg`).
+- **The heads cut out and pinned to a static batch run entirely on the HTP** (strict mode), fp32
+  `ConvTranspose` included: mask head 4.4 ms vs 79.9 ms on 4 CPU cores (18x, 32-RoI bucket); box
+  head 27.6 ms vs 36.3 ms (1.3x, opt mode 3 + burst). The split is bit-exact on the host, and end
+  to end (HTP backbone + HTP heads + CPU dynamic ops) all 3 `cats.jpg` detections match the
+  all-ORT pipeline (box IoU 0.986, mask IoU 0.980). RoiAlign is accepted by QNN too but is 2.4x
+  slower than the CPU as its own graph (it re-uploads the 55.7 MB feature map every call).
+- **The biggest CPU cost was a scatter**: 36% of `rest.onnx` is the RoiAlign level merge, an
+  element-wise `ScatterElements` over a fully broadcast index tensor. Rewriting it to a row
+  `ScatterND` (`qnn_shell/scatter_rewrite.py`) is bit-exact and cuts `rest.onnx` from 300.6 to
+  187.4 ms on the phone's CPU, no HTP involved.
+
+| Per image on the phone (4 CPU threads) | total |
+|---|---:|
+| backbone on HTP + `rest.onnx` on CPU (above) | ~358 ms |
+| + ScatterND rewrite | ~244 ms |
+| + box and mask heads on HTP | **~191 ms** (sum of measured pieces) |
+| + HVX NMS/decode/TopK/RoiAlign kernels (projection) | ~170 ms |
+
+EP-context caveat: the box head's EP-context model runs ~2x slower than the JIT-compiled one
+(52-55 vs 27-40 ms); not root-caused.
+
+## How close to the HTP's ceiling? 18% as shipped, 60% after rewrites (`ceiling_findings.md`)
+
+The practical int8 ceiling, measured on this phone by timing chains of large QDQ conv/MatMul
+layers and differencing chain lengths, is **~16 TMAC/s** (best: 3x3 conv 256->256 @128x128,
+15.9 TMAC/s; data-independent; per-channel weights free; uint16 activations half speed). At that
+rate the backbone's 159.2 GMAC would take 10 ms, so the shipped 54 ms is **18%** of the ceiling.
+
+QNN's own profiler shows convs are only 13% of the shipped model's accelerator time. The rest is
+float glue: the model's residual shortcuts are never quantized (12 of 16 blocks pass the Relu
+output to the next Add in float), so QNN can't form int8 Add units and runs Add/Relu/Q/DQ in
+float on full-resolution tensors. Five ONNX-level rewrites, measured one at a time:
+
+| step | rewrite | wall ms | % of ceiling |
+|---|---|---:|---:|
+| 0 | as shipped | 54.3 | 18% |
+| 1 | residual Adds as int8 QDQ units (quantized shortcut; the only numeric change) | 30.4 | 33% |
+| 2 | uint8 outputs | 21.5 | 47% |
+| 3 | raw RPN conv outputs (no per-anchor layout chain) | 20.8 | 48% |
+| 4 | uint8 NHWC image input | 19.4 | 52% |
+| 5 | NHWC FPN outputs | **16.7** (EP-context cache) | **60%** |
+
+Steps 2-5 are lossless interface changes that hand out what the HTP already holds, in the forms
+this project's DSP kernels already take (NHWC FPN maps for the fast RoiAlign, raw uint8 deltas for
+the fused RPN kernel). Accuracy stays in the same int8 band (FPN max abs 0.93-1.15 vs 0.81-1.08
+unmodified; `cats.jpg` 3/3 detections, box IoU 0.969 vs 0.985).
+`htp_graph_finalization_optimization_mode=3` is 3.6 ms *slower*; `vtcm_mb` and I/O-quantization
+offload are neutral.
+What's left (~7 ms): 19 memory-bound quantized Adds (~4 ms), the cin=3 stem conv, host-side I/O.
+
 ## Files
 
 - `make_tiny_qdq_conv.py` -- builds the minimal QDQ int8 conv model used to
@@ -127,3 +205,25 @@ against either the tiny probe model or the real backbone.
   given model to HTP on this host (device enumeration, both the legacy
   `providers=[...]` API and the newer `SessionOptions.add_provider` API), and
   reports exactly where it fails.
+- `qnn_shell/` -- adb-shell native ORT + QNN EP harness: `fetch_libs.sh` (Maven downloads,
+  not committed), `run.sh` (build, push, run), `qnn_run.cpp`, `compare.py` (tensor-level vs host
+  ORT), `detect_compare.py` (detection-level through `rest.onnx`),
+  `make_tiny_qdq_conv_f32io.py` (smoke-test model). See `qnn_shell_findings.md`.
+- `qnn_shell_findings.md` -- the working HTP path and its measurements.
+- `qnn_shell/qnn_run_multi.cpp`, `qnn_shell/run_multi.sh` -- multi-input variant of the harness
+  (manifest of `name dtype file shape`, int64 inputs, median timing, optional ORT profiling).
+- `qnn_shell/rest_split.py` -- cuts `rest.onnx` into the static box/mask heads (for the HTP) and
+  three dynamic CPU pieces, and stitches them back together with the heads on host ORT or on
+  the phone's HTP.
+- `qnn_shell/scatter_rewrite.py` -- rewrites the RoiAlign level merge from `ScatterElements`
+  over a broadcast index to `ScatterND` (bit-exact, 1.6x on `rest.onnx` on the phone's CPU).
+- `rest_htp_findings.md` -- `rest.onnx` on the HTP: partitioning, the heads, the scatter, and the
+  per-image pipeline.
+- `ceiling_findings.md` -- the measured HTP int8 ceiling, where the backbone's time goes, and the
+  five rewrites that take it from 18% to 60% of that ceiling.
+- `ceiling/` -- `gen_ceiling_models.py` / `run_ceiling.sh` / `summarize_ceiling.py` (ceiling
+  sweep), `profile_backbone.sh` / `analyze_profile.py` (QNN profiling + attribution), the rewrites
+  (`quantize_residuals.py`, `quantized_outputs.py`, `raw_rpn_outputs.py`, `quantized_input.py`,
+  `nhwc_fpn_outputs.py`, chained by `make_optimized.sh`), and `compare_optimized.py` (accuracy of
+  the rewritten model against the original on host ORT). `qnn_shell/qnn_run.cpp` now also takes
+  uint8 inputs and writes non-fp32 outputs at their real element size.

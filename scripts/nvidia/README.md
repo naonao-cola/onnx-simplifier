@@ -17,6 +17,7 @@ hand-built-graph tests in `tests/test_tensorrt_*.py` (which never invoke TensorR
 | `run_cuda_feature_notebook.py` | onnxsim + a GPU `onnxruntime` | runs `examples/cuda_feature_tests/cuda_feature_tests.ipynb`'s tests as a plain script |
 | `llm_pipeline.py` | onnxsim (Python >= 3.11) | pins shapes on a decoder-with-KV-cache LLM export and runs `simplify()` on it |
 | `llm_block_split.py` | onnxsim (`split`), system Python with `tensorrt` (`build`) | splits a decoder LLM into N-layer TensorRT-buildable blocks, chains them, measures real end-to-end latency per block size |
+| `edgellm_simplify.py` | onnxsim (Python >= 3.11) | runs onnxsim on a TensorRT Edge-LLM export dir for `llm_build` and checks plugin nodes / graph I/O are untouched; `rms-stack` writes a synthetic RMSNorm+MLP stack for `trtexec` |
 
 They are split because JetPack 6's TensorRT Python bindings are cp310-only while onnxsim
 needs Python >= 3.11; models are exchanged as `.onnx` files.
@@ -452,3 +453,352 @@ within ~1.3-1.7x of the theoretical (unreliable) single-engine latency, while bu
 loading reliably every time, unlike K=24. This is a genuine, real-hardware answer to "can
 a small decoder LLM be deployed via plain ONNX-import TensorRT on an 8 GB Jetson Orin Nano
 at all" -- yes, with this splitting, even though the unsplit graph cannot.
+
+## TensorRT-LLM and TensorRT Edge-LLM: ONNX status and onnxsim fusion
+
+Checked 2026-09-23 against TensorRT-LLM `main` (1.3.0rc28) / 1.2.1 and TensorRT Edge-LLM
+0.10.1 (`e8b2952`), on an x86 RTX 5050 (sm_120, driver 615.71) host.
+
+**TensorRT-LLM has no ONNX path for onnxsim to plug into.** It builds models from PyTorch
+module definitions, not ONNX. The legacy TensorRT-engine backend was removed from `main` in
+July 2026 -- Python modules in
+[NVIDIA/TensorRT-LLM#15918](https://github.com/NVIDIA/TensorRT-LLM/pull/15918), C++ modules
+and every plugin (`GPTAttention` included) in
+[#16369](https://github.com/NVIDIA/TensorRT-LLM/pull/16369) -- so 1.3 no longer links
+TensorRT at all and runs on the PyTorch backend only. 1.2.1, the last stable release with
+the TensorRT path, touches ONNX in exactly two places: `network.py`/`tools/onnx_utils.py`'s
+`to_onnx` (a weightless "ONNX-like" *visualization dump* of a TensorRT network, not a
+runnable model) and `tools/multimodal_builder.py`, which exports ~20 VLMs' vision encoders
+with TorchScript `torch.onnx.export(opset_version=17)` and builds them with TensorRT's ONNX
+parser -- the only real ONNX -> TensorRT route, and deleted from `main` by #15918.
+
+TensorRT-LLM 1.2.1 (pip wheel: torch 2.9.1+cu128, TensorRT 10.14.1) **runs on the RTX 5050
+(sm_120)** via the PyTorch backend, after two workarounds:
+
+- The `LLM` API spawns its worker with `MPI_Comm_spawn`, which fails under the pip
+  `openmpi` wheel (`OPAL ERROR ... dpm.c`, then a hang). `TLLM_WORKER_USE_SINGLE_PROCESS=1`
+  runs a TP=1 worker in-process instead.
+- It then segfaults in `nvmlSystemGetConfComputeSettings`: `tensorrt_llm/_utils.py` passes
+  the ctypes struct *by value* where NVML takes a pointer (undefined behavior that crashes
+  on driver 615.71). Fixed on `main` (`byref(cc_settings)`); a 1.2.1 backport is requested
+  in issue [#18816](https://github.com/NVIDIA/TensorRT-LLM/issues/18816). Patching the one call in the
+  installed `_utils.py` the same way fixes it.
+
+`Qwen/Qwen3-0.6B` fp16, same 3 chat prompts x 128 greedy tokens as the Edge-LLM run below:
+176-195 tok/s end to end through the Python `LLM` API (Edge-LLM's C++ runtime: 212 tok/s
+wall-clock), 2.5 GB peak host RAM. Outputs match Edge-LLM's for the first 117-237
+characters (one of the three identically in full) before fp16 kernel differences diverge
+them.
+
+**TensorRT Edge-LLM is ONNX-first**: HF checkpoint -> `tensorrt-edgellm-export`
+(`torch.onnx.export(dynamo=True, optimize=True)`) -> ONNX with custom-domain plugin nodes ->
+C++ `llm_build` (TensorRT ONNX parser + its plugin library) -> C++ runtime. x86 sm_120 is a
+"Developer" platform in its support matrix; no prebuilt sm_120 CuTe DSL kernels ship, but
+`kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_120` generates them in seconds.
+
+`Qwen/Qwen3-0.6B`, exported on CPU in fp16 (opset 24, 856 nodes): attention, RoPE, QK-norm
+and the paged-KV-cache update are all inside 28 `trt_edgellm::AttentionPlugin` nodes (with
+empty-string optional inputs); what is left is 57 decomposed RMSNorms and 28 SwiGLU MLPs.
+
+- onnxsim handles the custom-domain plugin nodes fine (kept verbatim, empty optional
+  inputs preserved, constants around them folded), but **before this change it was a
+  no-op: 856 -> 856 nodes**. Every norm is HF's fp32-upcast spelling
+  (`Cast(X, FLOAT) -> Pow/ReduceMean/Add/Sqrt/Reciprocal/Mul -> Cast(fp16) -> Mul(weight)`),
+  which `fuse_rms_norm` explicitly declined.
+- `fuse_rms_norm` now matches that spelling too, as
+  `RMSNormalization<stash_type=FLOAT>(X, weight)` -- exactly the op's own reference body
+  (Cast X to the stash type, normalize, Cast back to T, multiply by scale). **856 -> 400
+  nodes**: all 57 norms fused, 114 of 115 `Cast`s gone, 2.5 s, 5.7 GB peak RSS.
+- Fixed along the way: `fuse_rms_norm` accepted a `ReduceMean` over *any* single axis, but
+  `RMSNormalization` normalizes over every axis from `axis` to the last, so e.g.
+  `ReduceMean(axes=[1])` on a rank-3 tensor fused into a reduction over axes 1 *and* 2
+  (onnxruntime: max |diff| 0.94 vs the decomposed graph on unit-scale input). It now only
+  fuses a last-axis reduction.
+
+**Real TensorRT, RTX 5050 (sm_120), TensorRT 11.3.0, CUDA 13.4: the fusion is exact and
+speed-neutral.** TensorRT's Myelin compiler already fuses the *decomposed* fp32-upcast norm
+into one kernel (`__myl_CastMulMeanAddSqrtDivMulCastMul`), so both forms produce the same
+engine. Edge-LLM was built from source for sm_120 only (`CMAKE_CUDA_ARCHITECTURES=120`,
+`-DCUTE_DSL_ARTIFACT_TAG=sm_120 -DENABLE_CUTE_DSL=fmha`); its `llm_build` accepts the
+onnxsim output as-is (standard `RMSNormalization`, plugin nodes byte-identical).
+
+```sh
+python3.12 scripts/nvidia/edgellm_simplify.py EXPORT/llm SIM/llm        # onnxsim venv
+./build/examples/llm/llm_build --onnxDir SIM/llm --engineDir ENG --maxBatchSize 1 \
+    --maxInputLen 512 --maxKVCacheCapacity 1024
+python3.12 scripts/nvidia/edgellm_simplify.py rms-stack /tmp/rms       # synthetic, trtexec
+```
+
+| Qwen3-0.6B fp16, Edge-LLM `llm_build` + `llm_inference` | as exported | onnxsim |
+|---|---|---|
+| ONNX nodes | 856 | 400 |
+| engine build | 26.5 s, 4.7 GB peak | 25.8 s, 5.2 GB peak |
+| prefill | 2821 tok/s (9.22 ms) | 2854 tok/s (9.11 ms) |
+| decode | 218.0 tok/s | 218.9 tok/s |
+| greedy output, 3 prompts x 128 tokens | -- | identical |
+
+One run each (~1% differences are noise). Both builds print the same 31 TensorRT warnings
+(28 of them `Attribute xqa_jit_kernels not found in plugin node`, from the export itself,
+not onnxsim). The plugin-free `rms-stack` model (28 Qwen3-0.6B-shaped RMSNorm + SwiGLU
+blocks, `trtexec` with CUDA graphs) isolates the norm: 113 engine layers either way, decode
+1.979 vs 1.979 ms, 512-token prefill 13.71 vs 13.78 ms (decomposed vs fused, median of 500).
+
+So for Edge-LLM on TensorRT the fusion is a graph-size/readability win, not a speed win.
+Any speed benefit would have to come from a backend without a Myelin-style fuser of its
+own that does dispatch `RMSNormalization` to a fused kernel -- not measured here.
+
+### Edge-LLM quantized exports: fp8, int4_awq, nvfp4, mxfp8, int8_sq
+
+Every backbone quantization Edge-LLM 0.10.1 offers, on `Qwen/Qwen3-0.6B`, RTX 5050 (sm_120):
+`tensorrt-edgellm-quantize llm --quantization <q> --text_dataset wikitext --num_samples 128`
+(ModelOpt calibration on the GPU, 19 s-2 min, <= 6.1 GB host RAM) -> `tensorrt-edgellm-export`
+(CPU) -> `edgellm_simplify.py` -> `llm_build` / `llm_inference`, same 3 prompts x 128 greedy
+tokens as the fp16 run above.
+
+**onnxsim keeps every quantization scheme intact.** The graphs carry very different
+quantization machinery -- standard `QuantizeLinear`/`DequantizeLinear` with FP8 / INT8
+initializers (fp8, int8_sq), `trt::TRT_FP4DynamicQuantize` + `trt::DequantizeLinear` with
+FLOAT4E2M1 weights (nvfp4), `trt::TRT_MXFP8DynamicQuantize` / `TRT_MXFP8DequantizeLinear`
+(mxfp8), `trt_edgellm::Int4GroupwiseGemmPluginV2` + `QkvConcatPlugin` (int4_awq) -- and
+in all five no Q/DQ or plugin node is touched, the plugin attributes and graph I/O stay
+byte-identical (`edgellm_simplify.py`'s check), and the count of FP8/FP4/INT8/UINT8
+initializers is unchanged (no weight `DequantizeLinear` constant-folded into fp16). What
+changes is the same as for fp16: the 57 fp32-upcast RMSNorms fuse into `RMSNormalization`
+and redundant `Cast`s go (e.g. int4_awq 1136 -> 680 nodes, nvfp4 1752 -> 1296).
+
+| dtype | decode tok/s (orig / onnxsim) | prefill tok/s | peak GPU MB | onnxsim greedy output identical |
+|---|---|---|---|---|
+| fp16 | 218 / 219 | 2821 / 2854 | 1698 | 3/3 |
+| fp8 | 327 / 327 | 4574 / 4537 | 1266 | 3/3 |
+| int4_awq | **413 / 412** | 3847 / 3858 | **1076** | 2/3 |
+| nvfp4 | 337 / 340 | 4326 / 4322 | 1074 | 3/3 |
+| mxfp8 | 253 / 253 | 3320 / 3403 | 1272 | 0/3 |
+| int8_sq | 315 / 315 | 2660 / 2836 | 1314 | 3/3 |
+
+Speed and memory are unchanged by onnxsim (single runs; ~1-3% differences are noise).
+Where the greedy text differs it diverges late (after 172-298 characters) into equally
+fluent text; per-step log-probabilities (`llm_inference --numLogprobs 5`, mxfp8) differ by
+0.002-0.06 on average before the split, and two of the three splits are at near-exact ties
+in the original (top-1/top-2 margin 0.000 and 0.031) -- rounding-level differences in how
+TensorRT fuses the fused vs decomposed RMSNorm feeding the quantizer, amplified by MXFP8's
+dynamic block quantization (the largest single-step top-1 difference seen was 0.44). Not
+verified against an independent reference, so "equivalent quality" is inferred, not measured.
+
+**int4_awq on x86 needs the `int4_fp16_gemm` CuTe group.** With only `fmha` built (the
+quick-start default), `Int4GroupwiseGemmPluginV2` compiles with no kernels
+(`#ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED`), `llm_build` still succeeds, and inference fails
+at the first enqueue (`Custom layer callback ... failed`, `warmup enqueueV3 failed`).
+`build_cutedsl.py --kernels fmha,int4_fp16_gemm --gpu_arch sm_120` (the group targets the
+Ampere instruction set, so it runs on sm_120) plus `-DENABLE_CUTE_DSL="fmha;int4_fp16_gemm"`
+fixes it (tracked in onnxsim/onnxsim#1916).
+
+## ONNX -> TensorRT-LLM via AutoDeploy (`onnxsim.to_torch`)
+
+TensorRT-LLM has no ONNX importer, but AutoDeploy -- its path for arbitrary models -- only
+needs a PyTorch module with `forward(input_ids, position_ids) -> logits` from a *model
+factory*: it `torch.export`s it, pattern-matches attention / GQA repeat / RoPE / RMSNorm
+onto its canonical ops, and inserts TensorRT-LLM's paged-KV-cache attention kernels.
+`onnxsim/to_torch.py` supplies that module for an ONNX decoder LLM, and
+`scripts/nvidia/trtllm_autodeploy_onnx.py` registers it as an `OnnxModelForCausalLM`
+factory:
+
+```sh
+python3.12 -c "import onnx, onnxsim; m = onnx.load('model_fp16.onnx'); \
+  s, _ = onnxsim.simplify(m, target_opset_version=23, check_n=0); \
+  onnx.save(s, 'model_fp16_sim23.onnx', save_as_external_data=True)"
+python3.12 scripts/nvidia/trtllm_autodeploy_onnx.py model_fp16_sim23.onnx --tokenizer EXPORT_DIR \
+    --compile-backend torch-cudagraph                       # TensorRT-LLM venv, onnxsim --no-deps
+```
+
+`onnx_to_torch` interprets the ONNX graph op by op inside `forward`, so `torch.export`
+flattens it into plain aten ops. Shape arithmetic (`Shape` -> `Gather`/`Concat`/... ->
+`Reshape`/`Expand`) is carried as Python (Sym)ints -- note `torch.SymInt` is *not* an `int`
+subclass -- which is what keeps batch and sequence dynamic. Decoder attention
+(`MatMul(q, kT) [-> scale] [-> +mask] -> Softmax -> MatMul(., v)`, or opset-23 `Attention`)
+becomes causal `F.scaled_dot_product_attention`, `past_key_values.*` inputs are stripped
+(`Concat(past, new)` -> `new`), and everything only the mask / `present.*` outputs needed
+is dead and never traced. One non-obvious rewrite: old HF `rotary_emb` slices its cos/sin
+table to `[:past_len + seq_len]` before indexing it with `position_ids`; with the cache
+stripped that slice must become the whole table, or every decode step (seq_len 1, large
+positions) reads past the traced end.
+
+Checked on [`onnx-community/Qwen2.5-0.5B-Instruct`](https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct)
+`onnx/model_fp16.onnx` (optimum export, opset 14, 2759 nodes, 24 layers, GQA 14/2, past-KV
+inputs), TensorRT-LLM 1.2.1, RTX 5050:
+
+- **Conversion is exact.** On an fp32 copy of the model, prefill logits vs onnxruntime:
+  relative L2 4.5e-6, argmax 100%, in both `attention="exact"` (every op, KV cache kept)
+  and the default `"sdpa"` mode (cache stripped, all 24 attention blocks recognized).
+- **The fp16 export is broken in real fp16, and onnxsim fixes it.** Its RMSNorm is
+  decomposed and computed entirely in fp16; the residual stream reaches ~1,700 by layer 3,
+  so `Pow(x, 2)` overflows fp16 (max 65,504) and greedy decoding degenerates ("four, four,
+  four, ..."), both through AutoDeploy and with the converter alone (so not a cache bug).
+  (onnxruntime's CPU provider upcasts internally and does not overflow, but its fp16 path
+  is inaccurate here in the other direction: `mean(x^2)` ~ 1e-4 at the embedding hits
+  fp16 subnormals, 2.8e-2 relative error in the first RMSNorm vs 3.8e-4 for torch --
+  so it is not a usable reference for this model in fp16.) `fuse_rms_norm` fuses the chain
+  into `RMSNormalization` with an explicit `stash_type=FLOAT` -- after being taught to read
+  fp16 scalar constants, which it previously silently declined on -- and `to_torch` emits
+  that as HF's upcast RMSNorm, which AutoDeploy's `match_rmsnorm_pattern` recognizes (it
+  matched 0 of the fp16 decompositions). `simplify(target_opset_version=23)`: 2759 -> 2461
+  nodes, 49 `RMSNormalization`.
+- **AutoDeploy then recognizes everything**: 24 attention (-> cached attention), 48 GQA
+  repeats, 24 RoPE (-> its optimized RoPE), 49 RMSNorm (-> fused RMSNorm). Output is
+  coherent and matches the converter's own no-cache greedy decode.
+
+| Qwen2.5-0.5B-Instruct fp16 ONNX, 3 chat prompts, greedy, batch 1 | build | end-to-end tok/s |
+|---|---|---|
+| AutoDeploy `torch-simple` | 37 s | 130-133 |
+| AutoDeploy `torch-cudagraph` | 25 s | 181-183 |
+
+(For scale: TensorRT-LLM's own PyTorch backend on the HF `Qwen3-0.6B` checkpoint gave
+176-195 tok/s in the section above -- a different, slightly larger model.)
+`torch-cudagraph` needs `cuda_graph_batch_sizes` capped at `max_batch_size` (the script
+does this): AutoDeploy 1.2.1's default capture list includes larger batch sizes and fails
+with `Data too large for buffer 'cu_seqlen'`. `max_batch_size` must be >= 2: AutoDeploy
+traces with that batch size and `torch.export` specializes a size-1 example dimension.
+
+### More models and export formats: ONNX Runtime contrib ops and int4
+
+Two of the three most common ways LLMs are shipped as ONNX turned out to be the *ONNX
+Runtime GenAI builder* spelling, not optimum's: `com.microsoft` `GroupQueryAttention`
+(q/k/v in `[B, S, H*D]`, past KV fed straight in, `seqlens_k`/`total_sequence_length`
+derived from `attention_mask`), contrib `RotaryEmbedding` (cos/sin cache looked up by
+`position_ids`), `SimplifiedLayerNormalization` / `SkipSimplifiedLayerNormalization`
+(RMSNorm, and residual-add + RMSNorm), and for quantized files `MatMulNBits`. `to_torch`
+now converts all of them: GQA -> causal SDPA with HF's `repeat_kv` spelling (past and
+seqlens inputs are never read in `sdpa` mode), RMSNorms in HF's upcast form, and
+`GroupQueryAttention` with `do_rotary=1` (Llama-3.2's export: RoPE inside the op,
+positions derived from `seqlens_k`, and no `position_ids` graph input) takes the positions
+from `forward`'s `position_ids` -- which AutoDeploy supplies -- as a synthetic input, and
+`MatMulNBits` *dequantized once at conversion* to a dense fp16 `[K, N]` weight -- a
+working path onto TensorRT-LLM, not its int4 kernels (no int4 memory saving; the packed
+weights are not kept). `GroupQueryAttention` with sliding window or softcap,
+interleaved / scaled contrib RoPE and `MatMulNBits` with `g_idx` raise instead of guessing.
+
+All three checked against onnxruntime on an fp32 copy (prefill logits, `exact` and `sdpa`
+modes), then run through AutoDeploy (`torch-cudagraph`, 3 chat prompts, greedy, RTX 5050):
+
+| model (export) | vs onnxruntime | AutoDeploy matches | end-to-end tok/s |
+|---|---|---|---|
+| `HuggingFaceTB/SmolLM2-360M-Instruct` `model_fp16.onnx` (contrib ops) | rel 5.6e-6, argmax 100% | 32 attn, 64 GQA repeat, 65 RMSNorm | 216-220 |
+| same, `model_q4f16.onnx` (int4 `MatMulNBits` x224) | rel 8.2e-6, argmax 100% | same | 215-220 |
+| `onnx-community/Qwen3-0.6B-ONNX` `model_fp16.onnx` (contrib ops, per-head q/k-norm) | -- | 28 attn, 56 GQA repeat, 113 RMSNorm | 132 |
+| `onnx-community/Llama-3.2-1B-Instruct-ONNX` `model_fp16.onnx` (RoPE *inside* GQA, no `position_ids` input) | rel 2.5e-6, argmax 100% | 16 attn, 32 GQA repeat, 33 RMSNorm | 100-101 |
+
+All outputs are coherent (the int4 SmolLM2's answers differ from fp16's, as expected).
+onnxruntime's own `GroupQueryAttention` kernel has restrictions the conversion does not
+(head size a multiple of 8, of 16 with `do_rotary`; batch 1 when a multi-token input has a
+past), which only matters for the tests' reference runs. The speeds above are from before
+the two fixes below; updated numbers follow them.
+
+**Why AutoDeploy did not fuse the converted RoPE (fixed).** Its `match_rope_pattern` is
+one pattern over a q *and* k rotation that share one `cos.unsqueeze(1)` /
+`sin.unsqueeze(1)` node, registered only for the `[B, N, S, D]` / `unsqueeze_dim=1`
+layout. Three things had to hold, and the conversion violated each in turn: (1) q and k
+each have their own ONNX `RotaryEmbedding` node, so they must be handed the *same*
+unsqueezed cos/sin; (2) that unsqueeze is *inside* the pattern, so it must be used by
+exactly one q/k pair -- memoizing it across the whole forward call shared it with every
+layer, and the matcher refuses a replacement whose internal node has outside users;
+(3) the replacement `torch_rope(q, k, cos, sin)` is inserted where q's rotation starts, so
+k's `reshape`/`transpose` must already exist there -- i.e. q and k are prepared together
+(the converter now rotates each q/k `RotaryEmbedding` pair, found through the
+`GroupQueryAttention` consuming both, at whichever node comes first). With all three,
+every model's RoPE matches (SmolLM2 32/32, Qwen3 28/28, Llama-3.2 16/16 -- the in-op GQA
+rotary only needed (2)).
+
+**Why Qwen3 was 22% slower than the same model from its HF checkpoint (fixed).** Running
+AutoDeploy on the HF checkpoint itself (same prompts, same settings) gave 176 tok/s vs
+137 for the ONNX -- so the gap was the conversion, not AutoDeploy. An `nsys` kernel
+summary of one 128-token generation (`torch-simple`, so kernels are visible): 898 ms of
+GPU kernels vs 693 ms, and the whole difference was one extra GEMV per layer (3,556
+launches = 28 layers x 127 steps, 180 ms, ~50 us each, plus a `cublasLt::splitKreduce`
+per launch). Every matmul was plain fp16 x fp16 at the aten level; the cause was weight
+**layout**: ONNX `MatMul` stores `[K, N]` weights (`x @ W`), PyTorch linears `[N, K]`
+(`F.linear(x, W)`), and for batch-1 decode cuBLAS sent one of the seven per-layer
+`[K, N]` matmuls to a slow split-K GEMV. (A first guess -- the tied LM head computed as
+`MatMul(x, Transpose(embed))`, 311 MB transposed every step -- was tested by
+pre-transposing it in the ONNX and made no difference: the transpose is a view.) The
+converter now registers a constant 2-D `MatMul` weight transposed and emits `F.linear`
+(also AutoDeploy's canonical linear); `MatMulNBits` dequantizes straight to `[N, K]`.
+Numerics are unchanged (all four models still match onnxruntime at 2.5e-6 to 8.2e-6).
+
+| AutoDeploy `torch-cudagraph`, RTX 5050, 3 chat prompts x 128 greedy tokens | before | after both fixes |
+|---|---|---|
+| `onnx-community/Qwen3-0.6B-ONNX` fp16 | 132 | **173-175** (HF checkpoint through AutoDeploy: 176) |
+| `onnx-community/Qwen2.5-0.5B-Instruct` fp16 (optimum, via `simplify(opset 23)`) | 181-183 | **196-207** |
+| `onnx-community/Llama-3.2-1B-Instruct-ONNX` fp16 | 100-101 | **106-109** |
+| `HuggingFaceTB/SmolLM2-360M-Instruct` fp16 | 216-220 | 208-231 (3 runs; noise ~+-5%) |
+| same, `model_q4f16.onnx` (int4, dequantized) | 215-220 | 202-227 |
+
+### int4 that stays int4: `matmul_nbits="packed"` and a Triton W4A16 kernel
+
+Dequantizing `MatMulNBits` once to fp16 works but throws away what int4 is for. Real int4
+execution on this stack turned out to need a kernel of our own:
+
+- **TensorRT-LLM's weight-only int4 GEMMs refuse sm_120.** `finegrained_mixed_dtype_gemm`
+  (what its PyTorch backend's W4A16 AWQ linear calls) and `weight_only_quant_gemm` both fail
+  with `Not Implemented: SM120 GEMM only supports nvfp4` (`cutlass_heuristic.cpp`) -- the
+  consumer-Blackwell build ships NVFP4 GEMMs only on that path.
+- **AutoDeploy has no int4 kernel at all**, in 1.2.1 or on `main`: its AWQ and GPTQ int4 ops
+  (`torch_fake_quant_int4_linear`, `..._gptq_linear`) are *fake-quant* -- they dequantize
+  the whole weight in PyTorch on every call; only FP8 / NVFP4 get `fuse_*_linear` onto real
+  kernels.
+- PyTorch's `aten._weight_int4pack_mm` (tinygemm) runs on sm_120 but takes **bf16**
+  activations only; for these fp16 models that would round every int4 linear's input to bf16.
+
+So `onnx_to_torch(..., matmul_nbits="packed")` keeps 4-bit `MatMulNBits` weights in their own
+layout (`[N, K/2]` uint8, `[N, groups]` scales, unpacked zeros) and emits
+`torch.ops.onnxsim.matmul_nbits` (`onnxsim/_matmul_nbits_op.py`): a `torch.library` custom op
+with a fake implementation (AutoDeploy exports it as one opaque node, CUDA graphs capture it),
+a PyTorch dequantize-and-`F.linear` fallback, and on CUDA the Triton kernels in
+`onnxsim/_triton_w4a16.py` -- a split-K W4A16 kernel that dequantizes in registers for
+M <= 16 (decode), and a GPU dequantize + cuBLAS for larger M (prefill). Same arithmetic as
+the dequantize path (`(q - zp) * s` rounded to fp16, fp32 accumulation), different
+summation order: Llama-3.2-1B q4f16 logits agree at rel 2.4e-3 (max |diff| 0.047 of 23.7,
+argmax 100% on an 8-token decode-path input) -- enough to flip greedy near-ties (top-1/top-2
+margins of 0.016 occur), so the two modes' generations can diverge after a few tokens.
+
+**Verified end to end against ONNX Runtime.** Prefill logits of the real int4 files on the
+GPU (fp16) vs ONNX Runtime on an fp32 copy of the same file (int4 weights exact):
+SmolLM2-360M q4f16 3.5e-3 relative (decode-sized input, Triton split-K kernel) / 2.7e-3
+(54-token prefill), Llama-3.2-1B q4f16 2.4e-3 / 2.7e-3, argmax 100% -- the same as the
+`dequant` path and as a plain fp16 model (2.4e-3), i.e. fp16 rounding. One trap: Llama's
+`MatMulNBits` carry `accuracy_level=4`, which lets ONNX Runtime's CPU kernel quantize the
+*activations* to int8; against that reference both paths look 10x worse (3.2e-2, argmax 97%).
+The conversion ignores `accuracy_level` and always uses full-precision activations.
+
+**Kernel speed: measure with weights that don't fit in L2.** Timing one layer in a loop
+keeps its dense fp16 weight resident in the RTX 5050's 24 MB L2 (a 2048x2048 fp16 weight is
+8 MB), which made dense look faster than int4 for every layer up to ~3072 wide at M = 2-16.
+In a model the weights stream from DRAM every token (Llama-3.2-1B: 2.5 GB), so the table
+below rotates each layer over enough copies to exceed 4x L2 (also: 2 s clock warm-up,
+7 interleaved rounds, medians, CUDA-graph replay; group 32):
+
+| layer K x N | M=1 | M=8 | M=32 | M=64 | M=128 | M=512 |
+|---|---|---|---|---|---|---|
+| 960 x 960 | 2.52x | 1.11x | 0.82x | 0.60x | 0.76x | 0.91x |
+| 2048 x 2048 | 1.64x | 1.53x | 1.31x | 0.82x | 0.71x | 0.93x |
+| 2048 x 8192 | 1.90x | 1.86x | 1.50x | 1.11x | 0.82x | 0.82x |
+| 8192 x 2048 | 1.69x | 1.64x | 1.33x | 0.85x | 0.61x | 0.82x |
+
+(int4 speedup over dense fp16 `F.linear`.) M <= 16 is the split-K decode kernel; 16 < M <= 256
+the same kernel as a plain tile GEMM (tuned from a sweep: it beat the first version's
+transient-dequant + cuBLAS path at every M <= 128, e.g. 73 vs 274 us at M = 32 on
+2048x8192); M > 256 dequantizes to a transient fp16 weight and calls cuBLAS. Decode --
+nearly all of a chat generation -- is 1.1-2.5x faster; mid-size prefills are the weak spot.
+
+| AutoDeploy `torch-cudagraph`, RTX 5050, 3 prompts x 128 greedy tokens | weights on GPU | tok/s |
+|---|---|---|
+| Llama-3.2-1B `model_fp16.onnx` | ~2.5 GB fp16 | 106-109 |
+| Llama-3.2-1B `model_q4f16.onnx`, `matmul_nbits="dequant"` | ~2.5 GB fp16 | 108-109 |
+| Llama-3.2-1B `model_q4f16.onnx`, **`matmul_nbits="packed"`** | int4 + fp16 embedding | **159-160** |
+| SmolLM2-360M `model_q4f16.onnx`, `"dequant"` | 0.725 GB | 218-229 |
+| SmolLM2-360M `model_q4f16.onnx`, **`"packed"`** | **0.272 GB** | **347-365** (290-349 before the tile path) |
+
+(`trtllm_autodeploy_onnx.py --matmul-nbits packed`. AutoDeploy's "Estimated parameters
+memory" log line counts `parameters()` only and misses the uint8 buffers -- the byte counts
+above are from the state dict.) Only 4-bit without `g_idx`, group sizes that divide or are
+multiples of 128, and zero points that are absent, packed uint8, or integral floats in
+[0, 15] take the kernel; anything else (e.g. fractional float zero points, which
+MatMulNBits allows) falls back to dequantizing.

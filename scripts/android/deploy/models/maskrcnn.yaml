@@ -1,0 +1,16 @@
+# Mask R-CNN exactly as #1841 runs it (stage e_opt): optimized int8 backbone, box/mask heads on the
+# HTP, fused RPN post-processing and RoiAlign on the HVX DSP, the rest on ORT CPU -- one process.
+#
+# This pipeline is built by ../e2e_pipeline (its README's "Reproduce": maskrcnn_e2e/prepare.py,
+# ceiling/make_optimized.sh, build_models.py, prepare_inputs.py, and `BUILD_ONLY=1 build.sh` for
+# the DSP stubs/skels), so the spec only points at those outputs; deploy.py skips its own
+# simplify/quantize/rewrite/post and runs pipe -> push -> bench -> accuracy on them.
+name: maskrcnn
+prebuilt:
+  dir: $MASKRCNN_E2E_OUT        # build_models.py --out
+  pipe: pipe_e_opt.txt
+  inputs: $MASKRCNN_E2E_IMGS    # prepare_inputs.py dir: <stem>.bin images + ref/ (all-ORT outputs)
+  dsp: true                     # needs runtime/pipe_run_dsp + the rpn/roialign skels
+  dsp_build: $MASKRCNN_E2E_BUILD  # ../e2e_pipeline/build.sh's BUILD dir
+bench: {warmup: 2, reps: 7, cpu_threads: 4}
+accuracy: {kind: maskrcnn}

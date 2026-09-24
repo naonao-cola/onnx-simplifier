@@ -1,0 +1,102 @@
+{
+ "relu_16x128x28x28_zp169.axmodel.gz": {
+  "scale": 0.010256078094244003,
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "zero_point": 169
+ },
+ "relu_16x128x28x28_zp86.axmodel.gz": {
+  "scale": 0.03829725459218025,
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "zero_point": 86
+ },
+ "relu_16x256x14x14_zp169.axmodel.gz": {
+  "scale": 0.010256078094244003,
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "zero_point": 169
+ },
+ "relu_16x256x14x14_zp86.axmodel.gz": {
+  "scale": 0.03829725459218025,
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "zero_point": 86
+ },
+ "relu_16x512x7x7_zp169.axmodel.gz": {
+  "scale": 0.010256078094244003,
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "zero_point": 169
+ },
+ "relu_16x512x7x7_zp86.axmodel.gz": {
+  "scale": 0.03829725459218025,
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "zero_point": 86
+ },
+ "relu_16x64x112x112_zp169.axmodel.gz": {
+  "scale": 0.010256078094244003,
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "zero_point": 169
+ },
+ "relu_16x64x112x112_zp86.axmodel.gz": {
+  "scale": 0.03829725459218025,
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "zero_point": 86
+ },
+ "relu_16x64x56x56_zp169.axmodel.gz": {
+  "scale": 0.010256078094244003,
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "zero_point": 169
+ },
+ "relu_16x64x56x56_zp86.axmodel.gz": {
+  "scale": 0.03829725459218025,
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "zero_point": 86
+ }
+}

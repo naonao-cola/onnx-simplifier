@@ -866,9 +866,12 @@ _GAP_STREAMS = {
     # lone singles the abutting-trailer form does not cover plus the
     # still-unformed `08`. Fails loudly in either direction: a regression
     # adds runs, a future form decoding these removes them.
+    # Re-pinned by docs/axera-mcode-segments-fix.md: with segment starts no
+    # longer 4 bytes late, the (284, 285) literal token now decodes as a
+    # segment's opening record and a (488, 490) run surfaces instead.
     "reshape_mul_gap": (
-        "coverage: only 93.8% of non-zero bytes explained "
-        "[(284, 285), (321, 322), (465, 468), (470, 471)]"
+        "coverage: only 93.9% of non-zero bytes explained "
+        "[(321, 322), (465, 468), (470, 471), (488, 490)]"
     ),
     "reshape_gather_bwd": (),
 }
@@ -967,23 +970,28 @@ def test_terminal_pair_closes_before_padding(name):
 # {0x23, 0x24, 0x26, 0x2B} with two zero bytes before it, abutting the
 # next segment's `a7 00` marker head. Device-mapped (zeroing faults the
 # NPU); 36 exact recurrences corpus-wide against zero shuffled.
+# An A record is the one-byte LZ77 literal token that opens each segment,
+# just before its `a7 00 00` header (docs/axera-short-unit-encoding.md). The
+# blobs marked +1 have 4-byte tail padding; before
+# docs/axera-mcode-segments-fix.md, mcode.segments started their first segment
+# 4 bytes late, past its token, so one fewer A was counted.
 _A_COUNTS = {
     "conv64_k5_d2": 3,
     "conv128_k7_d12": 4,
-    "piper_vocoder": 3,
-    "w2v2fe_training_step": 3,
+    "piper_vocoder": 4,  # +1
+    "w2v2fe_training_step": 4,  # +1
     "dwconv_g32": 3,
-    "layernorm_last_axis": 1,
+    "layernorm_last_axis": 2,  # +1
     "attn_qkv_softmax": 4,
     "toy_training_step": 4,
     "resnet18_int8": 4,
-    "loss_head_kd": 1,
-    "adam_update_fp32": 1,
-    "reshape_gather_bwd": 2,
+    "loss_head_kd": 2,  # +1
+    "adam_update_fp32": 2,  # +1
+    "reshape_gather_bwd": 3,  # +1
     "reshape_mul_gap": 1,
     "reshape_matmul_gap": 3,
-    "neg_1x8": 1,
-    "mul_1x8": 1,
+    "neg_1x8": 2,  # +1
+    "mul_1x8": 2,  # +1
 }
 
 

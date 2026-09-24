@@ -1,0 +1,902 @@
+{
+ "GreaterCast:1024x9x3136": {
+  "file": "misc_op_step_templates/GreaterCast_1024x9x3136.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   1024,
+   9,
+   3136
+  ],
+  "source": "t_step_misc/GreaterCast_1024x9x3136"
+ },
+ "GreaterCast:16x128x28x28": {
+  "file": "misc_op_step_templates/GreaterCast_16x128x28x28.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   16,
+   128,
+   28,
+   28
+  ],
+  "source": "t_step_misc/GreaterCast_16x128x28x28"
+ },
+ "GreaterCast:16x256x14x14": {
+  "file": "misc_op_step_templates/GreaterCast_16x256x14x14.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   16,
+   256,
+   14,
+   14
+  ],
+  "source": "t_step_misc/GreaterCast_16x256x14x14"
+ },
+ "GreaterCast:16x512x7x7": {
+  "file": "misc_op_step_templates/GreaterCast_16x512x7x7.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "source": "t_step_misc/GreaterCast_16x512x7x7"
+ },
+ "GreaterCast:16x64x112x112": {
+  "file": "misc_op_step_templates/GreaterCast_16x64x112x112.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_misc/GreaterCast_16x64x112x112"
+ },
+ "GreaterCast:16x64x56x56": {
+  "file": "misc_op_step_templates/GreaterCast_16x64x56x56.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   16,
+   64,
+   56,
+   56
+  ],
+  "source": "t_step_misc/GreaterCast_16x64x56x56"
+ },
+ "GreaterCast:1x64x56x56": {
+  "file": "teng_register_census/gtcast_s1.axmodel.gz",
+  "op": "GreaterCast",
+  "shape": [
+   1,
+   64,
+   56,
+   56
+  ],
+  "source": "t_register_census/gtcast_s1"
+ },
+ "LessCast:1024x9x3136": {
+  "file": "misc_op_step_templates/LessCast_1024x9x3136.axmodel.gz",
+  "op": "LessCast",
+  "shape": [
+   1024,
+   9,
+   3136
+  ],
+  "source": "t_step_misc/LessCast_1024x9x3136"
+ },
+ "Log:16x1000": {
+  "file": "misc_op_step_templates/Log_16x1000.axmodel.gz",
+  "op": "Log",
+  "scales": {
+   "x": 0.003921568859368563,
+   "y": 0.03611898049712181
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_step_misc/F_Log_16x1000",
+  "zero_points": {
+   "x": 0,
+   "y": 255
+  }
+ },
+ "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1": {
+  "file": "misc_op_step_templates/MaxPool_16x64x112x112.axmodel.gz",
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.02199968881905079,
+   "y": 0.02199968881905079
+  },
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_misc/F_MaxPool_16x64x112x112",
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1:zp": {
+  "file": "misc_op_step_templates/MaxPool_16x64x112x112_zp.axmodel.gz",
+  "op": "MaxPool",
+  "scales": {
+   "x": 0.03390980511903763,
+   "y": 0.03390980511903763
+  },
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_zp/maxpool_zpA",
+  "variant_of": "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1",
+  "zero_points": {
+   "x": 108,
+   "y": 108
+  }
+ },
+ "Neg:1x1": {
+  "file": "misc_op_neg/neg_L128.axmodel.gz",
+  "op": "Neg",
+  "program": "large",
+  "programs": {
+   "small": "Neg:1x1:small"
+  },
+  "scales": {
+   "x": 0.019999999552965164,
+   "y": 0.019999999552965164
+  },
+  "shape": [
+   1,
+   1
+  ],
+  "source": "t_step_leftovers/neg_L128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "Neg:1x1:small": {
+  "file": "misc_op_neg/neg_z128.axmodel.gz",
+  "op": "Neg",
+  "program": "small",
+  "programs": {
+   "large": "Neg:1x1"
+  },
+  "scales": {
+   "x": 0.009999999776482582,
+   "y": 0.009999999776482582
+  },
+  "shape": [
+   1,
+   1
+  ],
+  "source": "t_step_leftovers/neg_z128",
+  "zero_points": {
+   "x": 128,
+   "y": 127
+  }
+ },
+ "ReduceMean:16x512x7x7:axes2,3:k1": {
+  "file": "misc_op_step_templates/ReduceMean_16x512x7x7.axmodel.gz",
+  "op": "ReduceMean",
+  "reduce_count": 49,
+  "scales": {
+   "x": 0.018699945881962776,
+   "y": 0.0032624078448861837
+  },
+  "shape": [
+   16,
+   512,
+   7,
+   7
+  ],
+  "source": "t_step_misc/F_ReduceMean_16x512x7x7",
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "ReduceSum:1024x9x12544:axes1:k0": {
+  "axes": [
+   1
+  ],
+  "file": "misc_op_step_templates/ReduceSum_1024x9x12544_axes1_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.047130174934864044,
+   "y": 0.13514187932014465
+  },
+  "shape": [
+   1024,
+   9,
+   12544
+  ],
+  "source": "t_step_misc/ReduceSum_1024x9x12544_axes1_k0",
+  "zero_points": {
+   "x": 124,
+   "y": 126
+  }
+ },
+ "ReduceSum:1024x9x3136:axes1:k1": {
+  "axes": [
+   1
+  ],
+  "file": "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04310387000441551,
+   "y": 0.12226002663373947
+  },
+  "shape": [
+   1024,
+   9,
+   3136
+  ],
+  "source": "t_step_misc/ReduceSum_1024x9x3136_axes1_k1",
+  "zero_points": {
+   "x": 125,
+   "y": 128
+  }
+ },
+ "ReduceSum:1024x9x3136:axes1:k1:zp0": {
+  "axes": [
+   1
+  ],
+  "file": "misc_op_step_templates/ReduceSum_1024x9x3136_axes1_k1_zp0.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.003921568859368563,
+   "y": 0.03310549631714821
+  },
+  "shape": [
+   1024,
+   9,
+   3136
+  ],
+  "source": "t_step_zp/reducesum_zp0_a",
+  "variant_of": "ReduceSum:1024x9x3136:axes1:k1",
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ },
+ "ReduceSum:16x1000:axes0,1:k1": {
+  "axes": [
+   0,
+   1
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1000_axes0-1_k1.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03294731304049492,
+   "y": 0.5929204225540161
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_step_misc/ReduceSum_16x1000_axes0-1_k1",
+  "zero_points": {
+   "x": 129,
+   "y": 224
+  }
+ },
+ "ReduceSum:16x1000:axes0:k1": {
+  "axes": [
+   0
+  ],
+  "file": "reducesum_decode/c_16x1000_ax0.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058156654238701,
+   "y": 0.055398836731910706
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_reducesum_decode/c_16x1000_ax0",
+  "zero_points": {
+   "x": 127,
+   "y": 134
+  }
+ },
+ "ReduceSum:16x1000:axes0:k1:reshape1000": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1000_axes0_k1_to_1000.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "reshape_out": [
+   1000
+  ],
+  "scales": {
+   "x": 0.03275791555643082,
+   "y": 0.10807306319475174
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_step_rsfused/C1000_P_v1",
+  "zero_points": {
+   "x": 121,
+   "y": 128
+  }
+ },
+ "ReduceSum:16x1000:axes1:k1": {
+  "axes": [
+   1
+  ],
+  "file": "reducesum_decode/d_16x1000_ax1.axmodel.gz",
+  "keepdims": 1,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058156654238701,
+   "y": 0.2727001905441284
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_reducesum_decode/d_16x1000_ax1",
+  "zero_points": {
+   "x": 127,
+   "y": 171
+  }
+ },
+ "ReduceSum:16x1x128x1152:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x128x1152_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04104521870613098,
+   "y": 0.14683477580547333
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   1152
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x128x1152_axes0_k0",
+  "zero_points": {
+   "x": 127,
+   "y": 129
+  }
+ },
+ "ReduceSum:16x1x128x576:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x128x576_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03984058275818825,
+   "y": 0.15110385417938232
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   576
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x128x576_axes0_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 140
+  }
+ },
+ "ReduceSum:16x1x128x64:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x128x64_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 0.1326870173215866
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   64
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x128x64_axes0_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 131
+  }
+ },
+ "ReduceSum:16x1x128x784:axes0,3:k0": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x128x784_axes0-3_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04104521870613098,
+   "y": 3.273888111114502
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   784
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x128x784_axes0-3_k0",
+  "zero_points": {
+   "x": 127,
+   "y": 143
+  }
+ },
+ "ReduceSum:16x1x128x784:axes0,3:k0:reshape128": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x128x784_axes0-3_k0_to_128.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   128
+  ],
+  "scales": {
+   "x": 0.04185009375214577,
+   "y": 2.8142006397247314
+  },
+  "shape": [
+   16,
+   1,
+   128,
+   784
+  ],
+  "source": "t_step_rsfused/C128_P_v1",
+  "zero_points": {
+   "x": 124,
+   "y": 118
+  }
+ },
+ "ReduceSum:16x1x256x1152:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x256x1152_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04242660477757454,
+   "y": 0.1471737027168274
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   1152
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x256x1152_axes0_k0",
+  "zero_points": {
+   "x": 123,
+   "y": 128
+  }
+ },
+ "ReduceSum:16x1x256x128:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x256x128_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 0.1297895461320877
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   128
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x256x128_axes0_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 125
+  }
+ },
+ "ReduceSum:16x1x256x196:axes0,3:k0": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x256x196_axes0-3_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 1.4104975461959839
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   196
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x256x196_axes0-3_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 118
+  }
+ },
+ "ReduceSum:16x1x256x196:axes0,3:k0:reshape256": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x256x196_axes0-3_k0_to_256.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   256
+  ],
+  "scales": {
+   "x": 0.03879866376519203,
+   "y": 1.6299002170562744
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   196
+  ],
+  "source": "t_step_rsfused/C256_P_v1",
+  "zero_points": {
+   "x": 121,
+   "y": 123
+  }
+ },
+ "ReduceSum:16x1x256x2304:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x256x2304_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04242660477757454,
+   "y": 0.15644921362400055
+  },
+  "shape": [
+   16,
+   1,
+   256,
+   2304
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x256x2304_axes0_k0",
+  "zero_points": {
+   "x": 123,
+   "y": 125
+  }
+ },
+ "ReduceSum:16x1x512x2304:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x512x2304_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04310387000441551,
+   "y": 0.16095255315303802
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   2304
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x512x2304_axes0_k0",
+  "zero_points": {
+   "x": 125,
+   "y": 132
+  }
+ },
+ "ReduceSum:16x1x512x256:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x512x256_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04104521870613098,
+   "y": 0.14737196266651154
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   256
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x512x256_axes0_k0",
+  "zero_points": {
+   "x": 127,
+   "y": 132
+  }
+ },
+ "ReduceSum:16x1x512x4608:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x512x4608_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.04370495676994324,
+   "y": 0.15959036350250244
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   4608
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x512x4608_axes0_k0",
+  "zero_points": {
+   "x": 123,
+   "y": 130
+  }
+ },
+ "ReduceSum:16x1x512x49:axes0,3:k0": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x512x49_axes0-3_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 0.700127899646759
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   49
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x512x49_axes0-3_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 129
+  }
+ },
+ "ReduceSum:16x1x512x49:axes0,3:k0:reshape512": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x512x49_axes0-3_k0_to_512.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   512
+  ],
+  "scales": {
+   "x": 0.03908182308077812,
+   "y": 0.7188730835914612
+  },
+  "shape": [
+   16,
+   1,
+   512,
+   49
+  ],
+  "source": "t_step_rsfused/C512_P_v1",
+  "zero_points": {
+   "x": 124,
+   "y": 131
+  }
+ },
+ "ReduceSum:16x1x64x147:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x1x64x147_axes0_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.03972519189119339,
+   "y": 0.13025009632110596
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   147
+  ],
+  "source": "t_step_misc/ReduceSum_16x1x64x147_axes0_k0",
+  "zero_points": {
+   "x": 130,
+   "y": 121
+  }
+ },
+ "ReduceSum:16x1x64x3136:axes0,3:k0": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "reducesum_decode/b_16x1x64x3136_ax03.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007058822084218264,
+   "y": 2.365309953689575
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_reducesum_decode/b_16x1x64x3136_ax03",
+  "zero_points": {
+   "x": 128,
+   "y": 139
+  }
+ },
+ "ReduceSum:16x1x64x3136:axes0,3:k0:reshape64": {
+  "axes": [
+   0,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSumReshape_16x1x64x3136_axes0-3_k0_to_64.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "reshape_out": [
+   64
+  ],
+  "scales": {
+   "x": 0.041686978191137314,
+   "y": 4.210116386413574
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_step_rsfused/C64_P_v1",
+  "zero_points": {
+   "x": 131,
+   "y": 135
+  }
+ },
+ "ReduceSum:16x1x64x576:axes0:k0": {
+  "axes": [
+   0
+  ],
+  "file": "reducesum_decode/a_16x1x64x576_ax0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.0070588174276053905,
+   "y": 0.07025907933712006
+  },
+  "shape": [
+   16,
+   1,
+   64,
+   576
+  ],
+  "source": "t_reducesum_decode/a_16x1x64x576_ax0",
+  "zero_points": {
+   "x": 127,
+   "y": 130
+  }
+ },
+ "ReduceSum:16x64x112x112:axes0,2,3:k0": {
+  "axes": [
+   0,
+   2,
+   3
+  ],
+  "file": "misc_op_step_templates/ReduceSum_16x64x112x112_axes0-2-3_k0.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.043196097016334534,
+   "y": 11.085447311401367
+  },
+  "shape": [
+   16,
+   64,
+   112,
+   112
+  ],
+  "source": "t_step_leftovers/rs_nchw",
+  "zero_points": {
+   "x": 132,
+   "y": 124
+  }
+ },
+ "ReduceSum:1x1x64x3136:axes2:k0": {
+  "axes": [
+   2
+  ],
+  "file": "teng_register_census/reducesum_s1.axmodel.gz",
+  "keepdims": 0,
+  "op": "ReduceSum",
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.007840676233172417
+  },
+  "shape": [
+   1,
+   1,
+   64,
+   3136
+  ],
+  "source": "t_register_census/reducesum_s1",
+  "zero_points": {
+   "x": 128,
+   "y": 128
+  }
+ },
+ "Softmax:16x1000:axis1": {
+  "file": "misc_op_step_templates/Softmax_16x1000.axmodel.gz",
+  "op": "Softmax",
+  "scales": {
+   "x": 0.09794769436120987,
+   "y": 0.0034618517383933067
+  },
+  "shape": [
+   16,
+   1000
+  ],
+  "source": "t_step_misc/F_Softmax_16x1000",
+  "zero_points": {
+   "x": 127,
+   "y": 0
+  }
+ },
+ "Sqrt:512x512x3x3": {
+  "file": "misc_op_record_emit/sqrt_512x512x3x3_t.axmodel.gz",
+  "op": "Sqrt",
+  "scales": {
+   "x": 0.007843137718737125,
+   "y": 0.005545935593545437
+  },
+  "shape": [
+   512,
+   512,
+   3,
+   3
+  ],
+  "source": "t_elementwise_scale_emit/sqrt_512x512x3x3_zp0_t",
+  "zero_points": {
+   "x": 0,
+   "y": 0
+  }
+ }
+}

@@ -56,17 +56,47 @@
 // `target_opset_version=23` (or higher) to onnxsim to upgrade first if the
 // exported model predates it -- true of essentially all LLM exports today.
 //
-// Does not match the HuggingFace-style variant that explicitly upcasts to
-// fp32 around the reduction (`Cast(X, FLOAT) -> ... -> Cast(_, orig_dtype)`):
-// the inner X no longer points at the same Value as the outer multiply's X,
-// so the pattern declines rather than misfiring. Left for follow-up.
+// Also matches the HuggingFace-style variant that upcasts to fp32 around
+// the reduction (Qwen2/Qwen3/LLaMA `*RMSNorm.forward`, and what TensorRT
+// Edge-LLM's dynamo export emits for every norm):
+//   XU = Cast(X, to=FLOAT)
+//   N  = XU * rsqrt(mean(XU^2) + eps)      # any spelling listed above
+//   Y  = weight * Cast(N, to=T)            # T = X's own element type
+// which is exactly RMSNormalization's reference body with
+// `stash_type=FLOAT` (Cast X to the stash type, normalize, Cast back to T,
+// then multiply by scale), so it fuses to
+//   Y = RMSNormalization<axis, epsilon, stash_type=1>(X, weight).
+// Requires X's and weight's element types to be known and equal to the
+// outer Cast's target, and the upcast value to feed nothing but the chain.
+//
+// Half-precision models: the eps / 2 / 1 constants of an fp16 or bf16 chain
+// are read in that type too. When the *plain* variant runs entirely in fp16
+// (no upcast), the fused node carries an explicit stash_type=FLOAT -- the
+// op's default, and what the HF reference RMSNorm does -- so the reduction
+// is computed in fp32. That is deliberately not bit-faithful to the fp16
+// chain: `Pow(x, 2)` in fp16 overflows to inf for |x| > ~255 in any runtime
+// that really computes it in fp16 (torch, GPU kernels; onnxruntime's CPU
+// provider happens to upcast internally), and real LLM residual streams
+// exceed that (onnx-community/Qwen2.5-0.5B-Instruct's fp16 export reaches
+// ~1,700 by layer 3; run in torch fp16 it generates repeated garbage --
+// scripts/nvidia/README.md). Where the fp16 chain did not
+// overflow or underflow the two agree to fp16 rounding; where it did, the
+// fused node gives the finite, intended value, so onnxsim's equivalence
+// check reports a mismatch for exactly those inputs.
+//
+// RMSNormalization reduces over *every* axis from `axis` to the last one,
+// so only a ReduceMean over the last axis (-1, or rank-1 when X's rank is
+// known) is fused; a single inner axis would otherwise silently widen into
+// a reduction over all trailing axes.
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/float16_to_float32.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -86,6 +116,9 @@ struct FuseRMSNorm final : public PredicateBasedPass {
     Value* scale = nullptr;
     int64_t axis = -1;
     float epsilon = 0.0f;
+    // 0 = no stash_type attribute (plain variant); otherwise the
+    // TensorProto element type the upcast variant normalizes in.
+    int32_t stash_type = 0;
     // Every node strictly between (X, scale) and the outer Mul, ordered
     // innermost-consumer first (i.e. the node whose output the outer Mul
     // directly used comes first) so destroying them in this order always
@@ -102,6 +135,18 @@ struct FuseRMSNorm final : public PredicateBasedPass {
       out = static_cast<float>(d);
       return true;
     }
+    // fp16/bf16 models carry their eps / 2 / 1 constants in the model's own
+    // type; FetchSoleValueOfTensor<T> only matches an exact elem_type.
+    Float16 h;
+    if (FetchSoleValueOfTensor(v, h)) {
+      out = Float16BitsToFloat(h.bits);
+      return true;
+    }
+    BFloat16 b;
+    if (FetchSoleValueOfTensor(v, b)) {
+      out = static_cast<float>(b);
+      return true;
+    }
     return false;
   }
 
@@ -115,6 +160,17 @@ struct FuseRMSNorm final : public PredicateBasedPass {
       return i == 2;
     }
     return false;
+  }
+
+  static bool IsLastAxis(Value* x, int64_t axis) {
+    if (axis == -1) {
+      return true;
+    }
+    if (!x->has_sizes()) {
+      return false;
+    }
+    int64_t rank = static_cast<int64_t>(x->sizes().size());
+    return axis == rank - 1;
   }
 
   // Matches `Add(ReduceMean(square, axes), eps)` feeding `sqrt_out`'s Sqrt,
@@ -174,7 +230,7 @@ struct FuseRMSNorm final : public PredicateBasedPass {
       x = square->input(0);
       square_ok = true;
     }
-    if (!square_ok) {
+    if (!square_ok || !IsLastAxis(x, axis)) {
       return false;
     }
 
@@ -185,72 +241,147 @@ struct FuseRMSNorm final : public PredicateBasedPass {
     return true;
   }
 
-  // Matches the outer `weight * (X * rsqrt(v))` / `weight * (X / sqrt(v))`,
-  // trying both operand orders of the scale-Mul and of the two inner
-  // commutative ops.
+  // Matches the normalized value `norm` = `X * rsqrt(v)` / `X / sqrt(v)`
+  // (see the header comment for the accepted spellings), trying both operand
+  // orders of the inner commutative ops. On success, sets `x`/`axis`/`eps`
+  // and fills `chain` with every node from `norm`'s producer inward,
+  // innermost-consumer first.
+  static bool MatchNorm(Value* norm, Value*& x, int64_t& axis, float& eps,
+                        std::vector<Node*>& chain) {
+    if (norm->uses().size() != 1) {
+      return false;
+    }
+    Node* norm_node = norm->node();
+
+    // Div(X, RMS): the exact spelling of RMSNormalization's own reference
+    // decomposition (`Normalized = Div(X, RMS)`).
+    if (CheckKind(norm_node, kDiv) && norm_node->inputs().size() == 2) {
+      Value* x_direct = norm_node->input(0);
+      Value* x_denom;
+      std::vector<Node*> c;
+      if (MatchDenominator(norm_node->input(1), x_denom, axis, eps, c) &&
+          x_denom == x_direct) {
+        c.insert(c.begin(), norm_node);
+        x = x_direct;
+        chain = std::move(c);
+        return true;
+      }
+    }
+
+    // Mul(X, 1/RMS), 1/RMS = Reciprocal(RMS) or Div(one, RMS).
+    if (CheckKind(norm_node, kMul) && norm_node->inputs().size() == 2) {
+      for (int j = 0; j < 2; ++j) {
+        Value* x_direct = norm_node->input(j);
+        Value* inv = norm_node->input(1 - j);
+        if (inv->uses().size() != 1) {
+          continue;
+        }
+        Node* inv_node = inv->node();
+        Value* sqrt_out = nullptr;
+        if (CheckKind(inv_node, "Reciprocal") &&
+            inv_node->inputs().size() == 1) {
+          sqrt_out = inv_node->input(0);
+        } else if (CheckKind(inv_node, kDiv) &&
+                   inv_node->inputs().size() == 2) {
+          float one;
+          if (!FetchScalarAsFloat(inv_node->input(0), one) || one != 1.0f) {
+            continue;
+          }
+          sqrt_out = inv_node->input(1);
+        } else {
+          continue;
+        }
+        Value* x_denom;
+        std::vector<Node*> c;
+        if (MatchDenominator(sqrt_out, x_denom, axis, eps, c) &&
+            x_denom == x_direct) {
+          c.insert(c.begin(), inv_node);
+          c.insert(c.begin(), norm_node);
+          x = x_direct;
+          chain = std::move(c);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Upcast variant: `norm_t` = Cast(N, to=T) where N is MatchNorm over
+  // XU = Cast(X, to=FLOAT) and X is of type T. On success, `x` is the
+  // *original* X, and `chain` also covers both Casts (outer Cast first,
+  // upcast Cast last, so it is destroyed after every one of its uses).
+  static bool MatchUpcastNorm(Value* norm_t, Value* scale, Value*& x,
+                              int64_t& axis, float& eps,
+                              std::vector<Node*>& chain) {
+    if (norm_t->uses().size() != 1 || !CheckKind(norm_t, kCast)) {
+      return false;
+    }
+    Node* down = norm_t->node();
+    if (!down->hasAttribute(kto)) {
+      return false;
+    }
+    const int64_t t = down->i(kto);
+    Value* xu;
+    std::vector<Node*> c;
+    if (!MatchNorm(down->input(0), xu, axis, eps, c) || !CheckKind(xu, kCast)) {
+      return false;
+    }
+    Node* up = xu->node();
+    if (!up->hasAttribute(kto) ||
+        up->i(kto) != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+      return false;
+    }
+    Value* x_orig = up->input(0);
+    if (x_orig->elemType() != t || scale->elemType() != t) {
+      return false;
+    }
+    // XU must feed nothing outside the matched chain.
+    for (const Use& u : xu->uses()) {
+      if (std::find(c.begin(), c.end(), u.user) == c.end()) {
+        return false;
+      }
+    }
+    c.insert(c.begin(), down);
+    c.push_back(up);
+    x = x_orig;
+    chain = std::move(c);
+    return true;
+  }
+
+  // Matches the outer `weight * norm` (either operand order), where `norm`
+  // is MatchNorm's plain form or MatchUpcastNorm's Cast-wrapped form.
   static bool MatchOuter(Node* n, Match& out) {
     if (!CheckKind(n, kMul) || n->inputs().size() != 2) {
       return false;
     }
     for (int i = 0; i < 2; ++i) {
       Value* norm = n->input(i);
-      if (norm->uses().size() != 1) {
-        continue;
-      }
       Value* scale = n->input(1 - i);
-      Node* norm_node = norm->node();
-
-      // Div(X, RMS): the exact spelling of RMSNormalization's own reference
-      // decomposition (`Normalized = Div(X, RMS)`).
-      if (CheckKind(norm_node, kDiv) && norm_node->inputs().size() == 2) {
-        Value* x_direct = norm_node->input(0);
-        Value* x_denom;
-        int64_t axis;
-        float eps;
-        std::vector<Node*> chain;
-        if (MatchDenominator(norm_node->input(1), x_denom, axis, eps, chain) &&
-            x_denom == x_direct) {
-          chain.insert(chain.begin(), norm_node);
-          out = Match{x_direct, scale, axis, eps, std::move(chain)};
-          return true;
-        }
+      Value* x;
+      int64_t axis;
+      float eps;
+      std::vector<Node*> chain;
+      if (MatchNorm(norm, x, axis, eps, chain)) {
+        // A half-precision X gets an explicit stash_type=FLOAT -- see the
+        // header comment on why that is intended.
+        const bool half = x->elemType() == TensorProto_DataType_FLOAT16 ||
+                          x->elemType() == TensorProto_DataType_BFLOAT16;
+        out = Match{x,
+                    scale,
+                    axis,
+                    eps,
+                    half ? TensorProto_DataType_FLOAT : 0,
+                    std::move(chain)};
+        return true;
       }
-
-      // Mul(X, 1/RMS), 1/RMS = Reciprocal(RMS) or Div(one, RMS).
-      if (CheckKind(norm_node, kMul) && norm_node->inputs().size() == 2) {
-        for (int j = 0; j < 2; ++j) {
-          Value* x_direct = norm_node->input(j);
-          Value* inv = norm_node->input(1 - j);
-          if (inv->uses().size() != 1) {
-            continue;
-          }
-          Node* inv_node = inv->node();
-          Value* sqrt_out = nullptr;
-          if (CheckKind(inv_node, "Reciprocal") &&
-              inv_node->inputs().size() == 1) {
-            sqrt_out = inv_node->input(0);
-          } else if (CheckKind(inv_node, kDiv) &&
-                     inv_node->inputs().size() == 2) {
-            float one;
-            if (!FetchScalarAsFloat(inv_node->input(0), one) || one != 1.0f) {
-              continue;
-            }
-            sqrt_out = inv_node->input(1);
-          } else {
-            continue;
-          }
-          Value* x_denom;
-          int64_t axis;
-          float eps;
-          std::vector<Node*> chain;
-          if (MatchDenominator(sqrt_out, x_denom, axis, eps, chain) &&
-              x_denom == x_direct) {
-            chain.insert(chain.begin(), inv_node);
-            chain.insert(chain.begin(), norm_node);
-            out = Match{x_direct, scale, axis, eps, std::move(chain)};
-            return true;
-          }
-        }
+      if (MatchUpcastNorm(norm, scale, x, axis, eps, chain)) {
+        out = Match{x,
+                    scale,
+                    axis,
+                    eps,
+                    ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
+                    std::move(chain)};
+        return true;
       }
     }
     return false;
@@ -278,6 +409,9 @@ struct FuseRMSNorm final : public PredicateBasedPass {
     rms->addInput(m.scale);
     rms->i_(kaxis, m.axis);
     rms->f_(kepsilon, m.epsilon);
+    if (m.stash_type != 0) {
+      rms->i_(Symbol("stash_type"), m.stash_type);
+    }
     for (int i = 0; i < static_cast<int>(n->outputs().size()); ++i) {
       rms->outputs()[i]->copyMetadata(n->outputs()[i]);
     }

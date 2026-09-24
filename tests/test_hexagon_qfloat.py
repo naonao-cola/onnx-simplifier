@@ -11,8 +11,9 @@ IEEE around every fp op). Two layers of tests:
   to a Hexagon object, link a C harness, run on ``hexagon-sim`` and compare with NumPy. A stock-TVM
   control run validates the harness itself.
 
-The whole module is skipped unless a matching TVM is importable; it runs in the dedicated
-``hexagon-qfloat`` CI workflow, which builds TVM v0.17.0 and installs the open-access toolchain.
+The whole module is skipped unless a matching TVM is importable. It is no longer run in CI (the
+``hexagon-qfloat`` workflow that built TVM v0.17.0 was replaced by ``hexagon-tinygrad``, see
+``scripts/android/README.md``); run it locally against a TVM v0.17.0 build.
 The TVM 0.17 legacy TE schedule API (``te.create_schedule``) is required, so newer TVM wheels
 skip too.
 """

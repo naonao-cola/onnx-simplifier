@@ -1,21 +1,24 @@
 name: Execution Provider Integration
 
 # Compiles and runs onnxsim's output through onnxruntime execution providers
-# (Intel's OpenVINO EP, the Qualcomm AI Runtime / QNN EP) to catch
-# simplifications that break those toolchains, or whose on-device result
-# changed. Both run entirely on a stock x86-64 CPU runner via their pip EP
-# wheels (onnxruntime-openvino, onnxruntime-qnn) -- no discrete Intel/Qualcomm
-# hardware needed. See scripts/intel/README.md and scripts/qualcomm/README.md
-# for the fidelity tiers each covers.
+# (Intel's OpenVINO EP, the Qualcomm AI Runtime / QNN EP) and tinygrad's
+# Hexagon (DSP) device backend to catch simplifications that break those
+# toolchains, or whose on-device result changed. The EP checks run entirely
+# on a stock x86-64 CPU runner via their pip EP wheels
+# (onnxruntime-openvino, onnxruntime-qnn) -- no discrete Intel/Qualcomm
+# hardware needed; the Hexagon check runs tinygrad's generated DSP code under
+# qemu-hexagon (MOCKDSP=1) with an LLVM clang -- no phone needed. See
+# scripts/intel/README.md, scripts/qualcomm/README.md and
+# scripts/hexagon/README.md for the fidelity tiers each covers.
 #
-# These two checks used to live in their own workflow files
+# These checks used to live in their own workflow files
 # (intel-integration.yml, qualcomm-integration.yml), each independently
 # building an identical cp312 manylinux wheel from the same commit via
 # cibuildwheel. Merged here into one workflow: the wheel is built once and
-# shared with both EP checks, exactly like model-regression.yml already does
+# shared with every check, exactly like model-regression.yml already does
 # for its shards.
 #
-# Scheduled + on demand, plus on PRs that touch either harness so they stay
+# Scheduled + on demand, plus on PRs that touch any harness so they stay
 # valid.
 
 on:
@@ -27,9 +30,11 @@ on:
       - ".github/workflows/ep-integration.yml"
       - "scripts/intel/**"
       - "scripts/qualcomm/**"
+      - "scripts/hexagon/**"
       - "scripts/common/**"
       - "tests/test_openvino_compat.py"
       - "tests/test_qnn_compat.py"
+      - "tests/test_tinygrad_hexagon_compat.py"
 
 concurrency:
   group: ep-integration-${{ github.ref }}
@@ -151,4 +156,57 @@ jobs:
         with:
           name: qnn-compat-report
           path: ${{ runner.temp }}/qnn-compat.csv
+          if-no-files-found: ignore
+
+  tinygrad-hexagon:
+    name: tinygrad Hexagon (DSP) compatibility check
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-ep
+          path: wheelhouse
+      # Same mock-DSP prerequisites as hexagon-tinygrad.yml: tinygrad's
+      # MOCKDSP path compiles for hexagonv65 and runs under qemu-hexagon.
+      - name: Install clang-19, lld, qemu-hexagon
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 lld-19 qemu-user-static
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+      - name: Install onnxsim wheel + tinygrad
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest tinygrad
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the other EP workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        env:
+          HEXAGON_CLANG: clang-19
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__, m.__file__)"
+          python -c "import tinygrad; print('tinygrad', tinygrad.__file__)"
+          python -c "import sys, os; sys.path.insert(0, os.path.join(os.environ['GITHUB_WORKSPACE'], 'scripts', 'hexagon')); import tinygrad_hexagon_backend as b; print('DSP available:', b.HEXAGON_AVAILABLE, b.unavailable_reason('DSP') or '')"
+      - name: Run tinygrad Hexagon compatibility check
+        working-directory: ${{ runner.temp }}
+        env:
+          HEXAGON_CLANG: clang-19
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/hexagon/run_hexagon_compat.py" \
+            --require-device \
+            --output hexagon-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hexagon-compat-report
+          path: ${{ runner.temp }}/hexagon-compat.csv
           if-no-files-found: ignore

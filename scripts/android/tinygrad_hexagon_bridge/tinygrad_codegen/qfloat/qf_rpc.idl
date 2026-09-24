@@ -1,0 +1,7 @@
+#include "remote.idl"
+#include "AEEStdDef.idl"
+interface qf_rpc : remote_handle64 {
+  AEEResult run(in int32 kern, in int32 reps, in sequence<octet> b1, in sequence<octet> b2, in sequence<octet> b3,
+                in sequence<octet> b4, in sequence<octet> b5, rout sequence<octet> result, rout uint64 min_us, rout uint64 med_us);
+  AEEResult perf_vote(in int32 turbo, rout int32 rc);
+};

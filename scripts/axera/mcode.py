@@ -643,20 +643,39 @@ def tail_tables(mcode):
     return vec, _tables_at(mcode, vec)
 
 
+def tail_padding(mcode):
+    """Zero bytes between the last segment and the tail vector.
+
+    Segments start 8-byte aligned, but the FlatBuffers vector is only
+    4-byte aligned. When the vector sits at an offset that is 4 mod 8
+    (424 of 1,063 fixture blobs), four zero bytes of padding precede it;
+    otherwise there are none. See docs/axera-mcode-segments-fix.md."""
+    return _tail_padding(mcode, tail_vector(mcode))
+
+
+def _tail_padding(mcode, vec):
+    pad = vec % 8
+    assert pad in (0, 4), f"tail vector at {vec} is not 4-byte aligned"
+    assert mcode[vec - pad : vec] == bytes(pad), "tail padding is not zero"
+    return pad
+
+
 def segments(mcode):
     """The stream segments the tail table describes: `(offset, length,
     table)` per segment in stream order, which is *reverse* table order.
     Table field 2 is the segment length in 8-byte words; the segments tile
     the blob exactly from the end of the FlatBuffers header to the tail
-    vector. Also returns the header length."""
+    vector, less any `tail_padding` before the vector. Also returns the
+    header length."""
     vec, tables = tail_tables(mcode)
+    pad = _tail_padding(mcode, vec)
     words = [t.get(2, 0) for t in tables]
-    header = vec - 8 * sum(words)
+    header = vec - pad - 8 * sum(words)
     segs, pos = [], header
     for k in range(len(tables) - 1, -1, -1):
         segs.append((pos, 8 * words[k], tables[k]))
         pos += 8 * words[k]
-    assert pos == vec
+    assert pos == vec - pad
     return header, segs
 
 
@@ -930,10 +949,11 @@ def check(mcode, strict=True):
 
     # 1. The segment table is a loader manifest. Its word counts are
     #    load-bearing: the runtime rejects a blob whose segments do not tile
-    #    the stream exactly, from the end of the header to the tail vector.
+    #    the stream exactly, from the end of the header to the tail vector
+    #    (less the zero padding that keeps the vector 4-byte aligned).
     vec = tail_vector(mcode)
     end = segs[-1][0] + segs[-1][1]
-    if end != vec:
+    if end != vec - _tail_padding(mcode, vec):
         bad.append(f"segments: tile to {end}, tail vector is at {vec}")
     for pos, length, _ in segs:
         if length % 8:
@@ -990,6 +1010,83 @@ def check(mcode, strict=True):
     if strict and long_runs:
         bad.append(f"stream: unexplained runs longer than eight bytes {long_runs[:4]}")
 
+    # 7. Every compressed segment decompresses into whole records. The checks
+    #    above read the LZ77 token stream as-is, so a patch that overwrote a
+    #    token byte passed them; see `codec_violations`.
+    bad += codec_violations(mcode)
+
+    return bad
+
+
+def codec_violations(mcode):
+    """Decompress every compressed segment (tail table key 5) with
+    `short_unit_codec` and report what breaks the framing measured over every
+    native fixture (docs/axera-short-unit-encoding.md):
+
+    * the token stream starts with a literal run holding the `a7 00 00`
+      header record;
+    * decoding consumes exactly `key 5` bytes and yields whole 8-byte records;
+    * `key 2` words are `key 5` rounded up to 32 bytes, and the padding after
+      the stream is zero;
+    * every decoded word is zero or `[verb >= 0xa0][00]...`.
+
+    An in-place patch that lands on a token byte changes how the rest of the
+    segment decompresses, not the value it meant to write; this is what
+    `patch_scales` did to the ResNet18 1x1 downsample
+    (docs/axera-mcode-segments-fix.md). Returns a list of violations."""
+    import os
+    import sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import short_unit_codec
+
+    try:
+        _, segs = segments(mcode)
+    except Exception as exc:  # noqa: BLE001 -- report, do not raise
+        return [f"tail: no readable segment table ({exc})"]
+
+    bad = []
+    for pos, length, table in segs:
+        if 5 not in table:
+            continue
+        size = table[5]
+        where = f"segment at {pos}"
+        if size > length:
+            bad.append(
+                f"{where}: key 5 stream of {size} bytes overruns its {length}-byte slot"
+            )
+            continue
+        if length != -(-size // 32) * 32:
+            bad.append(
+                f"{where}: slot is {length} bytes, key 5 = {size} pads to "
+                f"{-(-size // 32) * 32}"
+            )
+        if any(mcode[pos + size : pos + length]):
+            bad.append(f"{where}: padding after the {size}-byte stream is not zero")
+        stream = mcode[pos : pos + size]
+        if not (stream[:1] and stream[0] < 0x80 and stream[1:4] == b"\xa7\x00\x00"):
+            bad.append(f"{where}: stream does not open with the a7 00 00 header")
+        try:
+            raw = short_unit_codec.decode(stream)
+        except short_unit_codec.CodecError as exc:
+            bad.append(f"{where}: does not decompress ({exc})")
+            continue
+        if len(raw) % 8:
+            bad.append(
+                f"{where}: decompresses to {len(raw)} bytes, not whole 8-byte records"
+            )
+        odd = [
+            w // 8
+            for w in range(0, len(raw) - 7, 8)
+            if any(raw[w : w + 8]) and not (raw[w] >= 0xA0 and raw[w + 1] == 0)
+        ]
+        if odd:
+            bad.append(
+                f"{where}: {len(odd)} decompressed word(s) are not records "
+                f"(first at record {odd[0]}); a patch likely overwrote an LZ77 token"
+            )
     return bad
 
 

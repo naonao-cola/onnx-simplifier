@@ -9,6 +9,13 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.activation_sensitivity import (
+    ActivationPrecisionSearch,
+    ActivationSensitivityReport,
+    analyze_activation_sensitivity,
+    group_nodes,
+    search_activation_precision_for_budget,
+)
 from onnxsim.adaquant import apply_adaquant
 from onnxsim.adaround import apply_adaround
 from onnxsim.adpq import quantize_weight_only_adpq
@@ -32,7 +39,9 @@ from onnxsim.bn_recovery import (
 from onnxsim.brecq import apply_brecq
 from onnxsim.bwa_ptq import apply_bwa_ptq
 from onnxsim.calibration import (
+    CalibrationStats,
     calibrate,
+    collect_calibration_stats,
     generate_random_calibration_data,
     load_huggingface_calibration_data,
     quantize_qoperator,
@@ -45,6 +54,11 @@ from onnxsim.calibration import (
     quantize_qoperator_where,
     quantize_static,
     quantize_static_int16,
+)
+from onnxsim.calibration_pick import (
+    CalibrationPick,
+    pick_calibration,
+    worst_output_sqnr,
 )
 from onnxsim.compile_training import TrainingLoop, compile_training_loop
 from onnxsim.coreml_export import export_coreml
@@ -429,6 +443,11 @@ from onnxsim.qwen_drive_planning_expert_reconstruct import (
 )
 from onnxsim.rotatekv import apply_rotatekv
 from onnxsim.rptq import apply_rptq_reorder
+from onnxsim.rustnn_runtime import (
+    RustnnSession,
+    find_unsupported_webnn_ops,
+    probe_rustnn,
+)
 from onnxsim.sam2_export import export_sam2_model
 from onnxsim.slim_llm import apply_slim_llm
 from onnxsim.smoothquant import apply_smoothquant
@@ -625,6 +644,11 @@ __all__ = [
     "apply_mixed_precision_quantization",
     "apply_mixed_precision_quantization_cpp",
     "search_mixed_precision_for_budget",
+    "ActivationPrecisionSearch",
+    "ActivationSensitivityReport",
+    "analyze_activation_sensitivity",
+    "group_nodes",
+    "search_activation_precision_for_budget",
     "MixedPrecisionSearchResult",
     "apply_slim_llm",
     "apply_slim_llm_cpp",
@@ -714,6 +738,9 @@ __all__ = [
     "split_around_node",
     "check_webnn_support",
     "estimate_webnn_islands",
+    "RustnnSession",
+    "find_unsupported_webnn_ops",
+    "probe_rustnn",
     "chain_slim",
     "chain_slim_base",
     "check_vitisai_support",
@@ -847,6 +874,11 @@ __all__ = [
     "quantize_bf16",
     "quantize_fp8",
     "calibrate",
+    "CalibrationStats",
+    "collect_calibration_stats",
+    "CalibrationPick",
+    "pick_calibration",
+    "worst_output_sqnr",
     "generate_random_calibration_data",
     "load_huggingface_calibration_data",
     "estimate_quantization_precision",

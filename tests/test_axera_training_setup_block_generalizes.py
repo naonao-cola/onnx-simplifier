@@ -154,10 +154,14 @@ class TestExactBlockInSingleOpTrainingFixtures(unittest.TestCase):
     single-op (or op-plus-consumer) fixtures -- carry the exact,
     unmodified 35-record block in segment 4."""
 
+    # Indices count V records from the segment start. loss_head_kd and
+    # reshape_gather_bwd have 4-byte tail padding, so the corrected
+    # mcode.segments (docs/axera-mcode-segments-fix.md) starts their segment 4
+    # four bytes earlier and decodes its opening a7 record too: [3] -> [4].
     CASES = {
-        "loss_head_kd.mcode.gz": [3],
+        "loss_head_kd.mcode.gz": [4],
         "resnet18_int8.mcode.gz": [4],
-        "reshape_gather_bwd.mcode.gz": [3],
+        "reshape_gather_bwd.mcode.gz": [4],
     }
 
     def test_exact_block_present_at_expected_offset(self):
@@ -174,9 +178,10 @@ class TestVariantBlockInFullMultiOpTrainingSteps(unittest.TestCase):
     identical 35-record block with one extra record, (167, 0, 30),
     inserted between elements 22 and 23."""
 
+    # w2v2fe has 4-byte tail padding: [4] -> [5] for the same reason as above.
     CASES = {
         "toy_training_step.mcode.gz": [5],
-        "w2v2fe_training_step.mcode.gz": [4],
+        "w2v2fe_training_step.mcode.gz": [5],
     }
 
     def test_variant_block_present_at_expected_offset(self):

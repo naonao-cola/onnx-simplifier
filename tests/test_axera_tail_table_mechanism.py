@@ -66,6 +66,13 @@ public functions no longer expose it.
 | `emit_gemm_reg8_group` | short-anchor donor -> long-anchor ref | +2 | tail-table error | clean |
 | `emit_gemm_reg8_group` | long-anchor donor -> short-anchor ref | -2 | tail-table error | clean |
 
+**Superseded (docs/axera-mcode-segments-fix.md):** "clean" in the last
+column no longer holds. These edits land inside LZ77-compressed segments
+(`scripts/axera/short_unit_codec.py`), so each segment's key 5 stream length
+is stale, and the retargeted tail vector sits 2 mod 4 -- a FlatBuffers vector
+is 4-byte aligned. `mcode.segments` now checks that, and `mcode.check()`
+reports all four as malformed. The tests below pin that state.
+
 Every one of these 4 is checked below directly against the real
 `tiny_emit.emit_conv_reg8_group`/`tiny_emit.emit_gemm_reg8_group`
 functions and real committed fixtures -- not simulated. After the fix,
@@ -120,6 +127,21 @@ def load(name):
 
 def hard_errors(data):
     return [e for e in mcode.check(data) if not e.startswith("coverage:")]
+
+
+# docs/axera-mcode-segments-fix.md: every one of the 4 "fixed" cases below is
+# a +/-2-byte edit inside an LZ77 token stream (key 5 stays stale), and
+# retarget_tail_vector moves the tail vector to a 2 mod 4 offset. A
+# FlatBuffers vector is 4-byte aligned, and mcode.segments now checks that,
+# so these outputs are reported malformed. The class names are kept for
+# history; the assertions pin the real state.
+MISALIGNED = "is not 4-byte aligned"
+
+
+def assert_misaligned(test, data):
+    errs = hard_errors(data)
+    test.assertEqual(len(errs), 1, errs)
+    test.assertIn(MISALIGNED, errs[0])
 
 
 class TestConvShrinkIsFixed(unittest.TestCase):
@@ -187,14 +209,15 @@ class TestConvShrinkIsFixed(unittest.TestCase):
         errs = hard_errors(raw)
         self.assertTrue(errs)
         self.assertIn("tail", errs[0])
-        # And retarget_tail_vector fixes exactly that reconstructed state.
+        # retarget_tail_vector repoints the header at the moved vector, but
+        # the vector is then misaligned (was `hard_errors(fixed) == []`).
         fixed = tiny_emit.retarget_tail_vector(base, raw)
-        self.assertEqual(hard_errors(fixed), [])
+        assert_misaligned(self, fixed)
 
     def test_clean_by_default(self):
         base, out = self._out()
         self.assertEqual(len(out), len(base) - 2)
-        self.assertEqual(hard_errors(out), [])
+        assert_misaligned(self, out)  # was `hard_errors(out) == []`
 
     def test_reapplying_retarget_is_a_safe_noop(self):
         base, out = self._out()
@@ -202,9 +225,11 @@ class TestConvShrinkIsFixed(unittest.TestCase):
         self.assertEqual(fixed_again, out)
 
     def test_segments_and_decode_succeed(self):
+        # mcode.segments now refuses the misaligned vector (it used to tile
+        # to it). The heuristic decode still runs over the bytes.
         base, out = self._out()
-        header, segs = mcode.segments(out)
-        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(out))
+        with self.assertRaisesRegex(AssertionError, MISALIGNED):
+            mcode.segments(out)
         recs = mcode.decode(out, **mcode.FULL_RULE)
         self.assertGreater(len(recs), 0)
 
@@ -223,7 +248,7 @@ class TestConvGrowIsFixed(unittest.TestCase):
     def test_clean_by_default(self):
         base, out = self._out()
         self.assertEqual(len(out), len(base) + 2)
-        self.assertEqual(hard_errors(out), [])
+        assert_misaligned(self, out)  # was `hard_errors(out) == []`
 
     def test_reapplying_retarget_is_a_safe_noop(self):
         base, out = self._out()
@@ -246,9 +271,7 @@ class TestGemmCrossFormSplicesAreFixed(unittest.TestCase):
         donor = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
-        self.assertEqual(hard_errors(out), [])
-        header, segs = mcode.segments(out)
-        self.assertEqual(segs[-1][0] + segs[-1][1], mcode.tail_vector(out))
+        assert_misaligned(self, out)  # was clean, and segments() tiled to it
         fixed_again = tiny_emit.retarget_tail_vector(ref, out)
         self.assertEqual(fixed_again, out)
 
@@ -257,7 +280,7 @@ class TestGemmCrossFormSplicesAreFixed(unittest.TestCase):
         donor = load("gemm_1x512x1000_tb0.mcode.gz")
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
-        self.assertEqual(hard_errors(out), [])
+        assert_misaligned(self, out)  # was `hard_errors(out) == []`
         fixed_again = tiny_emit.retarget_tail_vector(ref, out)
         self.assertEqual(fixed_again, out)
 

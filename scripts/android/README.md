@@ -407,7 +407,13 @@ build wrapper.
 
 ### Testing the qfloat pass without a phone (hexagon-sim)
 
-`tests/test_hexagon_qfloat.py` and `.github/workflows/hexagon-qfloat.yml` test the pass the way
+**No longer CI-tested.** The `hexagon-qfloat` workflow (TVM v0.17.0 built from source + hexagon-sim) was
+replaced by `.github/workflows/hexagon-tinygrad.yml`, which tests the TVM-free, tinygrad-based pipeline
+in `tinygrad_hexagon_bridge/` (see its README, "Continuous integration"). The pass, its harness and
+`tests/test_hexagon_qfloat.py` are kept and still run locally as described below; the removed
+workflow's TVM build recipe is in git history (`git log -- .github/workflows/hexagon-qfloat.yml`).
+
+`tests/test_hexagon_qfloat.py` tests the pass the way
 hexagon-mlir tests its backend: by running compiled Hexagon code on the instruction-set
 simulator instead of a device. The tests need Apache TVM **v0.17.0** (the TE schedule API these
 scripts use was removed from newer releases and the `apache-tvm` wheels) built with LLVM's
@@ -435,8 +441,8 @@ export HEXAGON_TOOLS=/path/to/Tools   # Hexagon open-access toolchain or <SDK>/t
 pytest tests/test_hexagon_qfloat.py
 ```
 
-The CI workflow builds TVM against `llvm-17-dev` from apt and downloads the public Hexagon
+The removed CI workflow built TVM against `llvm-17-dev` from apt and downloaded the public Hexagon
 open-access toolchain 19.0.02 (the same package hexagon-mlir installs; about 1.1 GB, 3 GB
-extracted); both are cached. `hexagon-sim` links `libncurses.so.5`, which current distros
+extracted), caching both. `hexagon-sim` links `libncurses.so.5`, which current distros
 lack, so the harness shims it from `libncurses.so.6`.
 

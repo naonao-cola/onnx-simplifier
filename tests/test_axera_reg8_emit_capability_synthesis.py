@@ -275,7 +275,11 @@ class TestConvEmitChangesLengthAndTailIsNowFixed(unittest.TestCase):
             slot3=(242, "P3", 130),
         )
         self.assertNotEqual(len(out), len(ref))
-        self.assertEqual(mcode.check(out), [])
+        # Superseded (docs/axera-mcode-segments-fix.md): the edit lands in an
+        # LZ77 token stream and leaves the tail vector misaligned, which
+        # mcode.check() now reports. Was `check(out) == []`.
+        (err,) = mcode.check(out)
+        self.assertIn("is not 4-byte aligned", err)
 
 
 class TestGemmEmitIsADonorSpliceNotSynthesis(unittest.TestCase):
@@ -317,7 +321,10 @@ class TestGemmEmitIsADonorSpliceNotSynthesis(unittest.TestCase):
         donor_start, donor_end = tiny_emit._gemm_reg8_group_bounds(donor)
         self.assertNotEqual(ref_end - ref_start, donor_end - donor_start)
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
-        self.assertEqual(mcode.check(out), [])
+        # Superseded (docs/axera-mcode-segments-fix.md), as above. Was
+        # `check(out) == []`.
+        (err,) = mcode.check(out)
+        self.assertIn("is not 4-byte aligned", err)
 
 
 class TestLengthPreservingEditsAreCleanLengthChangingEditsAreNot(unittest.TestCase):

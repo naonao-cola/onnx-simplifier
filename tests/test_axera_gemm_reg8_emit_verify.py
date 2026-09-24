@@ -231,7 +231,13 @@ class TestCrossFormSpliceIsNowFixedByRetarget(unittest.TestCase):
     internally (PR #1634), so the same cross-form splice now passes
     mcode.check() cleanly instead. See
     `tests/test_axera_tail_table_mechanism.py` for the mechanism this
-    fix is based on."""
+    fix is based on.
+
+    **Superseded (docs/axera-mcode-segments-fix.md):** the +/-2-byte
+    splice lands inside an LZ77 token stream, so key 5 goes stale and the
+    tail vector ends up 2 mod 4 -- a FlatBuffers vector must be 4-byte
+    aligned. `mcode.check()` now reports that, so these outputs are
+    malformed, not clean. Test names are kept for history."""
 
     def test_short_ref_long_donor_is_now_clean(self):
         ref = load("gemm_1x512x1000_tb0.mcode.gz")
@@ -239,9 +245,8 @@ class TestCrossFormSpliceIsNowFixedByRetarget(unittest.TestCase):
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
         hard = [e for e in mcode.check(out) if not e.startswith("coverage:")]
-        self.assertEqual(hard, [])
-        recs = mcode.decode(out, **mcode.FULL_RULE)
-        self.assertGreater(len(recs), 0)
+        self.assertEqual(len(hard), 1)
+        self.assertIn("is not 4-byte aligned", hard[0])
 
     def test_long_ref_short_donor_is_now_clean(self):
         ref = load("gemm_1x512x1000_tb0_rebuild0.mcode.gz")
@@ -249,9 +254,8 @@ class TestCrossFormSpliceIsNowFixedByRetarget(unittest.TestCase):
         out = tiny_emit.emit_gemm_reg8_group(ref, donor)
         self.assertNotEqual(len(out), len(ref))
         hard = [e for e in mcode.check(out) if not e.startswith("coverage:")]
-        self.assertEqual(hard, [])
-        recs = mcode.decode(out, **mcode.FULL_RULE)
-        self.assertGreater(len(recs), 0)
+        self.assertEqual(len(hard), 1)
+        self.assertIn("is not 4-byte aligned", hard[0])
 
 
 class TestBoundsHelperRaisesOnInvalidInput(unittest.TestCase):

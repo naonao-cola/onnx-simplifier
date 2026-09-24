@@ -674,6 +674,204 @@ def test_fuse_rms_norm_below_opset_23_untouched():
     assert ops["Mul"] == 2
 
 
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+# HuggingFace's Qwen2/Qwen3/LLaMA ``RMSNorm.forward`` upcasts to fp32 around
+# the reduction and casts back before the weight multiply; torch's dynamo
+# exporter emits it verbatim -- it is every norm in a TensorRT Edge-LLM
+# export (scripts/nvidia/README.md's Edge-LLM section). `{extra}` lets a test
+# add a stray consumer of the upcast value.
+_UPCAST_RMS_NORM = """
+    g (float16[2,4,8] X) => (float16[2,4,8] Y{extra_out})
+    <float two = {{2.0}}, int64[1] axes = {{-1}}, float eps = {{1e-06}}>
+    {{
+      xu = Cast<to = 1>(X)
+      sq = Pow(xu, two)
+      var = ReduceMean<keepdims = 1>(sq, axes)
+      var_eps = Add(var, eps)
+      rms = Sqrt(var_eps)
+      inv_rms = Reciprocal(rms)
+      normed = Mul(xu, inv_rms)
+      normed_t = Cast<to = {down}>(normed)
+      Y = Mul(weight, normed_t)
+      {extra}
+    }}
+"""
+
+
+def test_fuse_rms_norm_fp32_upcast():
+    # The upcast variant is exactly RMSNormalization's reference body with
+    # stash_type=FLOAT (Cast X to the stash type, normalize, Cast back to T,
+    # then multiply by scale), so both Casts fold into the fused node.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(down=10, extra="", extra_out=""),
+        initializer=[_f16(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    # check_n=0 plus an fp16-tolerance comparison instead of check_n's own:
+    # onnxruntime's fused RMSNormalization kernel rounds some fp16 outputs
+    # one ulp away from the decomposed graph on some platforms (seen on
+    # linux-aarch64 CI: max diff 2**-10 at values in [1, 2)), which check_n's
+    # tolerance rejects even though the rewrite is exact up to that rounding.
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops == {"RMSNormalization": 1}
+    ort = pytest.importorskip("onnxruntime")
+    x = np.random.default_rng(0).standard_normal((2, 4, 8)).astype(np.float16)
+    (want,) = ort.InferenceSession(model.SerializeToString()).run(None, {"X": x})
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(
+        got.astype(np.float32), want.astype(np.float32), rtol=2e-3, atol=2e-3
+    )
+    (rms,) = sim_model.graph.node
+    assert list(rms.input) == ["X", "weight"]
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in rms.attribute}
+    assert attrs["stash_type"] == onnx.TensorProto.FLOAT
+    assert attrs["axis"] == -1
+
+
+def test_fuse_rms_norm_fp32_upcast_shared_upcast_untouched():
+    # The fp32 copy of X also feeds another output: folding its Cast into
+    # the fused node would drop that consumer's input, so the pass declines.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(
+            down=10, extra="Z = Identity(xu)", extra_out=", float[2,4,8] Z"
+        ),
+        initializer=[_f16(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 0
+
+
+def test_fuse_rms_norm_fp32_upcast_downcast_type_mismatch_untouched():
+    # Casting back to something other than X's own type (here fp16 X,
+    # bf16 result) is not RMSNormalization's Cast-back-to-T semantics.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        _UPCAST_RMS_NORM.format(down=16, extra="", extra_out="").replace(
+            "float16[2,4,8] Y", "bfloat16[2,4,8] Y"
+        ),
+        initializer=[
+            onnx.helper.make_tensor(
+                "weight", onnx.TensorProto.BFLOAT16, [8], weight.tolist()
+            )
+        ],
+        opset=23,
+        ir_version=11,
+    )
+    # check_n=0: onnxruntime's CPU provider has no bf16 Mul kernel.
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops["RMSNormalization"] == 0
+
+
+_FP16_RMS_NORM = """
+    g (float16[2,4,8] X) => (float16[2,4,8] Y)
+    <int64[1] axes = {-1}>
+    {
+      sq = Pow(X, two)
+      var = ReduceMean<keepdims = 1>(sq, axes)
+      var_eps = Add(var, eps)
+      rms = Sqrt(var_eps)
+      inv_rms = Div(one, rms)
+      normed = Mul(X, inv_rms)
+      Y = Mul(weight, normed)
+    }
+"""
+
+
+def _fp16_rms_norm_model(weight):
+    # The constants are fp16 scalars, as in a real fp16 export
+    # (onnx-community/Qwen2.5-0.5B-Instruct's model_fp16.onnx).
+    return _model(
+        _FP16_RMS_NORM,
+        initializer=[
+            _f16(weight, "weight"),
+            _f16(np.array(2.0), "two"),
+            _f16(np.array(1e-6), "eps"),
+            _f16(np.array(1.0), "one"),
+        ],
+        opset=23,
+        ir_version=11,
+    )
+
+
+def _rms_norm_ref(x, w):
+    x = x.astype(np.float64)
+    return w * x / np.sqrt((x**2).mean(-1, keepdims=True) + 1e-6)
+
+
+def test_fuse_rms_norm_fp16_constants():
+    # fp16 eps / 2 / 1 constants used to make the pass decline (the scalar
+    # reader only accepted float/double). A pure-fp16 chain fuses with an
+    # explicit stash_type=FLOAT.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _fp16_rms_norm_model(weight)
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops == {"RMSNormalization": 1}
+    (rms,) = sim_model.graph.node
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in rms.attribute}
+    assert attrs["stash_type"] == onnx.TensorProto.FLOAT
+    ort = pytest.importorskip("onnxruntime")
+    x = np.random.default_rng(0).standard_normal((2, 4, 8)).astype(np.float16)
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(
+        got.astype(np.float64), _rms_norm_ref(x, weight), rtol=3e-3, atol=3e-3
+    )
+
+
+def test_fuse_rms_norm_fp16_fixes_overflow():
+    # Why stash_type=FLOAT: with |x| ~ 1000 (a real LLM residual stream), the
+    # fp16 chain's Pow(x, 2) overflows to inf in any runtime that really
+    # computes it in fp16 (torch, GPU kernels; onnxruntime's CPU provider
+    # happens to upcast internally), while the fused node computes the
+    # reduction in fp32 and stays correct.
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _fp16_rms_norm_model(weight)
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    ort = pytest.importorskip("onnxruntime")
+    x = (np.random.default_rng(1).standard_normal((2, 4, 8)) * 1000).astype(np.float16)
+    ref = _rms_norm_ref(x, weight)
+    assert np.isinf(x * x).any()  # strict fp16 x**2, as the unfused chain has it
+    (got,) = ort.InferenceSession(sim_model.SerializeToString()).run(None, {"X": x})
+    np.testing.assert_allclose(got.astype(np.float64), ref, rtol=3e-3, atol=3e-3)
+
+
+def test_fuse_rms_norm_inner_axis_untouched():
+    # RMSNormalization normalizes over *every* axis from `axis` to the last,
+    # so a mean over axis 1 alone of a rank-3 tensor has no single-node
+    # equivalent: fusing it as axis=1 would silently also reduce over axis 2.
+    weight = np.random.randn(4, 1) * 0.02 + 1.0
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        <float two = {2.0}, int64[1] axes = {1}, float eps = {1e-06}>
+        {
+          sq = Pow(X, two)
+          var = ReduceMean<keepdims = 1>(sq, axes)
+          var_eps = Add(var, eps)
+          rms = Sqrt(var_eps)
+          inv_rms = Reciprocal(rms)
+          normed = Mul(X, inv_rms)
+          Y = Mul(weight, normed)
+        }
+        """,
+        initializer=[_f32(weight, "weight")],
+        opset=23,
+        ir_version=11,
+    )
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # fuse_rope -- HuggingFace-style "rotate_half" rotary position embedding
 # application (see fuse_rope.h's own top comment and test_mnn_llm_export.py's

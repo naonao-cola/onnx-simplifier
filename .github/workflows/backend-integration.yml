@@ -46,6 +46,10 @@ on:
       - "tests/test_tvm_integration.py"
       - "tests/test_halide_integration.py"
       - "tests/test_tinygrad_integration.py"
+      - "tests/test_rustnn_runtime.py"
+      - "tests/test_webnn_tinygrad_tuning.py"
+      - "onnxsim/rustnn_runtime.py"
+      - "onnxsim/webnn_tinygrad_tuning.py"
       - "tests/test_torch_integration.py"
       - "tests/test_mlx_integration.py"
       - "tests/test_modelopt_integration.py"
@@ -340,6 +344,43 @@ jobs:
       - name: Run tinygrad integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_tinygrad_integration.py"
+
+  # rustnn (https://github.com/rustnn/rustnn) is a native Rust implementation
+  # of the W3C WebNN API; pywebnn is its Python binding. Its ONNX Runtime
+  # backend dlopens libonnxruntime at runtime (the ort crate's load-dynamic),
+  # which pywebnn finds inside the pip onnxruntime package. This runs onnxsim's ONNX-to-WebNN
+  # lowering against it, and the WebNN-vs-BEAM-tuned-tinygrad node tuner on
+  # top -- see docs/rustnn.md.
+  rustnn:
+    name: Simplify and run on rustnn (native WebNN) + tinygrad tuning
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + pywebnn + onnxruntime + tinygrad
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest "pywebnn>=0.5.12" onnxruntime "tinygrad==0.14.0"
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import onnxsim; print(onnxsim.probe_rustnn('cpu'))"
+      - name: Run rustnn + WebNN/tinygrad tuning tests
+        working-directory: ${{ runner.temp }}
+        run: >-
+          pytest -v -rs
+          "$GITHUB_WORKSPACE/tests/test_rustnn_runtime.py"
+          "$GITHUB_WORKSPACE/tests/test_webnn_tinygrad_tuning.py"
 
   torch:
     name: Simplify and run on PyTorch (onnx2torch)

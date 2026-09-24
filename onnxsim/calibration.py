@@ -25,7 +25,7 @@ ONNX Runtime to produce the ``{tensor_name: (min, max)}`` ranges
 """
 
 import itertools
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
@@ -322,9 +322,28 @@ def _entropy_threshold(
         return abs_max
 
     hist, bin_edges = np.histogram(abs_values, bins=num_bins, range=(0.0, abs_max))
-    hist = hist.astype(np.float64)
-
     coverage_floor = float(np.percentile(abs_values, min_coverage * 100.0))
+    return _entropy_threshold_from_hist(
+        hist, bin_edges, coverage_floor, num_quantized_bins=num_quantized_bins
+    )
+
+
+def _entropy_threshold_from_hist(
+    hist: np.ndarray,
+    bin_edges: np.ndarray,
+    coverage_floor: float,
+    num_quantized_bins: int = 128,
+) -> float:
+    """The search half of :func:`_entropy_threshold`, on an already-built
+    ``|values|`` histogram over ``[0, abs_max]`` (``bin_edges[-1]``) -- what
+    :func:`calibrate`'s streaming collection accumulates batch by batch
+    instead of keeping the values themselves. ``coverage_floor`` is the
+    ``min_coverage`` percentile of ``|values|`` the search starts from."""
+    hist = np.asarray(hist, dtype=np.float64)
+    num_bins = hist.size
+    abs_max = float(bin_edges[-1])
+    if abs_max <= 0.0 or hist.sum() < num_quantized_bins:
+        return abs_max
     # bin_edges[i] is the upper edge of the i-th bin (0-indexed), so the first
     # cutoff whose upper edge reaches the floor is searchsorted's insertion
     # point; clamped into [num_quantized_bins, num_bins] either end.
@@ -333,6 +352,7 @@ def _entropy_threshold(
             np.searchsorted(bin_edges, coverage_floor), num_quantized_bins, num_bins
         )
     )
+    tail = np.concatenate([np.cumsum(hist[::-1])[::-1], [0.0]])
 
     best_threshold = abs_max
     best_divergence = float("inf")
@@ -340,23 +360,31 @@ def _entropy_threshold(
         ref_dist = hist[:i].copy()
         # Clipped, not dropped: fold the tail's count into the last
         # reference bin so `ref_dist` still sums to the full sample count.
-        ref_dist[-1] += hist[i:].sum()
+        ref_dist[-1] += tail[i]
         if ref_dist.sum() == 0:
             continue
 
         # Simulate quantizing the clipped range to num_quantized_bins levels:
-        # merge ref_dist's `i` fine bins into num_quantized_bins groups, then
-        # spread each group's total back out evenly over its own non-empty
-        # fine bins, so the simulated distribution has the same length (`i`)
-        # as ref_dist and the two are directly comparable bin-for-bin.
-        groups = np.array_split(np.arange(i), num_quantized_bins)
-        candidate = np.zeros(i, dtype=np.float64)
-        for idxs in groups:
-            nonzero = ref_dist[idxs] > 0
-            count = int(nonzero.sum())
-            if count == 0:
-                continue
-            candidate[idxs[nonzero]] = ref_dist[idxs].sum() / count
+        # merge ref_dist's `i` fine bins into num_quantized_bins groups (the
+        # same split np.array_split makes: the first i % k groups one bin
+        # longer), then spread each group's total back out evenly over its
+        # own non-empty fine bins, so the simulated distribution has the same
+        # length (`i`) as ref_dist and the two are comparable bin-for-bin.
+        base, extra = divmod(i, num_quantized_bins)
+        sizes = np.full(num_quantized_bins, base, dtype=np.int64)
+        sizes[:extra] += 1
+        sizes = sizes[sizes > 0]
+        starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        nonzero = ref_dist > 0
+        group_sum = np.add.reduceat(ref_dist, starts)
+        group_count = np.add.reduceat(nonzero.astype(np.int64), starts)
+        per_bin = np.divide(
+            group_sum,
+            group_count,
+            out=np.zeros_like(group_sum),
+            where=group_count > 0,
+        )
+        candidate = np.where(nonzero, np.repeat(per_bin, sizes), 0.0)
 
         p = _smooth_distribution(ref_dist)
         q = _smooth_distribution(candidate)
@@ -435,6 +463,489 @@ def _mse_threshold(
     return best_threshold
 
 
+def _hist_quantile(hist: np.ndarray, bin_edges: np.ndarray, q: float) -> float:
+    """The ``q`` (in ``[0, 1]``) quantile of the values ``hist`` counts,
+    linearly interpolated inside the bin it falls in."""
+    cdf = np.cumsum(np.asarray(hist, dtype=np.float64))
+    total = cdf[-1]
+    if total <= 0:
+        return float(bin_edges[0])
+    target = q * total
+    i = int(np.clip(np.searchsorted(cdf, target, side="left"), 0, hist.size - 1))
+    below = cdf[i - 1] if i > 0 else 0.0
+    count = cdf[i] - below
+    frac = 0.0 if count <= 0 else float(np.clip((target - below) / count, 0.0, 1.0))
+    return float(bin_edges[i] + frac * (bin_edges[i + 1] - bin_edges[i]))
+
+
+def _fold_abs(hist: np.ndarray) -> np.ndarray:
+    """``|values|`` histogram over ``[0, A]`` from a signed one over
+    ``[-A, A]`` with an even bin count (the two halves' edges line up)."""
+    half = hist.size // 2
+    return hist[half:] + hist[:half][::-1]
+
+
+def _mse_threshold_from_hist(
+    hist: np.ndarray,
+    bin_edges: np.ndarray,
+    num_candidates: int = 100,
+    min_coverage: float = 0.5,
+) -> float:
+    """:func:`_mse_threshold` on a signed histogram over ``[-A, A]`` instead
+    of the values themselves: every value is represented by its bin's center,
+    weighted by the bin's count. With :func:`calibrate`'s default 2 x 2048
+    bins the centers sit ~16x finer than an INT8 step at ``A``, so the
+    reconstruction error each candidate is scored by is the same to well
+    within the step (see the streaming-vs-exact test)."""
+    hist = np.asarray(hist, dtype=np.float64)
+    total = hist.sum()
+    abs_max = float(bin_edges[-1])
+    if total <= 0 or abs_max <= 0.0:
+        return 0.0 if total <= 0 else abs_max
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    # The observed |max| is at most one bin past the last non-empty bin's
+    # center; use that bin's upper edge magnitude as the search ceiling.
+    nz = np.nonzero(hist)[0]
+    ceiling = float(max(abs(bin_edges[nz[0]]), abs(bin_edges[nz[-1] + 1])))
+    ceiling = min(ceiling, abs_max)
+    abs_edges = bin_edges[hist.size // 2 :]
+    floor = max(
+        _hist_quantile(_fold_abs(hist), abs_edges, min_coverage), ceiling * 1e-6
+    )
+    if floor >= ceiling:
+        return ceiling
+    mask = hist > 0
+    c = centers[mask]
+    w = hist[mask]
+    best_threshold = ceiling
+    best_mse = float("inf")
+    for t in np.linspace(floor, ceiling, num_candidates):
+        scale = t / 127.0
+        q = np.clip(np.round(c / scale), -127, 127) * scale
+        mse = float(np.sum(w * (c - q) ** 2) / total)
+        if mse < best_mse:
+            best_mse = mse
+            best_threshold = float(t)
+    return best_threshold
+
+
+class _StreamingHistogram:
+    """Per-tensor signed histogram over a fixed ``[-A, A]`` (``A`` = the
+    tensor's observed ``max(|min|, |max|)`` from :func:`calibrate`'s first,
+    min/max-only pass), accumulated one batch at a time: memory is
+    ``2 * num_bins`` int64 counts per tensor however much calibration data
+    streams through, instead of every observed value."""
+
+    def __init__(self, abs_max: float, num_bins: int):
+        self.edges = np.linspace(-abs_max, abs_max, 2 * num_bins + 1)
+        self.abs_max = abs_max
+        self.counts = np.zeros(2 * num_bins, dtype=np.int64)
+
+    def add(self, arr: np.ndarray) -> None:
+        a = arr.ravel()
+        if not np.issubdtype(a.dtype, np.floating):
+            a = a.astype(np.float32)
+        # np.histogram with an explicit range drops NaN/inf, like the exact
+        # search functions' own isfinite filter.
+        h, _ = np.histogram(
+            a, bins=self.counts.size, range=(-self.abs_max, self.abs_max)
+        )
+        self.counts += h
+
+    def entropy_threshold(self, num_quantized_bins: int, min_coverage: float) -> float:
+        abs_hist = _fold_abs(self.counts)
+        abs_edges = self.edges[self.counts.size // 2 :]
+        coverage_floor = _hist_quantile(abs_hist, abs_edges, min_coverage)
+        return _entropy_threshold_from_hist(
+            abs_hist, abs_edges, coverage_floor, num_quantized_bins=num_quantized_bins
+        )
+
+    def mse_threshold(self, num_candidates: int, min_coverage: float) -> float:
+        return _mse_threshold_from_hist(
+            self.counts, self.edges, num_candidates, min_coverage
+        )
+
+    def percentile_range(self, percentile: float) -> Tuple[float, float]:
+        q = percentile / 100.0
+        return (
+            _hist_quantile(self.counts, self.edges, 1.0 - q),
+            _hist_quantile(self.counts, self.edges, q),
+        )
+
+
+_HIST_METHODS = ("entropy", "mse", "percentile")
+# What method="auto" chooses between, per tensor: every fixed method, with the
+# percentile at three clip levels (``"percentile:<p>"``).
+AUTO_CANDIDATES = (
+    "minmax",
+    "percentile:99.9",
+    "percentile:99.99",
+    "percentile:99.999",
+    "entropy",
+    "mse",
+)
+# Ops whose *input* tail carries the information: clipping a Sigmoid/Softmax
+# logit at T caps its output at f(T) -- a detector's rare confident scores
+# (YOLO11n's class logits, almost all background) are exactly that tail.
+_TAIL_SENSITIVE_INPUT_OPS = {"Sigmoid", "HardSigmoid", "Softmax", "LogSoftmax", "Tanh"}
+_BOUNDED_OUTPUT_OPS = {"Sigmoid", "HardSigmoid", "Softmax", "Tanh"}
+
+
+def _parse_method(method: str) -> Tuple[str, Optional[float]]:
+    """``"percentile:99.99"`` -> ``("percentile", 99.99)``; else ``(method, None)``."""
+    if ":" in method:
+        base, arg = method.split(":", 1)
+        if base != "percentile":
+            raise ValueError(f"unknown calibration method: {method!r}")
+        return base, float(arg)
+    return method, None
+
+
+def _asym_qparams(lo: float, hi: float, qmax: int) -> Tuple[float, int]:
+    """uint8/uint16 asymmetric (scale, zero_point) for ``[lo, hi]`` widened to
+    include 0 -- the same grid quantize_static / quantize_full_graph emit."""
+    lo, hi = min(float(lo), 0.0), max(float(hi), 0.0)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi - lo <= 0.0:
+        return 1.0, 0
+    scale = (hi - lo) / qmax
+    return scale, int(np.clip(np.round(-lo / scale), 0, qmax))
+
+
+def _hist_asym_mse(
+    counts: np.ndarray, edges: np.ndarray, lo: float, hi: float, qmax: int = 255
+) -> float:
+    """Expected squared error of quantizing the values ``counts`` holds (at
+    their bin centers) onto the asymmetric ``[lo, hi]`` grid: rounding error
+    inside the range plus clipping error outside it."""
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    mask = counts > 0
+    c = (0.5 * (edges[:-1] + edges[1:]))[mask]
+    w = counts[mask].astype(np.float64)
+    scale, zp = _asym_qparams(lo, hi, qmax)
+    q = (np.clip(np.round(c / scale) + zp, 0, qmax) - zp) * scale
+    return float(np.sum(w * (c - q) ** 2) / total)
+
+
+class CalibrationStats:
+    """What one calibration run over the data observed: every tensor's exact
+    ``(min, max)`` and (unless collected with ``histograms=False``) its
+    fixed-size streaming histogram. Every calibration method's ranges are a
+    pure function of these -- :meth:`ranges` derives any of them, and
+    :meth:`auto_ranges` picks one per tensor, without running the model
+    again. Built by :func:`collect_calibration_stats`."""
+
+    def __init__(
+        self,
+        observed: Dict[str, Tuple[float, float]],
+        histograms: Dict[str, "_StreamingHistogram"],
+        graph_outputs: Set[str],
+        bounded_outputs: Set[str],
+        tail_sensitive: Set[str],
+        upstream: Dict[str, List[str]],
+    ):
+        self.observed = observed
+        self.histograms = histograms
+        self.graph_outputs = graph_outputs
+        self.bounded_outputs = bounded_outputs
+        self.tail_sensitive = tail_sensitive
+        self._upstream = upstream
+        # (tensor, method, *params) -> range: "auto" and a model-level pick
+        # ask for the same thresholds (entropy's search is the slow one)
+        self._range_cache: Dict[Tuple, Tuple[float, float]] = {}
+
+    def _method_range(
+        self,
+        name: str,
+        method: str,
+        percentile: float,
+        num_quantized_bins: int,
+        num_mse_candidates: int,
+        mse_min_coverage: float,
+        entropy_min_coverage: float,
+    ) -> Tuple[float, float]:
+        obs_min, obs_max = self.observed[name]
+        h = self.histograms.get(name)
+        base, arg = _parse_method(method)
+        if base == "minmax" or h is None:
+            return obs_min, obs_max
+        if base == "percentile":
+            p = percentile if arg is None else arg
+            key: Tuple = (name, base, p)
+        elif base == "entropy":
+            key = (name, base, num_quantized_bins, entropy_min_coverage)
+        elif base == "mse":
+            key = (name, base, num_mse_candidates, mse_min_coverage)
+        else:
+            raise ValueError(f"unknown calibration method: {method!r}")
+        if key in self._range_cache:
+            return self._range_cache[key]
+        if base == "percentile":
+            lo, hi = h.percentile_range(p)
+            r = (max(obs_min, lo), min(obs_max, hi))
+        else:
+            if base == "entropy":
+                t = h.entropy_threshold(num_quantized_bins, entropy_min_coverage)
+            else:
+                t = h.mse_threshold(num_mse_candidates, mse_min_coverage)
+            r = (max(obs_min, -t), min(obs_max, t))
+        self._range_cache[key] = r
+        return r
+
+    def head_tensors(self, depth: int) -> Set[str]:
+        """Tensors at most ``depth`` producing nodes upstream of a graph
+        output (``depth=1``: the inputs of the nodes that write the outputs)."""
+        out: Set[str] = set()
+        frontier = set(self.graph_outputs)
+        for _ in range(depth):
+            frontier = {i for t in frontier for i in self._upstream.get(t, ())} - out
+            out |= frontier
+        return out
+
+    def ranges(
+        self,
+        method: str = "minmax",
+        percentile: float = 99.999,
+        num_quantized_bins: int = 128,
+        num_mse_candidates: int = 100,
+        mse_min_coverage: float = 0.5,
+        entropy_min_coverage: float = 0.999,
+        minmax_tensor_names: Optional[Sequence[str]] = None,
+        **auto_kwargs,
+    ) -> Dict[str, Tuple[float, float]]:
+        """``{tensor: (min, max)}`` for ``method`` -- any :func:`calibrate`
+        method, ``"percentile:<p>"``, or ``"auto"`` (see :meth:`auto_ranges`,
+        which ``auto_kwargs`` go to)."""
+        if method == "auto":
+            return self.auto_ranges(
+                minmax_tensor_names=minmax_tensor_names,
+                num_quantized_bins=num_quantized_bins,
+                num_mse_candidates=num_mse_candidates,
+                mse_min_coverage=mse_min_coverage,
+                entropy_min_coverage=entropy_min_coverage,
+                **auto_kwargs,
+            )[0]
+        if _parse_method(method)[0] not in ("minmax",) + _HIST_METHODS:
+            raise ValueError(f"unknown calibration method: {method!r}")
+        if method != "minmax" and not self.histograms and self.observed:
+            raise ValueError(
+                f"method {method!r} needs histograms: collect with histograms=True"
+            )
+        keep = set(minmax_tensor_names or ())
+        return {
+            name: (
+                self.observed[name]
+                if name in keep
+                else self._method_range(
+                    name,
+                    method,
+                    percentile,
+                    num_quantized_bins,
+                    num_mse_candidates,
+                    mse_min_coverage,
+                    entropy_min_coverage,
+                )
+            )
+            for name in self.observed
+        }
+
+    def auto_ranges(
+        self,
+        candidates: Sequence[str] = AUTO_CANDIDATES,
+        minmax_tensor_names: Optional[Sequence[str]] = None,
+        protect_outputs: bool = True,
+        protect_bounded: bool = True,
+        protect_head_depth: int = 0,
+        activation_type: str = "uint8",
+        num_quantized_bins: int = 128,
+        num_mse_candidates: int = 100,
+        mse_min_coverage: float = 0.5,
+        entropy_min_coverage: float = 0.999,
+    ) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, str]]:
+        """Per-tensor automatic calibration: for every tensor, derive each
+        ``candidates`` method's range from its histogram and keep the one with
+        the lowest expected quantization error on the tensor's *own*
+        distribution -- on the asymmetric ``activation_type`` grid the
+        quantizer actually emits, counting both rounding error and the error
+        of clipped values (:func:`_hist_asym_mse`). Ties keep the earlier
+        candidate (minmax first: no clipping unless it measurably helps).
+
+        Error on a tensor is not error on the task: a clipped tail can be the
+        only part that matters. So some tensors always keep their exact range
+        (``"minmax"``):
+
+        - ``minmax_tensor_names``;
+        - ``protect_outputs``: graph outputs;
+        - ``protect_bounded``: outputs of Sigmoid/HardSigmoid/Softmax/Tanh
+          and the *inputs* of Sigmoid/HardSigmoid/Softmax/LogSoftmax/Tanh --
+          clipping a logit at ``T`` caps the score at ``f(T)``, which is how
+          percentile/entropy calibration zeroes a detector's rare confident
+          class scores. A Sigmoid that only gates its own input (SiLU's
+          ``x * sigmoid(x)``, HardSwish) is an activation, not a score: its
+          input is not protected;
+        - ``protect_head_depth=N``: every tensor within ``N`` nodes upstream
+          of a graph output (a detection/regression head).
+
+        :returns: ``(ranges, choices)``; ``choices[tensor]`` is the method
+                picked (``"minmax (protected)"`` for the guarded ones)
+        """
+        qmax = {"uint8": 255, "uint16": 65535}[activation_type]
+        protected = set(minmax_tensor_names or ())
+        if protect_outputs:
+            protected |= self.graph_outputs
+        if protect_bounded:
+            protected |= self.bounded_outputs | self.tail_sensitive
+        if protect_head_depth > 0:
+            protected |= self.head_tensors(protect_head_depth)
+        for c in candidates:
+            if _parse_method(c)[0] not in ("minmax",) + _HIST_METHODS:
+                raise ValueError(f"unknown auto candidate: {c!r}")
+        kw: Dict[str, Any] = dict(
+            num_quantized_bins=num_quantized_bins,
+            num_mse_candidates=num_mse_candidates,
+            mse_min_coverage=mse_min_coverage,
+            entropy_min_coverage=entropy_min_coverage,
+        )
+        ranges: Dict[str, Tuple[float, float]] = {}
+        choices: Dict[str, str] = {}
+        for name, obs in self.observed.items():
+            h = self.histograms.get(name)
+            if name in protected or h is None:
+                ranges[name] = obs
+                choices[name] = "minmax (protected)" if name in protected else "minmax"
+                continue
+            best = None
+            for c in candidates:
+                r = self._method_range(name, c, 99.999, **kw)
+                err = _hist_asym_mse(h.counts, h.edges, r[0], r[1], qmax)
+                if best is None or err < best[0]:
+                    best = (err, c, r)
+            assert best is not None
+            ranges[name], choices[name] = best[2], best[1]
+        return ranges, choices
+
+
+def _is_gate(n: onnx.NodeProto, consumers: Dict[str, List[onnx.NodeProto]]) -> bool:
+    """A Sigmoid/HardSigmoid only gating its own input -- ``x * sigmoid(x)``
+    (SiLU/Swish), ``x * hardsigmoid(x)`` (HardSwish): its input is an
+    ordinary activation, not a score logit whose tail must survive."""
+    if n.op_type not in ("Sigmoid", "HardSigmoid") or not n.output[0]:
+        return False
+    uses = consumers.get(n.output[0], [])
+    return bool(uses) and all(
+        u.op_type == "Mul" and n.input[0] in u.input for u in uses
+    )
+
+
+def collect_calibration_stats(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[str]] = None,
+    tensor_names: Optional[Sequence[str]] = None,
+    extra_tensor_names: Optional[Sequence[str]] = None,
+    histograms: bool = True,
+    num_bins: int = 2048,
+) -> CalibrationStats:
+    """Run the float ``model`` over ``calibration_data`` once and record what
+    every calibration method needs (see :class:`CalibrationStats`): pass 1
+    the exact ``(min, max)`` per tensor, pass 2 (``histograms=True``) a
+    ``2 * num_bins``-bin signed histogram over ``[-max|x|, max|x|]`` per
+    tensor, streamed one batch at a time -- memory is #tensors x bins however
+    much data is used. Tensors are ``tensor_names`` if given, else
+    ``list_quantizable_activations``' list, plus ``extra_tensor_names``."""
+    import onnxruntime as ort
+
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    names: Set[str]
+    if tensor_names is not None:
+        names = set(tensor_names)
+    else:
+        names = set(C.list_quantizable_activations(model.SerializeToString()))
+    if extra_tensor_names:
+        names |= set(extra_tensor_names)
+
+    g = model.graph
+    upstream: Dict[str, List[str]] = {}
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for n in g.node:
+        for i in n.input:
+            if i:
+                consumers.setdefault(i, []).append(n)
+    bounded: Set[str] = set()
+    tail: Set[str] = set()
+    for n in g.node:
+        ins = [i for i in n.input if i]
+        for o in n.output:
+            if o:
+                upstream[o] = ins
+        if n.op_type in _BOUNDED_OUTPUT_OPS:
+            bounded |= {o for o in n.output if o}
+        if (
+            n.op_type in _TAIL_SENSITIVE_INPUT_OPS
+            and ins
+            and not _is_gate(n, consumers)
+        ):
+            tail.add(ins[0])
+    stats = CalibrationStats(
+        {}, {}, {o.name for o in g.output}, bounded, tail, upstream
+    )
+    if not names:
+        return stats
+
+    # Expose every candidate tensor as an extra graph output, so onnxruntime
+    # computes (and returns) it without the graph itself needing to change.
+    calib_model = onnx.ModelProto()
+    calib_model.CopyFrom(model)
+    existing_outputs = {o.name for o in calib_model.graph.output}
+    for name in names:
+        if name not in existing_outputs:
+            calib_model.graph.output.append(onnx.ValueInfoProto(name=name))
+
+    sess = ort.InferenceSession(
+        calib_model.SerializeToString(),
+        providers=list(providers) if providers else None,
+    )
+    output_names = [o.name for o in sess.get_outputs()]
+
+    def outputs_of(batch: Tensors):
+        for name, value in zip(output_names, sess.run(output_names, batch)):
+            if name in names:
+                arr = np.asarray(value)
+                if arr.size:
+                    yield name, arr
+
+    if histograms and not isinstance(calibration_data, Sequence):
+        calibration_data = list(calibration_data)
+
+    # Pass 1: exact running (min, max) -- all "minmax" needs, and the fixed
+    # histogram range for the others.
+    ranges = stats.observed
+    for batch in calibration_data:
+        for name, arr in outputs_of(batch):
+            batch_min = float(arr.min())
+            batch_max = float(arr.max())
+            if name in ranges:
+                prev_min, prev_max = ranges[name]
+                ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
+            else:
+                ranges[name] = (batch_min, batch_max)
+    if not histograms:
+        return stats
+
+    # Pass 2: stream every batch into a fixed-size histogram per tensor.
+    for name, (lo, hi) in ranges.items():
+        abs_max = max(abs(lo), abs(hi))
+        if 0.0 < abs_max < float("inf"):
+            stats.histograms[name] = _StreamingHistogram(abs_max, num_bins)
+    for batch in calibration_data:
+        for name, arr in outputs_of(batch):
+            if name in stats.histograms:
+                stats.histograms[name].add(arr)
+    return stats
+
+
 def calibrate(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
@@ -445,6 +956,11 @@ def calibrate(
     num_mse_candidates: int = 100,
     mse_min_coverage: float = 0.5,
     extra_tensor_names: Optional[Sequence[str]] = None,
+    percentile: float = 99.999,
+    tensor_names: Optional[Sequence[str]] = None,
+    minmax_tensor_names: Optional[Sequence[str]] = None,
+    entropy_min_coverage: float = 0.999,
+    auto_options: Optional[Dict] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Run the float ``model`` over every batch in ``calibration_data`` through
@@ -498,87 +1014,77 @@ def calibrate(
             threshold rather than one histogram pass total; needs the same
             "at least a few hundred observed values per tensor" amount of
             calibration data ``"entropy"`` does.
+            ``"percentile"`` clips each tensor to its ``(100 - percentile)``
+            and ``percentile`` quantiles (two-tailed, so an asymmetric
+            uint8 range keeps its own shape -- a post-ReLU tensor's lower
+            quantile stays 0), then intersects with the observed range.
+            Cheaper and more predictable than entropy/mse: a fixed fraction
+            of outliers is clipped, whatever the distribution.
+            ``"percentile:<p>"`` is the same with ``percentile=p``.
+            ``"auto"`` picks one of those per tensor, by the expected
+            quantization error on that tensor's own histogram, and never
+            clips graph outputs, Sigmoid/Softmax outputs and inputs, or
+            ``minmax_tensor_names`` -- see
+            :meth:`CalibrationStats.auto_ranges` (``auto_options`` are
+            passed to it) and, to choose one method for the whole model by
+            a task metric instead, :func:`onnxsim.pick_calibration`.
+
+            All three histogram methods stream: a first pass records every
+            tensor's exact ``(min, max)``; a second pass accumulates a
+            fixed ``2 * num_bins``-bin signed histogram over
+            ``[-max|x|, max|x|]`` per tensor, one batch at a time. Memory is
+            #tensors x bins, independent of how much calibration data is
+            used (the model runs twice over ``calibration_data``, which is
+            materialized as a list if it is a one-shot iterator). ``"mse"``
+            and the entropy coverage floor are evaluated on bin centers --
+            see :func:`_mse_threshold_from_hist`.
     :param num_mse_candidates: (``"mse"`` only) number of candidate clip
             thresholds the search evaluates -- see :func:`_mse_threshold`.
     :param mse_min_coverage: (``"mse"`` only) floor on the search, as a
             percentile of ``|values|`` below which no threshold is
             considered -- see :func:`_mse_threshold`.
+    :param percentile: (``"percentile"`` only) e.g. ``99.99`` or ``99.999``
+    :param tensor_names: calibrate exactly these tensors instead of
+            ``list_quantizable_activations``' list (``extra_tensor_names`` is
+            still added) -- what a quantizer that places its own QDQ pairs
+            (:func:`onnxsim.qdq_full_graph.quantize_full_graph`) passes
+    :param minmax_tensor_names: tensors kept at their exact observed range
+            whatever ``method`` is, e.g. graph inputs whose range is known
+            (normalized pixels are exactly ``[0, 1]``)
+    :param entropy_min_coverage: (``"entropy"`` only) the search's floor --
+            see :func:`_entropy_threshold`'s ``min_coverage``
+    :param auto_options: (``"auto"`` only) keyword arguments for
+            :meth:`CalibrationStats.auto_ranges`, e.g.
+            ``{"protect_head_depth": 2}``
     :returns: ``{tensor_name: (min, max)}`` for every tensor
-            ``onnxsim_cpp2py_export.list_quantizable_activations`` reports,
-            plus ``extra_tensor_names`` if given
+            ``onnxsim_cpp2py_export.list_quantizable_activations`` reports
+            (or ``tensor_names``), plus ``extra_tensor_names`` if given
     """
-    import onnxruntime as ort
-
-    if method not in ("minmax", "entropy", "mse"):
+    base, _ = _parse_method(method)
+    if method != "auto" and base not in ("minmax",) + _HIST_METHODS:
         raise ValueError(f"unknown calibration method: {method!r}")
+    if method == "percentile" and not 50.0 < percentile <= 100.0:
+        raise ValueError(f"percentile must be in (50, 100], got {percentile}")
 
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    model_bytes = model.SerializeToString()
-    tensor_names = set(C.list_quantizable_activations(model_bytes))
-    if extra_tensor_names:
-        tensor_names |= set(extra_tensor_names)
-    if not tensor_names:
-        return {}
-
-    # Expose every candidate tensor as an extra graph output, so onnxruntime
-    # computes (and returns) it without the graph itself needing to change.
-    calib_model = onnx.ModelProto()
-    calib_model.CopyFrom(model)
-    existing_outputs = {o.name for o in calib_model.graph.output}
-    for name in tensor_names:
-        if name not in existing_outputs:
-            calib_model.graph.output.append(onnx.ValueInfoProto(name=name))
-
-    sess = ort.InferenceSession(
-        calib_model.SerializeToString(),
-        providers=list(providers) if providers else None,
+    stats = collect_calibration_stats(
+        model,
+        calibration_data,
+        providers=providers,
+        tensor_names=tensor_names,
+        extra_tensor_names=extra_tensor_names,
+        histograms=method != "minmax",
+        num_bins=num_bins,
     )
-    output_names = [o.name for o in sess.get_outputs()]
-
-    ranges: Dict[str, Tuple[float, float]] = {}
-    # Only "entropy"/"mse" need every observed value kept around (to build a
-    # histogram from, or to measure reconstruction error against directly);
-    # "minmax" only ever needs a running (min, max).
-    collected: Dict[str, List[np.ndarray]] = {}
-    for batch in calibration_data:
-        outputs = sess.run(output_names, batch)
-        for name, value in zip(output_names, outputs):
-            if name not in tensor_names:
-                continue
-            arr = np.asarray(value)
-            if arr.size == 0:
-                continue
-            batch_min = float(arr.min())
-            batch_max = float(arr.max())
-            if name in ranges:
-                prev_min, prev_max = ranges[name]
-                ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
-            else:
-                ranges[name] = (batch_min, batch_max)
-            if method in ("entropy", "mse"):
-                collected.setdefault(name, []).append(arr.ravel())
-
-    if method == "entropy":
-        for name, chunks in collected.items():
-            threshold = _entropy_threshold(
-                np.concatenate(chunks),
-                num_bins=num_bins,
-                num_quantized_bins=num_quantized_bins,
-            )
-            obs_min, obs_max = ranges[name]
-            ranges[name] = (max(obs_min, -threshold), min(obs_max, threshold))
-    elif method == "mse":
-        for name, chunks in collected.items():
-            threshold = _mse_threshold(
-                np.concatenate(chunks),
-                num_candidates=num_mse_candidates,
-                min_coverage=mse_min_coverage,
-            )
-            obs_min, obs_max = ranges[name]
-            ranges[name] = (max(obs_min, -threshold), min(obs_max, threshold))
-
-    return ranges
+    kw: Dict[str, Any] = dict(
+        num_quantized_bins=num_quantized_bins,
+        num_mse_candidates=num_mse_candidates,
+        mse_min_coverage=mse_min_coverage,
+        entropy_min_coverage=entropy_min_coverage,
+        minmax_tensor_names=minmax_tensor_names,
+    )
+    if method == "auto":
+        return stats.auto_ranges(**kw, **(auto_options or {}))[0]
+    return stats.ranges(method, percentile=percentile, **kw)
 
 
 def quantize_static(
@@ -588,6 +1094,14 @@ def quantize_static(
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
     method: str = "minmax",
+    full_graph: bool = False,
+    per_channel: bool = True,
+    nodes_to_exclude: Optional[Sequence[str]] = None,
+    op_types_to_exclude: Optional[Sequence[str]] = None,
+    activation_type: str = "uint8",
+    percentile: float = 99.999,
+    minmax_tensor_names: Optional[Sequence[str]] = None,
+    auto_options: Optional[Dict] = None,
 ) -> onnx.ModelProto:
     """
     Statically (calibration-based) quantize every MatMul, every "vanilla"
@@ -620,7 +1134,33 @@ def quantize_static(
             :func:`calibrate` -- ``"minmax"`` (default), ``"entropy"``
             (KL-divergence calibration), or ``"mse"`` (direct reconstruction-
             error calibration); see that function for the tradeoffs and
-            their extra data requirement.
+            their extra data requirement; or ``"percentile"``, or ``"auto"``
+            (a method per tensor -- :meth:`CalibrationStats.auto_ranges`;
+            to pick one method for the whole model by a task metric, see
+            :func:`pick_calibration`).
+    :param full_graph: QDQ *every* float activation (uint8/uint16
+            asymmetric), with INT8 weights and INT32 biases, instead of only
+            the MatMul/Gemm/Conv inputs -- what a whole-graph integer NPU
+            (e.g. the Qualcomm HTP through ORT's QNN EP) needs; see
+            :mod:`onnxsim.qdq_full_graph`. Graph inputs and the outputs of
+            bounded ops (Sigmoid, Softmax...) always keep their exact
+            observed range whatever ``method`` is -- see
+            :func:`onnxsim.qdq_full_graph.bounded_output_tensors`.
+    :param per_channel: (``full_graph`` only) per-output-channel weight
+            scales; the default scheme is always per channel
+    :param nodes_to_exclude: (``full_graph`` only) node names left in float
+    :param op_types_to_exclude: (``full_graph`` only) op types left in float
+    :param activation_type: (``full_graph`` only) ``"uint8"`` or ``"uint16"``
+    :param percentile: (``method="percentile"`` only) passed to
+            :func:`calibrate`
+    :param auto_options: (``method="auto"`` only) passed to
+            :meth:`CalibrationStats.auto_ranges`
+    :param minmax_tensor_names: (``full_graph`` only) tensors kept at their
+            exact observed range whatever ``method`` is. A detector's score
+            path is the typical case: its logits are almost all background,
+            so the rare large logits that *are* the detections sit above any
+            percentile/entropy/mse clip (YOLO11n at the 99.99th percentile
+            clips its class logits to ~0, capping every score at ~0.5)
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -629,8 +1169,94 @@ def quantize_static(
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_calibration_samples, seed=seed
         )
-    ranges = calibrate(model, calibration_data, providers=providers, method=method)
-    return onnx.load_from_string(C.quantize_static(model.SerializeToString(), ranges))
+    plan = _StaticPlan(
+        model,
+        full_graph=full_graph,
+        per_channel=per_channel,
+        nodes_to_exclude=nodes_to_exclude,
+        op_types_to_exclude=op_types_to_exclude,
+        activation_type=activation_type,
+        minmax_tensor_names=minmax_tensor_names,
+    )
+    ranges = calibrate(
+        model,
+        calibration_data,
+        providers=providers,
+        method=method,
+        percentile=percentile,
+        tensor_names=plan.tensor_names,
+        minmax_tensor_names=plan.minmax_tensor_names,
+        auto_options=dict(auto_options or {}, activation_type=activation_type)
+        if method == "auto"
+        else None,
+    )
+    return plan.apply(ranges)
+
+
+class _StaticPlan:
+    """What :func:`quantize_static` calibrates and how it applies the ranges,
+    shared with :func:`pick_calibration` (which applies many range sets from
+    one calibration run)."""
+
+    def __init__(
+        self,
+        model: onnx.ModelProto,
+        full_graph: bool = False,
+        per_channel: bool = True,
+        nodes_to_exclude: Optional[Sequence[str]] = None,
+        op_types_to_exclude: Optional[Sequence[str]] = None,
+        activation_type: str = "uint8",
+        minmax_tensor_names: Optional[Sequence[str]] = None,
+    ):
+        self.model = model
+        self.full_graph = full_graph
+        self.per_channel = per_channel
+        self.activation_type = activation_type
+        self.exclude = dict(
+            nodes_to_exclude=nodes_to_exclude or (),
+            op_types_to_exclude=op_types_to_exclude or (),
+        )
+        self.tensor_names: Optional[List[str]] = None
+        self.minmax_tensor_names: Optional[List[str]] = None
+        if full_graph:
+            from onnxsim import qdq_full_graph
+
+            inits = {t.name for t in model.graph.initializer}
+            self.tensor_names = qdq_full_graph.list_full_graph_activations(
+                model, **self.exclude
+            )
+            self.minmax_tensor_names = (
+                [i.name for i in model.graph.input if i.name not in inits]
+                + qdq_full_graph.bounded_output_tensors(model)
+                + list(minmax_tensor_names or ())
+            )
+        elif (
+            not per_channel
+            or minmax_tensor_names
+            or nodes_to_exclude
+            or op_types_to_exclude
+            or activation_type != "uint8"
+        ):
+            raise ValueError(
+                "per_channel=False, nodes_to_exclude, op_types_to_exclude, "
+                "minmax_tensor_names and activation_type only apply with full_graph=True (use "
+                "quantize_static_int16 for W8A16 on the default scheme)"
+            )
+
+    def apply(self, ranges: Dict[str, Tuple[float, float]]) -> onnx.ModelProto:
+        if self.full_graph:
+            from onnxsim import qdq_full_graph
+
+            return qdq_full_graph.quantize_full_graph(
+                self.model,
+                ranges,
+                per_channel=self.per_channel,
+                activation_type=self.activation_type,
+                **self.exclude,
+            )
+        return onnx.load_from_string(
+            C.quantize_static(self.model.SerializeToString(), ranges)
+        )
 
 
 def quantize_static_int16(
