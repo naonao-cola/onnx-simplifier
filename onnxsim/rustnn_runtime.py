@@ -585,7 +585,46 @@ class _Lowering:
             raise WebnnLoweringError(
                 "AveragePool: count_include_pad=1 with padding is not supported"
             )
-        return self._pool(node, a, x, self.b.average_pool2d)
+        if not self.coreml:
+            return self._pool(node, a, x, self.b.average_pool2d)
+        inp = x()
+        self._require_2d(node, inp)
+        in_hw = self.shape(inp)[2:]
+        kernel = list(a["kernel_shape"])
+        strides, dilations, pads = self._spatial(node, a, kernel, in_hw)
+        if not any(pads):
+            return self._pool(node, a, x, self.b.average_pool2d)
+        if a.get("ceil_mode", 0):
+            raise WebnnLoweringError(
+                "AveragePool: ceil_mode=1 with padding is not supported on Core ML"
+            )
+        # rustnn 0.5.12's Core ML averagePool2d counts padding in the divisor
+        # (unlike WebNN / ONNX count_include_pad=0). Zero-pad explicitly, pool
+        # unpadded, then rescale by kernel taps / valid taps per output
+        # position: exact, and backend-independent.
+        top, bottom, left, right = pads
+        padded = self._pad_without_mil_pad(
+            inp, [0, 0, top, left, 0, 0, bottom, right], "constant", 0.0
+        )
+        out = self.b.average_pool2d(
+            padded,
+            window_dimensions=kernel,
+            strides=strides,
+            dilations=dilations,
+            pads=[0, 0, 0, 0],
+        )
+        out_hw = self.shape(out)[2:]
+        counts = []
+        for i, pb in enumerate((top, left)):
+            pos = (
+                np.arange(out_hw[i])[:, None] * strides[i]
+                - pb
+                + np.arange(kernel[i])[None, :] * dilations[i]
+            )
+            counts.append(((pos >= 0) & (pos < in_hw[i])).sum(axis=1))
+        valid = np.outer(counts[0], counts[1]).astype(np.float64)
+        scale = (kernel[0] * kernel[1] / valid).astype(np.float32)
+        return self.b.mul(out, self.b.constant(scale.reshape(1, 1, *out_hw)))
 
     def _op_GlobalAveragePool(self, node, a, x):
         inp = x()
@@ -767,7 +806,6 @@ class _Lowering:
         return self.b.gather(inp, indices, axis=axis)
 
     def _op_Pad(self, node, a, x):
-        self._reject_on_coreml(node, "rustnn 0.5.12 never emits MIL pad's mode")
         inp = x()
         rank = len(inp.shape)
         pads = a.get("pads")
@@ -792,11 +830,71 @@ class _Lowering:
                 "Pad: only constant/edge/reflect modes are supported"
             )
         value = self.const(node, 2, "constant_value")
+        fill = float(value.reshape(-1)[0]) if value is not None and value.size else 0.0
+        if self.coreml:
+            return self._pad_without_mil_pad(inp, [int(p) for p in pads], mode, fill)
         kwargs = {"mode": mode}
         if value is not None and value.size:
-            kwargs["value"] = float(value.reshape(-1)[0])
+            kwargs["value"] = fill
         # pywebnn takes ONNX's own [begin_0.., end_0..] layout as one list.
         return self.b.pad(inp, [int(p) for p in pads], **kwargs)
+
+    def _pad_without_mil_pad(self, inp, pads, mode: str, fill: float):
+        """Pad without WebNN's ``pad``: rustnn 0.5.12's Core ML backend emits
+        MIL ``pad`` with no ``mode``, which Core ML refuses to load. Exact
+        rewrite, one padded axis at a time, as a ``concat`` along that axis:
+        constant pads add constant blocks; edge/reflection pads add unit-
+        stride slices of the input following numpy's ``edge``/``reflect``
+        index maps (ONNX's), consecutive indices merged into one slice.
+        (Only unit strides: rustnn ignores slice strides on Core ML, and
+        chained ``gather`` on different axes mis-infers ranks.)"""
+        rank = len(inp.shape)
+        out = inp
+        for ax in range(rank):
+            before, after = pads[ax], pads[ax + rank]
+            if not before and not after:
+                continue
+            shape = self.shape(out)
+            n = shape[ax]
+            if mode == "constant":
+                ins = []
+                for k in (before, None, after):
+                    if k is None:
+                        ins.append(out)
+                    elif k:
+                        blk = list(shape)
+                        blk[ax] = k
+                        ins.append(
+                            self.b.constant(np.full(blk, fill, dtype=np.float32))
+                        )
+                out = self.b.concat(ins, ax)
+                continue
+            if mode == "reflection" and (before >= n or after >= n):
+                raise WebnnLoweringError(
+                    "Pad: reflect pads must be smaller than the padded dimension"
+                )
+            idx = np.pad(
+                np.arange(n),
+                (before, after),
+                mode="edge" if mode == "edge" else "reflect",
+            ).tolist()
+            runs = []  # [start, length] of ascending consecutive index runs
+            for i in idx:
+                if runs and runs[-1][0] + runs[-1][1] == i:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([i, 1])
+            ins = []
+            for start, length in runs:
+                if start == 0 and length == n:
+                    ins.append(out)
+                    continue
+                starts = [0] * rank
+                sizes = list(shape)
+                starts[ax], sizes[ax] = start, length
+                ins.append(self.b.slice(out, starts, sizes))
+            out = self.b.concat(ins, ax) if len(ins) > 1 else ins[0]
+        return out
 
     def _arg(self, node, a, x, fn):
         if a.get("select_last_index", 0):
@@ -885,9 +983,10 @@ def build_webnn_graph(
     what pywebnn 0.5.12 picks for ``device_type="npu"``) the lowering works
     around that backend's bugs: conv/gemm biases become explicit adds,
     arg-reductions return int32, non-float outputs are returned as float32,
+    ``Pad`` becomes an exact gather/concat (its MIL ``pad`` lacks ``mode``),
     and every output is flattened to 1-D (use :class:`RustnnSession`, which
-    reshapes and casts them back). Ops it can't run or computes wrongly there
-    (``Pad``, ``Where``, ``LayerNormalization``, strided ``Slice``) raise
+    reshapes and casts them back). Ops it computes wrongly there (``Where``,
+    ``LayerNormalization``, strided ``Slice``) raise
     :class:`WebnnLoweringError` instead.
 
     :param input_shapes: static shapes for graph inputs whose ONNX shape has
