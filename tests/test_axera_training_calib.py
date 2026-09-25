@@ -118,17 +118,13 @@ def test_scalar_trajectory_is_lifted_to_rank_one_input(tmp_path):
     )
     got = _read_tar(wd, "dataset/lr.tar")
     assert [tuple(sample.shape) for sample in got] == [(1,)] * 3
-    np.testing.assert_allclose(
-        [float(sample[0]) for sample in got], [0.1, 0.2, 0.1]
-    )
+    np.testing.assert_allclose([float(sample[0]) for sample in got], [0.1, 0.2, 0.1])
 
 
 def test_default_grad_seed_calibration_is_centered_on_one(tmp_path):
     model = _model()
     model.graph.input.append(
-        onnx.helper.make_tensor_value_info(
-            "grad_seed", onnx.TensorProto.FLOAT, [1]
-        )
+        onnx.helper.make_tensor_value_info("grad_seed", onnx.TensorProto.FLOAT, [1])
     )
     step = tmp_path / "step.onnx"
     onnx.save(model, step)

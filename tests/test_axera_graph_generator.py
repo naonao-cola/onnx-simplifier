@@ -13,7 +13,9 @@ import graph_generator  # noqa: E402
 
 def _model(nodes, inputs, outputs, initializers=()):
     graph = onnx.helper.make_graph(nodes, "source", inputs, outputs, initializers)
-    return onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
 
 
 def _full_model():
@@ -31,7 +33,12 @@ def _full_model():
         onnx.helper.make_tensor_value_info("w", onnx.TensorProto.FLOAT, [4, 6]),
         onnx.helper.make_tensor_value_info("b", onnx.TensorProto.FLOAT, [1, 1, 6, 8]),
     ]
-    return _model(nodes, inputs, [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 6, 8])], [f, shape])
+    return _model(
+        nodes,
+        inputs,
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 6, 8])],
+        [f, shape],
+    )
 
 
 def test_schedule_fuses_measured_chain():
@@ -44,7 +51,9 @@ def test_generate_uses_one_fused_template(tmp_path):
     source = tmp_path / "source.onnx"
     output = tmp_path / "generated.axmodel"
     onnx.save(_full_model(), source)
-    plan = graph_generator.generate(str(source), str(output), indices=[15, 0, 7, 7, 3, 12, 1, 14])
+    plan = graph_generator.generate(
+        str(source), str(output), indices=[15, 0, 7, 7, 3, 12, 1, 14]
+    )
     assert plan.chain == "gather_reshape_matmul_transpose_add"
     generated = onnx.load(str(output), load_external_data=False)
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
@@ -60,7 +69,11 @@ def test_schedule_and_generate_fused_reshape_relu(tmp_path):
     source_model = _model(
         nodes,
         [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 8, 4, 4])],
-        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 8, 16])],
+        [
+            onnx.helper.make_tensor_value_info(
+                "y", onnx.TensorProto.FLOAT, [1, 1, 8, 16]
+            )
+        ],
         [shape],
     )
     source = tmp_path / "reshape.onnx"
@@ -70,7 +83,9 @@ def test_schedule_and_generate_fused_reshape_relu(tmp_path):
     assert plan.chain == "reshape_relu"
     generated = onnx.load(str(output), load_external_data=False)
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
-    assert [dim.dim_value for dim in generated.graph.input[0].type.tensor_type.shape.dim] == [1, 8, 4, 4]
+    assert [
+        dim.dim_value for dim in generated.graph.input[0].type.tensor_type.shape.dim
+    ] == [1, 8, 4, 4]
 
 
 def test_schedule_refuses_unmeasured_transpose():
