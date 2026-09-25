@@ -50,3 +50,25 @@ def test_builder_can_relayout_an_existing_template_segment():
         )
     )
     assert mcode_builder.replace_template_segment(template, 1, program) == template
+
+
+def test_builder_packages_a_segment_into_an_axmodel():
+    path = os.path.join(
+        _AXERA, "fixtures", "step_recalib", "toyf_A1.axmodel.gz"
+    )
+    model = step_recalibrate.load(path)
+    name = step_recalibrate.mcode_name(model)
+    raw = step_recalibrate.codec.decode_segments(
+        step_recalibrate.get_mcode(model)
+    )[1]
+    program = mcode_builder.MCodeProgram().extend(
+        step_recalibrate.mcode_mod.decode(
+            raw, start=0, end=len(raw), **step_recalibrate.mcode_mod.FULL_RULE
+        )
+    )
+    packaged = mcode_builder.replace_model_segment(model, name, 1, program)
+    init = next(item for item in packaged.graph.initializer if item.name == name)
+    assert bytes(init.raw_data) == bytes(
+        next(item for item in model.graph.initializer if item.name == name).raw_data
+    )
+    assert list(init.dims) == [len(init.raw_data)]

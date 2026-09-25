@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 import mcode
+import onnx
 
 
 def _byte(value: int, label: str) -> int:
@@ -123,3 +124,39 @@ def replace_template_segment(template: bytes, segment: int, program: MCodeProgra
     if violations:
         raise ValueError("generated MCode failed structural validation: " + violations[0])
     return result
+
+
+def replace_model_segment(
+    model: onnx.ModelProto,
+    mcode_initializer: str,
+    segment: int,
+    program: MCodeProgram,
+) -> onnx.ModelProto:
+    """Return ``model`` with one generated segment packaged into its MCode.
+
+    Only the MCode blob and its length declarations are changed.  Quantization
+    tables, graph metadata, and opaque vendor attributes are copied exactly;
+    callers remain responsible for proving that the program's register
+    bindings match those metadata.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    initializer = next(
+        (item for item in out.graph.initializer if item.name == mcode_initializer),
+        None,
+    )
+    if initializer is None:
+        raise ValueError(f"MCode initializer not found: {mcode_initializer!r}")
+    patched = replace_template_segment(bytes(initializer.raw_data), segment, program)
+    initializer.raw_data = patched
+    del initializer.dims[:]
+    initializer.dims.append(len(patched))
+    declarations = [*out.graph.value_info, *out.graph.input]
+    for value in declarations:
+        if value.name != mcode_initializer:
+            continue
+        dims = value.type.tensor_type.shape.dim
+        if len(dims) != 1:
+            raise ValueError(f"MCode declaration is not one-dimensional: {value.name!r}")
+        dims[0].dim_value = len(patched)
+    return out
