@@ -24,13 +24,13 @@ This directory asks whether that can be done again without SNPE, with our own in
 | Best integer config (§6) | **W16A16**: plan 5.7 / 4.5 mm, lead p95 0.009 / 7e-5 (6-12x fp16's error) | **W16A16**: worst head 5.9e-4 / 4.2e-4 (~2.5x fp16), blink agreement ≥ 99.8% |
 | Cheaper config (§6) | W8 AdaRound + 10 convs W16, A16: plan 1.4 / 1.7 cm, lead p95 0.017 | W8 AdaRound, A16: worst head 0.006, blink ≥ 99.7% |
 | Plain int8 PTQ (§3) | W8A8: **broken** (plan 4.3 m) | W8A8: blink agreement 86-95% |
-| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed) | W16A16 33.4 ms, cheaper config 21.3 ms, W8A16 19.7 ms, W8A8 11.8 ms; heads extra (§7) | W16A16 19.2 ms, W8A16 10.9 ms, W8A8 6.1 ms |
+| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed), after §7 | W16A16 31.3 ms, cheaper config 19.2 ms, W8A16 17.7 ms, W8A8 10.8 ms; heads extra | W16A16 18.5 ms, W8A16 10.2 ms, W8A8 5.8 ms |
 | Upstream tinygrad `DEV=DSP` on these models | fp16 graph: fails to link (`__extendhfsf2`/`__truncsfhf2` undefined). fp32 graph: not tried (see the DM column) | fp32 graph: compiles (730 kernels) and matches ORT to 1.4e-5 under qemu. It is scalar float code: V65 HVX has no float |
 
 **Accuracy sets the cost.** No integer config reaches fp16's own error against fp32: not even with every
 weight and activation in 16 bits, and not with the stem in float on top of that (§6). The best integer
 config (W16A16) is within 6-12x of fp16 on the driving model and ~2.5x on DM. At the assumed
-2 threads x 1 GHz it projects to 33 ms (driving) + 19 ms (DM) of DSP time, above the GPU's 29.5 + 14.5 ms
+2 threads x 1 GHz it projects to 31 ms (driving) + 19 ms (DM), after §7's depthwise work, of DSP time, above the GPU's 29.5 + 14.5 ms
 in the route's logs. The cheaper configs fit, at 15-40x fp16's error.
 
 ## 1. Models and profile (`profile_models.py`)
@@ -288,6 +288,75 @@ top-10 W16 at 21 ms, DM W8A16 AdaRound at 11 ms), at 15-40x fp16's own error. Ma
 isn't possible with 16-bit integer tensors on these nets. The next levers are QAT with the real training
 data (comma-side only), or faster kernels, so that W16A16's 33 ms fits (§4, depthwise first).
 
+## 7. Depthwise conv speed (`hvx65/kernels.c`: `dw3`, `dwc3`)
+
+Round 1's `dwc` reached only 4-15 MAC/cycle. That was ~21% of driving's W8A8 cycles for 5% of its
+MACs.
+
+**The simulator is load-bound.** A microbenchmark measures hexagon-sim sustaining **one HVX vector load
+per ~2 cycles** from L2 (2.0-2.2 cycles/vector for 16 KB-1 MB working sets; stores are the same).
+Depthwise is load-heavy: every tap needs a new input vector, and per-channel weights are vectors too.
+It was never limited by the multiply instruction. Versions tried, all bit-exact against the scalar
+reference (`./run_sim.sh <op> ... check`):
+
+| kernel | idea | result |
+|---|---|---|
+| `dwc2` | `dwc` + per-layer shift, requant by narrowing `vasr(Vw,Vw):rnd:sat` (≈12 instead of ≈45 ops per 128 outputs), 4 pixels per iteration | 1.2x |
+| `dwc3` | taps as `vrmpy`'s 4-way reduction: 4 tap vectors byte+halfword-shuffled (`vshuff`) so a word holds one channel's 4 taps; `vrmpy(Vub, Vb)` is single-resource (2 per packet), no 16-bit widening | 1.3-1.4x (5x5, 7x7) |
+| `dwc4` | `dwc3` with each input row shuffled once into a ring buffer, amortized over k output rows | **0.5x**: the extra store + reload costs more than the shuffles it saves |
+| **`dw3`** | 3x3 only: all 12 weight vectors in registers for a whole row, 3x3 window sliding along x (3 new loads per output pixel at stride 1) | **1.6-1.7x** |
+| **C = 64 packing** (`dw3`, `dwc3`) | channels-last C=64 tensors put 2 pixels per vector instead of padding to 128 lanes; the odd tap is `valign(next, cur, 64)` (`dw3`) or an unaligned load (`dwc3`) | **2.7-3.3x** on the C = 64 layers (driving's largest-spatial stage) |
+
+Not done: **fusing into the neighbouring 1x1.** The two kernels also don't share a layout yet.
+- `pw` wants `[P/32][C/4][32 px][4 ch]`, and the depthwise kernels are channels-last.
+- A real pipeline needs a transpose between them: about 5 permute ops + a load/store per vector, very
+  roughly 5% of total cycles (estimated, not in the projection).
+- A fused dw→pw kernel would remove that transpose and the depthwise output's store/reload. It is the
+  natural next step, but a larger one than this chunk.
+
+Per-layer cycles (single thread; `sim_cycles_cache.json`). Every depthwise shape in both models is
+listed; "new" is `dw3` for 3x3 and `dwc3` (2 pixels per iteration) otherwise:
+
+| C | H x W | k | s | round 1 `dwc` | new | speedup |
+|---:|---|---:|---:|---:|---:|---:|
+| 64 | 32x64 | 3 | 1 | 276,390 | 83,131 | 3.32x |
+| 64 | 64x128 | 3 | 2 | 587,284 | 467,790 | 1.26x |
+| 96 | 15x23 | 3 | 1 | 50,146 | 29,460 | 1.70x |
+| 128 | 16x32 | 3 | 1 | 70,982 | 42,834 | 1.66x |
+| 192 | 15x23 | 3 | 1 | 98,042 | 57,356 | 1.71x |
+| 256 | 8x16 | 3 | 1 | 36,840 | 22,384 | 1.65x |
+| 512 | 4x8 | 3 | 1 | 19,816 | 12,260 | 1.62x |
+| 512 | 8x12 | 3 | 1 | 54,344 | 33,030 | 1.65x |
+| 576 | 15x23 | 3 | 2 | 67,369 | 41,958 | 1.61x |
+| 64 | 30x45 | 5 | 1 | 351,188 | 128,765 | 2.73x |
+| 128 | 8x12 | 5 | 1 | 26,902 | 19,904 | 1.35x |
+| 192 | 30x45 | 5 | 2 | 184,240 | 129,802 | 1.42x |
+| 384 | 8x12 | 5 | 1 | 75,895 | 54,835 | 1.38x |
+| 512 | 8x12 | 5 | 1 | 100,392 | 72,283 | 1.39x |
+| 64 | 32x64 | 7 | 1 | 814,158 | 299,435 | 2.72x |
+| 64 | 32x64 | 7 | 2 | 205,552 | 151,756 | 1.35x |
+| 128 | 16x32 | 7 | 1 | 205,550 | 151,764 | 1.35x |
+| 128 | 16x32 | 7 | 2 | 53,312 | 39,868 | 1.34x |
+| 256 | 8x16 | 7 | 1 | 104,207 | 77,307 | 1.35x |
+| 256 | 8x16 | 7 | 2 | 27,999 | 21,293 | 1.31x |
+| 512 | 4x8 | 7 | 1 | 53,585 | 40,121 | 1.34x |
+
+Updated projection (`project_latency.py --dw-kernel best`, the default now; 2 threads @ 1 GHz assumed):
+
+| model / config | dw Mcycles, round 1 → now | total Mcycles | projected ms |
+|---|---:|---:|---:|
+| driving W8A8 | 4.62 → 2.55 | 23.6 → 21.5 | 11.8 → 10.8 |
+| driving W8A16 | 9.24 → 5.10 | 39.5 → 35.3 | 19.7 → 17.7 |
+| driving W8 AdaRound + top-10 W16, A16 | 9.24 → 5.10 | 42.5 → 38.4 | 21.3 → 19.2 |
+| driving W16A16 | 9.24 → 5.10 | 66.8 → 62.7 | 33.4 → 31.3 |
+| DM W8A8 | 1.51 → 0.87 | 12.2 → 11.6 | 6.1 → 5.8 |
+| DM W8A16 | 3.02 → 1.75 | 21.7 → 20.5 | 10.9 → 10.2 |
+| DM W16A16 | 3.02 → 1.75 | 38.3 → 37.1 | 19.2 → 18.5 |
+
+Depthwise is now 12-14% of driving's cycles, and **pointwise is 64-75%**. `pw` sits at 40-64 MAC/cycle
+against a 2-`vrmpy`-per-packet ceiling of 256. So pointwise is where the next speedup is, especially
+for W16A16's 4-pass (estimated) pointwise.
+
 ## Going on device (plan)
 
 1. **Access.** comma devices run AGNOS (Linux, root).
@@ -316,7 +385,7 @@ data (comma-side only), or faster kernels, so that W16A16's 33 ms fits (§4, dep
 | `run_models.py` | fp16→fp32 conversion, sequential model runs with state feedback, openpilot-parser comparison |
 | `quantize.py` | onnxsim `quantize_full_qdq` with real-frame calibration, head-float and policy options |
 | `sweep_driving_groups.py`, `policy_driving_mixed.json` | per-window uint8 damage sweep and the resulting mixed policy |
-| `hvx65/kernels.c`, `build_sim.sh`, `run_sim.sh` | V65 HVX kernels + hexagon-sim harness |
+| `hvx65/kernels.c`, `build_sim.sh`, `run_sim.sh` | V65 HVX kernels + hexagon-sim harness (`dw3`/`dwc3`: §7's depthwise kernels; `dwc2`/`dwc4`: the variants that didn't pay off; `warm` runs a kernel once untimed first) |
 | `project_latency.py`, `sim_cycles_cache.json`, `results/` | per-layer sim runs → model latency projection |
 | `tinygrad_dsp_check.py` | upstream tinygrad `DEV=DSP MOCKDSP=1` vs ORT on real DM frames |
 | `evaluate.py` | held-out-segment scoring vs fp32 through openpilot's parser (driving + DM) |

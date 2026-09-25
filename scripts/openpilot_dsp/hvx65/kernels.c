@@ -18,6 +18,10 @@
  * Usage: kernels <op> <args...> [check]
  *   pw   P K N (8 output channels per pass when N % 8 == 0; "pw4" forces the 4-channel kernel)
  *   pw16 P K N    dw C H W k s (planar)    dwc C H W k s (channels-last)    gelu n
+ *   dw3 C H W s           (3x3 only: weights in registers, sliding input window)
+ *   dwc4 C H W k s        (channels-last, vrmpy over taps, taps shuffled once per input row)
+ *   dwc3 C H W k s [pix]  (channels-last, vrmpy over 4 taps; pix = 1|2)
+ *   dwc2 C H W k s [pix]  (channels-last, per-layer shift, narrowing requant; pix = 2|4 per iteration)
  * Prints cycles (upcycle counter around the timed call) and, with "check", compares against a scalar
  * C reference of the same fixed-point spec (bit exact expected).
  */
@@ -337,6 +341,364 @@ __attribute__((noinline)) void dwc_u8(const dwc_args *a) {
   }
 }
 
+/* ---- depthwise v2: the MAC loop of dwc_u8, with a requantization that costs ~12 instead of ~45 ops
+ * per 128 outputs. Spec change (the quantizer can always produce it): per-channel Q31 multipliers but
+ * one right shift per layer, so the shift + round + saturate is the narrowing
+ * vasr(Vu.w, Vv.w, Rt):rnd:sat (two word vectors -> one halfword vector), then + zp and a saturating
+ * narrow to bytes. The even/odd split of vzxt x vmpy (e.lo = ch 4i, o.lo = 4i+1, e.hi = 4i+2,
+ * o.hi = 4i+3) is undone by the two narrowing steps' own interleave, so bytes come out in channel
+ * order with no shuffle. out = clamp(sat16(rnd(q31(acc, M_c) >> s)) + zp, 0, 255). */
+typedef struct {
+  int C, Hp, Wp, k, s, Ho, Wo;
+  const uint8_t *in;
+  const V *w16, *M, *B; /* as dwc_args */
+  int shift, zp_out;
+  uint8_t *out;
+  int pix; /* output pixels per inner iteration: 2 or 4 */
+} dwc2_args;
+
+static inline V narrow_requant(HVX_VectorPair e, HVX_VectorPair o, const V *M, int shift, V zp) {
+  V q0 = q31_mul(Q6_V_lo_W(e), M[0]), q1 = q31_mul(Q6_V_lo_W(o), M[1]);
+  V q2 = q31_mul(Q6_V_hi_W(e), M[2]), q3 = q31_mul(Q6_V_hi_W(o), M[3]);
+  V a = Q6_Vh_vadd_VhVh_sat(Q6_Vh_vasr_VwVwR_rnd_sat(q2, q0, shift), zp); /* h: 4i, 4i+2 */
+  V b = Q6_Vh_vadd_VhVh_sat(Q6_Vh_vasr_VwVwR_rnd_sat(q3, q1, shift), zp); /* h: 4i+1, 4i+3 */
+  return Q6_Vub_vasr_VhVhR_sat(b, a, 0);
+}
+
+__attribute__((noinline)) void dwc2_u8(const dwc2_args *a) {
+  const int k = a->k, kk = k * k, Cv = a->C / 128;
+  const size_t rowb = (size_t)a->Wp * a->C, colb = (size_t)a->s * a->C;
+  const V zp = Q6_Vh_vsplat_R(a->zp_out);
+  for (int cv = 0; cv < Cv; cv++) {
+    const V *w = a->w16 + (size_t)cv * kk * 2;
+    const V *M = a->M + cv * 4, *B = a->B + cv * 4;
+    const HVX_VectorPair be = Q6_W_vcombine_VV(B[2], B[0]), bo = Q6_W_vcombine_VV(B[3], B[1]);
+    for (int y = 0; y < a->Ho; y++) {
+      const uint8_t *row = a->in + (size_t)(y * a->s) * rowb + cv * 128;
+      uint8_t *orow = a->out + (size_t)y * a->Wo * a->C + cv * 128;
+      int x = 0;
+      if (a->pix == 4) {
+        for (; x + 4 <= a->Wo; x += 4) {
+          HVX_VectorPair e0 = be, o0 = bo, e1 = be, o1 = bo, e2 = be, o2 = bo, e3 = be, o3 = bo;
+          const uint8_t *p = row + (size_t)x * colb;
+          for (int dy = 0; dy < k; dy++) {
+            const uint8_t *pr = p + (size_t)dy * rowb;
+            const V *wr = w + 2 * dy * k;
+            for (int dx = 0; dx < k; dx++) {
+              V we = wr[2 * dx], wo = wr[2 * dx + 1];
+              const uint8_t *pt = pr + (size_t)dx * a->C;
+              HVX_VectorPair x0 = Q6_Wuh_vzxt_Vub(*(const V *)pt);
+              HVX_VectorPair x1 = Q6_Wuh_vzxt_Vub(*(const V *)(pt + colb));
+              HVX_VectorPair x2 = Q6_Wuh_vzxt_Vub(*(const V *)(pt + 2 * colb));
+              HVX_VectorPair x3 = Q6_Wuh_vzxt_Vub(*(const V *)(pt + 3 * colb));
+              e0 = Q6_Ww_vmpyacc_WwVhVh(e0, Q6_V_lo_W(x0), we);
+              o0 = Q6_Ww_vmpyacc_WwVhVh(o0, Q6_V_hi_W(x0), wo);
+              e1 = Q6_Ww_vmpyacc_WwVhVh(e1, Q6_V_lo_W(x1), we);
+              o1 = Q6_Ww_vmpyacc_WwVhVh(o1, Q6_V_hi_W(x1), wo);
+              e2 = Q6_Ww_vmpyacc_WwVhVh(e2, Q6_V_lo_W(x2), we);
+              o2 = Q6_Ww_vmpyacc_WwVhVh(o2, Q6_V_hi_W(x2), wo);
+              e3 = Q6_Ww_vmpyacc_WwVhVh(e3, Q6_V_lo_W(x3), we);
+              o3 = Q6_Ww_vmpyacc_WwVhVh(o3, Q6_V_hi_W(x3), wo);
+            }
+          }
+          V *o = (V *)(orow + (size_t)x * a->C);
+          o[0] = narrow_requant(e0, o0, M, a->shift, zp);
+          o[Cv] = narrow_requant(e1, o1, M, a->shift, zp);
+          o[2 * Cv] = narrow_requant(e2, o2, M, a->shift, zp);
+          o[3 * Cv] = narrow_requant(e3, o3, M, a->shift, zp);
+        }
+      }
+      for (; x < a->Wo; x++) {
+        HVX_VectorPair e0 = be, o0 = bo;
+        const uint8_t *p = row + (size_t)x * colb;
+        for (int dy = 0; dy < k; dy++)
+          for (int dx = 0; dx < k; dx++) {
+            HVX_VectorPair x0 = Q6_Wuh_vzxt_Vub(*(const V *)(p + (size_t)dy * rowb + (size_t)dx * a->C));
+            e0 = Q6_Ww_vmpyacc_WwVhVh(e0, Q6_V_lo_W(x0), w[2 * (dy * k + dx)]);
+            o0 = Q6_Ww_vmpyacc_WwVhVh(o0, Q6_V_hi_W(x0), w[2 * (dy * k + dx) + 1]);
+          }
+        *(V *)(orow + (size_t)x * a->C) = narrow_requant(e0, o0, M, a->shift, zp);
+      }
+    }
+  }
+}
+
+/* ---- depthwise v3: vrmpy over the kernel taps (u8 x s8 -> s32, 4 taps per word, no widening) ----
+ * dwc/dwc2 widen pixels to 16 bits and use vmpy(Vh, Vh), a double-resource instruction: at most 64 MACs
+ * per packet, and the compiler reaches a fraction of that. Here the taps become vrmpy's 4-way reduction:
+ * for each group of 4 taps (the k*k taps flattened, the last group zero-padded), the 4 input vectors
+ * (128 channels each) are byte- then halfword-shuffled so word i of vector g holds channel 32g+i's four
+ * tap pixels, and vrmpy(Vu.ub, Vv.b) against the same-shuffled weights (prepared offline) accumulates
+ * 32 channels x 4 taps. vrmpy (vector x vector) is a single-resource instruction, so 2 issue per packet.
+ * Requantization: per-channel Q31 multiplier, one shift per layer (as dwc2); the two narrowing steps
+ * leave byte 4i+j = channel 32j+i, which two vdeal.b undo. */
+typedef struct {
+  int C, Hp, Wp, k, s, Ho, Wo;
+  const uint8_t *in;      /* [Hp][Wp][C] */
+  const V *w4;            /* [C/128][groups][4] shuffled int8 weights */
+  const V *M, *B;         /* [C/128][4] natural channel order (vector g = channels 32g..32g+31) */
+  const int32_t *tap_off; /* [groups*4] byte offsets of each tap from the output pixel's window origin */
+  int groups, shift, zp_out;
+  uint8_t *out;
+  int pix;  /* 1 or 2 output pixels per iteration */
+  int c64;  /* C = 64, stride 1: 2 pixels per vector (lane b = channel b % 64), unaligned tap loads */
+} dwc3_args;
+
+static inline void shuf4(V t0, V t1, V t2, V t3, V *x) {
+  HVX_VectorPair s01 = Q6_W_vshuff_VVR(t1, t0, -1), s23 = Q6_W_vshuff_VVR(t3, t2, -1);
+  HVX_VectorPair lo = Q6_W_vshuff_VVR(Q6_V_lo_W(s23), Q6_V_lo_W(s01), -2);
+  HVX_VectorPair hi = Q6_W_vshuff_VVR(Q6_V_hi_W(s23), Q6_V_hi_W(s01), -2);
+  x[0] = Q6_V_lo_W(lo), x[1] = Q6_V_hi_W(lo), x[2] = Q6_V_lo_W(hi), x[3] = Q6_V_hi_W(hi);
+}
+
+static inline V requant4(V a0, V a1, V a2, V a3, const V *M, int shift, V zp) {
+  V q0 = q31_mul(a0, M[0]), q1 = q31_mul(a1, M[1]), q2 = q31_mul(a2, M[2]), q3 = q31_mul(a3, M[3]);
+  V a = Q6_Vh_vadd_VhVh_sat(Q6_Vh_vasr_VwVwR_rnd_sat(q2, q0, shift), zp);
+  V b = Q6_Vh_vadd_VhVh_sat(Q6_Vh_vasr_VwVwR_rnd_sat(q3, q1, shift), zp);
+  V u = Q6_Vub_vasr_VhVhR_sat(b, a, 0); /* byte 4i+j = channel 32j+i */
+  return Q6_Vb_vdeal_Vb(Q6_Vb_vdeal_Vb(u));
+}
+
+static inline __attribute__((always_inline)) void dwc3_body(const dwc3_args *a, const int c64) {
+  const int Cv = c64 ? 1 : a->C / 128, G = a->groups, pixb = c64 ? 64 : a->C;
+  const size_t rowb = (size_t)a->Wp * pixb, colb = (size_t)a->s * pixb;
+  const int step = c64 ? 2 : 1; /* output pixels per vector */
+  const V zp = Q6_Vh_vsplat_R(a->zp_out);
+#define LD(p) (c64 ? *(const HVX_UVector *)(p) : *(const V *)(p))
+  for (int cv = 0; cv < Cv; cv++) {
+    const V *w = a->w4 + (size_t)cv * G * 4;
+    const V *M = a->M + cv * 4, *B = a->B + cv * 4;
+    for (int y = 0; y < a->Ho; y++) {
+      const uint8_t *row = a->in + (size_t)(y * a->s) * rowb + cv * 128;
+      uint8_t *orow = a->out + (size_t)y * a->Wo * pixb + cv * 128;
+      int x = 0;
+      if (a->pix == 2) {
+        for (; x + 2 * step <= a->Wo; x += 2 * step) {
+          const uint8_t *p0 = row + (size_t)x * colb, *p1 = p0 + step * colb;
+          V a0 = B[0], a1 = B[1], a2 = B[2], a3 = B[3], b0 = B[0], b1 = B[1], b2 = B[2], b3 = B[3];
+          for (int g = 0; g < G; g++) {
+            const int32_t *o = a->tap_off + 4 * g;
+            const V *wg = w + 4 * g;
+            V xa[4], xb[4];
+            shuf4(LD(p0 + o[0]), LD(p0 + o[1]), LD(p0 + o[2]), LD(p0 + o[3]), xa);
+            shuf4(LD(p1 + o[0]), LD(p1 + o[1]), LD(p1 + o[2]), LD(p1 + o[3]), xb);
+            V w0 = wg[0], w1 = wg[1], w2 = wg[2], w3 = wg[3];
+            a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, xa[0], w0);
+            a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, xa[1], w1);
+            a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, xa[2], w2);
+            a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, xa[3], w3);
+            b0 = Q6_Vw_vrmpyacc_VwVubVb(b0, xb[0], w0);
+            b1 = Q6_Vw_vrmpyacc_VwVubVb(b1, xb[1], w1);
+            b2 = Q6_Vw_vrmpyacc_VwVubVb(b2, xb[2], w2);
+            b3 = Q6_Vw_vrmpyacc_VwVubVb(b3, xb[3], w3);
+          }
+          *(V *)(orow + (size_t)x * pixb) = requant4(a0, a1, a2, a3, M, a->shift, zp);
+          *(V *)(orow + (size_t)(x + step) * pixb) = requant4(b0, b1, b2, b3, M, a->shift, zp);
+        }
+      }
+      for (; x < a->Wo; x += step) {
+        const uint8_t *p0 = row + (size_t)x * colb;
+        V a0 = B[0], a1 = B[1], a2 = B[2], a3 = B[3];
+        for (int g = 0; g < G; g++) {
+          const int32_t *o = a->tap_off + 4 * g;
+          const V *wg = w + 4 * g;
+          V xa[4];
+          shuf4(LD(p0 + o[0]), LD(p0 + o[1]), LD(p0 + o[2]), LD(p0 + o[3]), xa);
+          a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, xa[0], wg[0]);
+          a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, xa[1], wg[1]);
+          a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, xa[2], wg[2]);
+          a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, xa[3], wg[3]);
+        }
+        *(HVX_UVector *)(orow + (size_t)x * pixb) = requant4(a0, a1, a2, a3, M, a->shift, zp);
+      }
+    }
+  }
+#undef LD
+}
+
+__attribute__((noinline)) void dwc3_u8(const dwc3_args *a) {
+  if (a->c64)
+    dwc3_body(a, 1);
+  else
+    dwc3_body(a, 0);
+}
+
+/* ---- depthwise v4: dwc3's vrmpy-over-taps, with the tap shuffle done once per input row ----
+ * dwc3 re-shuffles every tap window for every output pixel and reloads 4 input vectors per 4 taps per
+ * pixel: with one vector load per packet, loads bound it. Here each input row r is transformed once into
+ * Q_r(p) = shuf4(in[r][p], in[r][p+1], in[r][p+2], in[r][p+3]) (4 vectors: word i of vector v = channel
+ * 32v+i's pixels p..p+3) in a ring buffer of k+s rows; an output pixel then needs, per kernel row dy and
+ * per group of 4 horizontal taps, 4 loads of Q and 4 vrmpy. The shuffle is amortized over the k output
+ * rows that read each input row (stride 1). Requantization as dwc3. */
+typedef struct {
+  int C, Hp, Wp, k, s, Ho, Wo;
+  const uint8_t *in; /* [Hp][Wp][C], Wp >= (Wo-1)*s + 4*gx + 4 */
+  const V *w4;       /* [C/128][k][gx][4]: row dy, horizontal group g, shuffled like Q */
+  const V *M, *B;
+  int shift, zp_out;
+  uint8_t *out;
+  V *ring; /* scratch: (k + s) * Wq * 4 vectors, Wq = Wp - 3 */
+} dwc4_args;
+
+__attribute__((noinline)) void dwc4_u8(const dwc4_args *a) {
+  const int k = a->k, s = a->s, gx = (k + 3) / 4, Cv = a->C / 128, R = k + s, Wq = a->Wp - 3;
+  const V zp = Q6_Vh_vsplat_R(a->zp_out);
+  for (int cv = 0; cv < Cv; cv++) {
+    const V *w = a->w4 + (size_t)cv * k * gx * 4;
+    const V *M = a->M + cv * 4, *B = a->B + cv * 4;
+    int built = 0; /* rows [0, built) have been transformed */
+    for (int y = 0; y < a->Ho; y++) {
+      for (; built < y * s + k; built++) {
+        const uint8_t *row = a->in + (size_t)built * a->Wp * a->C + cv * 128;
+        V *q = a->ring + (size_t)(built % R) * Wq * 4;
+        for (int p = 0; p < Wq; p += (s == 2 ? 2 : 1)) {
+          const uint8_t *pp = row + (size_t)p * a->C;
+          shuf4(*(const V *)pp, *(const V *)(pp + a->C), *(const V *)(pp + 2 * a->C), *(const V *)(pp + 3 * a->C), q + 4 * p);
+        }
+      }
+      uint8_t *orow = a->out + (size_t)y * a->Wo * a->C + cv * 128;
+      int x = 0;
+      for (; x + 2 <= a->Wo; x += 2) {
+        V a0 = B[0], a1 = B[1], a2 = B[2], a3 = B[3], b0 = B[0], b1 = B[1], b2 = B[2], b3 = B[3];
+        for (int dy = 0; dy < k; dy++) {
+          const V *q = a->ring + (size_t)((y * s + dy) % R) * Wq * 4;
+          for (int g = 0; g < gx; g++) {
+            const V *wg = w + ((size_t)dy * gx + g) * 4;
+            const V *qa = q + 4 * (x * s + 4 * g), *qb = qa + 4 * s;
+            V w0 = wg[0], w1 = wg[1], w2 = wg[2], w3 = wg[3];
+            a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, qa[0], w0);
+            a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, qa[1], w1);
+            a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, qa[2], w2);
+            a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, qa[3], w3);
+            b0 = Q6_Vw_vrmpyacc_VwVubVb(b0, qb[0], w0);
+            b1 = Q6_Vw_vrmpyacc_VwVubVb(b1, qb[1], w1);
+            b2 = Q6_Vw_vrmpyacc_VwVubVb(b2, qb[2], w2);
+            b3 = Q6_Vw_vrmpyacc_VwVubVb(b3, qb[3], w3);
+          }
+        }
+        *(V *)(orow + (size_t)x * a->C) = requant4(a0, a1, a2, a3, M, a->shift, zp);
+        *(V *)(orow + (size_t)(x + 1) * a->C) = requant4(b0, b1, b2, b3, M, a->shift, zp);
+      }
+      for (; x < a->Wo; x++) {
+        V a0 = B[0], a1 = B[1], a2 = B[2], a3 = B[3];
+        for (int dy = 0; dy < k; dy++) {
+          const V *q = a->ring + (size_t)((y * s + dy) % R) * Wq * 4;
+          for (int g = 0; g < gx; g++) {
+            const V *wg = w + ((size_t)dy * gx + g) * 4, *qa = q + 4 * (x * s + 4 * g);
+            a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, qa[0], wg[0]);
+            a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, qa[1], wg[1]);
+            a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, qa[2], wg[2]);
+            a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, qa[3], wg[3]);
+          }
+        }
+        *(V *)(orow + (size_t)x * a->C) = requant4(a0, a1, a2, a3, M, a->shift, zp);
+      }
+    }
+  }
+}
+
+/* ---- depthwise 3x3 v5: dwc3's vrmpy-over-taps with everything the sim says is expensive removed ----
+ * hexagon-sim sustains ~1 HVX vector load per 2 cycles from L2 (measured: 2.0-2.2 cycles/vector,
+ * 16 KB-1 MB), so the kernel is load-bound, not multiply-bound. For k = 3 the 12 weight vectors (3 rows
+ * x 4 shuffled vectors) stay in registers for a whole output row, and a 3x3 input window slides along x:
+ * stride 1 loads 3 new vectors per output pixel (1 per kernel row), stride 2 loads 6. Each kernel row is
+ * one shuf4 (taps dx = 0, 1, 2 and a dummy 4th with zero weight) and 4 vrmpy. */
+typedef struct {
+  int C, Hp, Wp, s, Ho, Wo;
+  const uint8_t *in; /* [Hp][Wp][C], pre-padded */
+  const V *w4;       /* [C/128][3][4]: kernel row dy, shuffled like shuf4 (4th tap 0) */
+  const V *M, *B;
+  int shift, zp_out;
+  uint8_t *out;
+} dw3_args;
+
+/* C = 64, stride 1: a vector holds 2 pixels x 64 channels (channels-last memory as is), so no lane is
+ * padding. Output pixels 2x, 2x+1 need input vectors starting at pixels 2x, 2x+1, 2x+2 per kernel row:
+ * the aligned V(2x), V(2x+2) and V(2x+1) = valign(V(2x+2), V(2x), 64). Weights/M/B vectors hold each
+ * channel's value in both 64-byte halves (lane b = channel b % 64). */
+__attribute__((noinline)) void dw3_c64_u8(const dw3_args *a) {
+  const size_t rowb = (size_t)a->Wp * 64;
+  const V *w = a->w4;
+  const V w00 = w[0], w01 = w[1], w02 = w[2], w03 = w[3], w10 = w[4], w11 = w[5], w12 = w[6], w13 = w[7];
+  const V w20 = w[8], w21 = w[9], w22 = w[10], w23 = w[11];
+  const V zp = Q6_Vh_vsplat_R(a->zp_out);
+  for (int y = 0; y < a->Ho; y++) {
+    const uint8_t *r0 = a->in + (size_t)y * rowb, *r1 = r0 + rowb, *r2 = r1 + rowb;
+    uint8_t *orow = a->out + (size_t)y * a->Wo * 64;
+    V p0 = *(const V *)r0, p1 = *(const V *)r1, p2 = *(const V *)r2;
+    for (int x = 0; x < a->Wo; x += 2) {
+      const size_t o = (size_t)(x + 2) * 64;
+      V n0 = *(const V *)(r0 + o), n1 = *(const V *)(r1 + o), n2 = *(const V *)(r2 + o);
+      V a0 = a->B[0], a1 = a->B[1], a2 = a->B[2], a3 = a->B[3], t[4];
+      shuf4(p0, Q6_V_valign_VVR(n0, p0, 64), n0, n0, t);
+      a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w00);
+      a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w01);
+      a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w02);
+      a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w03);
+      shuf4(p1, Q6_V_valign_VVR(n1, p1, 64), n1, n1, t);
+      a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w10);
+      a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w11);
+      a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w12);
+      a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w13);
+      shuf4(p2, Q6_V_valign_VVR(n2, p2, 64), n2, n2, t);
+      a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w20);
+      a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w21);
+      a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w22);
+      a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w23);
+      *(V *)(orow + (size_t)x * 64) = requant4(a0, a1, a2, a3, a->M, a->shift, zp);
+      p0 = n0, p1 = n1, p2 = n2;
+    }
+  }
+}
+
+__attribute__((noinline)) void dw3_u8(const dw3_args *a) {
+  const int Cv = a->C / 128, s = a->s;
+  const size_t rowb = (size_t)a->Wp * a->C, C = a->C;
+  const V zp = Q6_Vh_vsplat_R(a->zp_out);
+  for (int cv = 0; cv < Cv; cv++) {
+    const V *w = a->w4 + (size_t)cv * 12;
+    const V w00 = w[0], w01 = w[1], w02 = w[2], w03 = w[3], w10 = w[4], w11 = w[5], w12 = w[6], w13 = w[7];
+    const V w20 = w[8], w21 = w[9], w22 = w[10], w23 = w[11];
+    const V *M = a->M + cv * 4, *B = a->B + cv * 4;
+    for (int y = 0; y < a->Ho; y++) {
+      const uint8_t *r0 = a->in + (size_t)(y * s) * rowb + cv * 128, *r1 = r0 + rowb, *r2 = r1 + rowb;
+      uint8_t *orow = a->out + (size_t)y * a->Wo * C + cv * 128;
+      /* window columns 0, 1 of each row (column 2 is loaded per pixel) */
+      V p00 = *(const V *)r0, p01 = *(const V *)(r0 + C);
+      V p10 = *(const V *)r1, p11 = *(const V *)(r1 + C);
+      V p20 = *(const V *)r2, p21 = *(const V *)(r2 + C);
+      for (int x = 0; x < a->Wo; x++) {
+        const size_t o = (size_t)(x * s + 2) * C;
+        V p02 = *(const V *)(r0 + o), p12 = *(const V *)(r1 + o), p22 = *(const V *)(r2 + o);
+        V a0 = B[0], a1 = B[1], a2 = B[2], a3 = B[3], t[4];
+        shuf4(p00, p01, p02, p02, t);
+        a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w00);
+        a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w01);
+        a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w02);
+        a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w03);
+        shuf4(p10, p11, p12, p12, t);
+        a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w10);
+        a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w11);
+        a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w12);
+        a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w13);
+        shuf4(p20, p21, p22, p22, t);
+        a0 = Q6_Vw_vrmpyacc_VwVubVb(a0, t[0], w20);
+        a1 = Q6_Vw_vrmpyacc_VwVubVb(a1, t[1], w21);
+        a2 = Q6_Vw_vrmpyacc_VwVubVb(a2, t[2], w22);
+        a3 = Q6_Vw_vrmpyacc_VwVubVb(a3, t[3], w23);
+        *(V *)(orow + (size_t)x * C) = requant4(a0, a1, a2, a3, M, a->shift, zp);
+        if (s == 1) {
+          p00 = p01, p01 = p02, p10 = p11, p11 = p12, p20 = p21, p21 = p22;
+        } else {
+          const size_t n = (size_t)(x * s + 3) * C;
+          p00 = p02, p01 = *(const V *)(r0 + n), p10 = p12, p11 = *(const V *)(r1 + n), p20 = p22,
+          p21 = *(const V *)(r2 + n);
+        }
+      }
+    }
+  }
+}
+
 /* ---- GELU (or any u8 -> u8 map) by table: 8 x vlut32 over the 256-entry table ---- */
 __attribute__((noinline)) void lut_u8(const uint8_t *in, uint8_t *out, int n, const V *tbl /* 8 vectors */) {
   for (int i = 0; i < n; i += 128) {
@@ -357,6 +719,7 @@ static void rand_requant(int N, int32_t *mult, int8_t *shift, int32_t *bias, int
 }
 
 static int getenv_n4 = 0;
+static int warm = 0; /* "warm" as the last-but-check argument: run once untimed first (caches hot) */
 static int run_pw(int P, int K, int N, int check, int u16) {
   size_t asz = (size_t)P * K, osz = (size_t)P * N;
   uint8_t *act = amalloc(asz), *act_hi = u16 ? amalloc(asz) : NULL;
@@ -546,10 +909,237 @@ static int run_dwc(int C0, int H, int W, int k, int s, int check) {
   return bad;
 }
 
+static int run_dwc2(int C0, int H, int W, int k, int s, int pix, int check) {
+  int C = (C0 + 127) / 128 * 128, pad = k / 2;
+  int Ho = (H + 2 * pad - k) / s + 1, Wo = (W + 2 * pad - k) / s + 1;
+  int Hp = H + 2 * pad + s, Wp = W + 2 * pad + 4 * s;
+  uint8_t *in = amalloc((size_t)Hp * Wp * C), *out = amalloc((size_t)Ho * Wo * C);
+  int8_t *w = amalloc(C * k * k);
+  int32_t *bias = amalloc(4 * C), *mult = amalloc(4 * C);
+  int8_t *dummy = amalloc(C);
+  V *w16 = amalloc((size_t)C / 128 * k * k * 2 * VLEN), *M = amalloc(C / 128 * 4 * VLEN), *B = amalloc(C / 128 * 4 * VLEN);
+  for (size_t i = 0; i < (size_t)Hp * Wp * C; i++) in[i] = rnd();
+  for (int i = 0; i < C * k * k; i++) w[i] = (int8_t)(rnd() % 255 - 127);
+  rand_requant(C, mult, dummy, bias, 20000);
+  int shift = 9 + rnd() % 4;
+  for (int cv = 0; cv < C / 128; cv++) {
+    for (int t = 0; t < k * k; t++) {
+      int16_t *we = (int16_t *)&w16[((size_t)cv * k * k + t) * 2], *wo = we + 64;
+      for (int i = 0; i < 64; i++) {
+        we[i] = w[(cv * 128 + 2 * i) * k * k + t];
+        wo[i] = w[(cv * 128 + 2 * i + 1) * k * k + t];
+      }
+    }
+    for (int j = 0; j < 4; j++)
+      for (int i = 0; i < 32; i++) {
+        int c = cv * 128 + 4 * i + j;
+        ((int32_t *)&M[cv * 4 + j])[i] = mult[c];
+        ((int32_t *)&B[cv * 4 + j])[i] = bias[c];
+      }
+  }
+  dwc2_args a = {C, Hp, Wp, k, s, Ho, Wo, in, w16, M, B, shift, 5, out, pix};
+  uint64_t t0 = cycles();
+  dwc2_u8(&a);
+  uint64_t t1 = cycles();
+  printf("dwc2 C=%d(%d) H=%d W=%d k=%d s=%d pix=%d cycles=%llu macs_per_cycle=%.1f (useful channels)\n", C0, C, H, W, k, s, pix,
+         (unsigned long long)(t1 - t0), (double)C0 * Ho * Wo * k * k / (double)(t1 - t0));
+  if (!check) return 0;
+  int bad = 0;
+  for (int y = 0; y < Ho && bad < 5; y++)
+    for (int x = 0; x < Wo && bad < 5; x++)
+      for (int c = 0; c < C && bad < 5; c += 3) {
+        int32_t acc = bias[c];
+        for (int dy = 0; dy < k; dy++)
+          for (int dx = 0; dx < k; dx++) acc += in[((size_t)(y * s + dy) * Wp + x * s + dx) * C + c] * w[c * k * k + dy * k + dx];
+        int ref = clampi(clampi(rshift_rnd_ref(q31_mul_ref(acc, mult[c]), shift), -32768, 32767) + 5, 0, 255);
+        int got = out[((size_t)y * Wo + x) * C + c];
+        if (ref != got) {
+          printf("  MISMATCH y=%d x=%d c=%d ref=%d got=%d\n", y, x, c, ref, got);
+          bad++;
+        }
+      }
+  printf("  check %s\n", bad ? "FAIL" : "PASS");
+  return bad;
+}
+
+static int run_dwc3(int C0, int H, int W, int k, int s, int pix, int check) {
+  int c64 = C0 == 64 && s == 1;
+  int C = c64 ? 64 : (C0 + 127) / 128 * 128, pad = k / 2, kk = k * k, G = (kk + 3) / 4;
+  int Ho = (H + 2 * pad - k) / s + 1, Wo = (W + 2 * pad - k) / s + 1;
+  int Hp = H + 2 * pad + s, Wp = W + 2 * pad + 2 * s + 2;
+  int Cb = c64 ? 128 : C; /* channel lanes per vector block */
+  uint8_t *in = amalloc((size_t)Hp * Wp * C), *out = amalloc((size_t)(Ho * Wo + 2) * C);
+  int8_t *w = amalloc(C * kk), *dummy = amalloc(C);
+  int32_t *bias = amalloc(4 * C), *mult = amalloc(4 * C), *off = amalloc(4 * G * 4);
+  V *w4 = amalloc((size_t)Cb / 128 * G * 4 * VLEN), *M = amalloc(Cb / 128 * 4 * VLEN), *B = amalloc(Cb / 128 * 4 * VLEN);
+  for (size_t i = 0; i < (size_t)Hp * Wp * C; i++) in[i] = rnd();
+  for (int i = 0; i < C * kk; i++) w[i] = (int8_t)(rnd() % 255 - 127);
+  rand_requant(C, mult, dummy, bias, 20000);
+  int shift = 9 + rnd() % 4;
+  for (int t = 0; t < 4 * G; t++) off[t] = t < kk ? ((t / k) * Wp + t % k) * C : 0;
+  for (int cv = 0; cv < Cb / 128; cv++) {
+    for (int g = 0; g < G; g++)
+      for (int v = 0; v < 4; v++) {
+        int8_t *wb = (int8_t *)&w4[((size_t)cv * G + g) * 4 + v];
+        for (int i = 0; i < 32; i++)
+          for (int j = 0; j < 4; j++) {
+            int t = 4 * g + j, c = (cv * 128 + 32 * v + i) % C;
+            wb[4 * i + j] = t < kk ? w[c * kk + t] : 0;
+          }
+      }
+    for (int v = 0; v < 4; v++)
+      for (int i = 0; i < 32; i++) {
+        ((int32_t *)&M[cv * 4 + v])[i] = mult[(cv * 128 + 32 * v + i) % C];
+        ((int32_t *)&B[cv * 4 + v])[i] = bias[(cv * 128 + 32 * v + i) % C];
+      }
+  }
+  dwc3_args a = {C, Hp, Wp, k, s, Ho, Wo, in, w4, M, B, off, G, shift, 5, out, pix, c64};
+  if (warm) dwc3_u8(&a);
+  uint64_t t0 = cycles();
+  dwc3_u8(&a);
+  uint64_t t1 = cycles();
+  printf("dwc3 C=%d(%d) H=%d W=%d k=%d s=%d pix=%d cycles=%llu macs_per_cycle=%.1f (useful channels)\n", C0, C, H, W, k, s, pix,
+         (unsigned long long)(t1 - t0), (double)C0 * Ho * Wo * kk / (double)(t1 - t0));
+  if (!check) return 0;
+  int bad = 0;
+  for (int y = 0; y < Ho && bad < 5; y++)
+    for (int x = 0; x < Wo && bad < 5; x++)
+      for (int c = 0; c < C && bad < 5; c += 3) {
+        int32_t acc = bias[c];
+        for (int dy = 0; dy < k; dy++)
+          for (int dx = 0; dx < k; dx++) acc += in[((size_t)(y * s + dy) * Wp + x * s + dx) * C + c] * w[c * kk + dy * k + dx];
+        int ref = clampi(clampi(rshift_rnd_ref(q31_mul_ref(acc, mult[c]), shift), -32768, 32767) + 5, 0, 255);
+        int got = out[((size_t)y * Wo + x) * C + c];
+        if (ref != got) {
+          printf("  MISMATCH y=%d x=%d c=%d ref=%d got=%d\n", y, x, c, ref, got);
+          bad++;
+        }
+      }
+  printf("  check %s\n", bad ? "FAIL" : "PASS");
+  return bad;
+}
+
+static int run_dwc4(int C0, int H, int W, int k, int s, int check) {
+  int C = (C0 + 127) / 128 * 128, pad = k / 2, kk = k * k, gx = (k + 3) / 4;
+  int Ho = (H + 2 * pad - k) / s + 1, Wo = (W + 2 * pad - k) / s + 1;
+  int Hp = H + 2 * pad + s, Wp = (Wo - 1) * s + 4 * gx + 4 + s;
+  uint8_t *in = amalloc((size_t)Hp * Wp * C), *out = amalloc((size_t)Ho * Wo * C);
+  int8_t *w = amalloc(C * kk), *dummy = amalloc(C);
+  int32_t *bias = amalloc(4 * C), *mult = amalloc(4 * C);
+  V *w4 = amalloc((size_t)C / 128 * k * gx * 4 * VLEN), *M = amalloc(C / 128 * 4 * VLEN), *B = amalloc(C / 128 * 4 * VLEN);
+  V *ring = amalloc((size_t)(k + s) * (Wp - 3) * 4 * VLEN);
+  for (size_t i = 0; i < (size_t)Hp * Wp * C; i++) in[i] = rnd();
+  for (int i = 0; i < C * kk; i++) w[i] = (int8_t)(rnd() % 255 - 127);
+  rand_requant(C, mult, dummy, bias, 20000);
+  int shift = 9 + rnd() % 4;
+  for (int cv = 0; cv < C / 128; cv++) {
+    for (int dy = 0; dy < k; dy++)
+      for (int g = 0; g < gx; g++)
+        for (int v = 0; v < 4; v++) {
+          int8_t *wb = (int8_t *)&w4[(((size_t)cv * k + dy) * gx + g) * 4 + v];
+          for (int i = 0; i < 32; i++)
+            for (int j = 0; j < 4; j++) {
+              int dx = 4 * g + j, c = cv * 128 + 32 * v + i;
+              wb[4 * i + j] = dx < k ? w[c * kk + dy * k + dx] : 0;
+            }
+        }
+    for (int v = 0; v < 4; v++)
+      for (int i = 0; i < 32; i++) {
+        ((int32_t *)&M[cv * 4 + v])[i] = mult[cv * 128 + 32 * v + i];
+        ((int32_t *)&B[cv * 4 + v])[i] = bias[cv * 128 + 32 * v + i];
+      }
+  }
+  dwc4_args a = {C, Hp, Wp, k, s, Ho, Wo, in, w4, M, B, shift, 5, out, ring};
+  if (warm) dwc4_u8(&a);
+  uint64_t t0 = cycles();
+  dwc4_u8(&a);
+  uint64_t t1 = cycles();
+  printf("dwc4 C=%d(%d) H=%d W=%d k=%d s=%d cycles=%llu macs_per_cycle=%.1f (useful channels)\n", C0, C, H, W, k, s,
+         (unsigned long long)(t1 - t0), (double)C0 * Ho * Wo * kk / (double)(t1 - t0));
+  if (!check) return 0;
+  int bad = 0;
+  for (int y = 0; y < Ho && bad < 5; y++)
+    for (int x = 0; x < Wo && bad < 5; x++)
+      for (int c = 0; c < C && bad < 5; c += 3) {
+        int32_t acc = bias[c];
+        for (int dy = 0; dy < k; dy++)
+          for (int dx = 0; dx < k; dx++) acc += in[((size_t)(y * s + dy) * Wp + x * s + dx) * C + c] * w[c * kk + dy * k + dx];
+        int ref = clampi(clampi(rshift_rnd_ref(q31_mul_ref(acc, mult[c]), shift), -32768, 32767) + 5, 0, 255);
+        int got = out[((size_t)y * Wo + x) * C + c];
+        if (ref != got) {
+          printf("  MISMATCH y=%d x=%d c=%d ref=%d got=%d\n", y, x, c, ref, got);
+          bad++;
+        }
+      }
+  printf("  check %s\n", bad ? "FAIL" : "PASS");
+  return bad;
+}
+
+static int run_dw3(int C0, int H, int W, int s, int check) {
+  const int k = 3, kk = 9;
+  int c64 = C0 == 64 && s == 1;
+  int C = c64 ? 64 : (C0 + 127) / 128 * 128, Cb = c64 ? 128 : C;
+  int Ho = (H + 2 - k) / s + 1, Wo = (W + 2 - k) / s + 1;
+  int Hp = H + 2 + s, Wp = (Wo - 1) * s + 4 + s + 2;
+  uint8_t *in = amalloc((size_t)Hp * Wp * C), *out = amalloc((size_t)(Ho * Wo + 2) * C);
+  int8_t *w = amalloc(C * kk), *dummy = amalloc(C);
+  int32_t *bias = amalloc(4 * C), *mult = amalloc(4 * C);
+  V *w4 = amalloc((size_t)Cb / 128 * 12 * VLEN), *M = amalloc(Cb / 128 * 4 * VLEN), *B = amalloc(Cb / 128 * 4 * VLEN);
+  for (size_t i = 0; i < (size_t)Hp * Wp * C; i++) in[i] = rnd();
+  for (int i = 0; i < C * kk; i++) w[i] = (int8_t)(rnd() % 255 - 127);
+  rand_requant(C, mult, dummy, bias, 20000);
+  int shift = 9 + rnd() % 4;
+  for (int cv = 0; cv < Cb / 128; cv++) {
+    for (int dy = 0; dy < 3; dy++)
+      for (int v = 0; v < 4; v++) {
+        int8_t *wb = (int8_t *)&w4[((size_t)cv * 3 + dy) * 4 + v];
+        for (int i = 0; i < 32; i++)
+          for (int j = 0; j < 4; j++) wb[4 * i + j] = j < 3 ? w[((cv * 128 + 32 * v + i) % C) * kk + dy * 3 + j] : 0;
+      }
+    for (int v = 0; v < 4; v++)
+      for (int i = 0; i < 32; i++) {
+        ((int32_t *)&M[cv * 4 + v])[i] = mult[(cv * 128 + 32 * v + i) % C];
+        ((int32_t *)&B[cv * 4 + v])[i] = bias[(cv * 128 + 32 * v + i) % C];
+      }
+  }
+  dw3_args a = {C, Hp, Wp, s, Ho, Wo, in, w4, M, B, shift, 5, out};
+  void (*fn)(const dw3_args *) = c64 ? dw3_c64_u8 : dw3_u8;
+  if (warm) fn(&a);
+  uint64_t t0 = cycles();
+  fn(&a);
+  uint64_t t1 = cycles();
+  printf("dw3 C=%d(%d) H=%d W=%d k=3 s=%d cycles=%llu macs_per_cycle=%.1f (useful channels)\n", C0, C, H, W, s,
+         (unsigned long long)(t1 - t0), (double)C0 * Ho * Wo * kk / (double)(t1 - t0));
+  if (!check) return 0;
+  int bad = 0;
+  for (int y = 0; y < Ho && bad < 5; y++)
+    for (int x = 0; x < Wo && bad < 5; x++)
+      for (int c = 0; c < C && bad < 5; c += 3) {
+        int32_t acc = bias[c];
+        for (int dy = 0; dy < 3; dy++)
+          for (int dx = 0; dx < 3; dx++) acc += in[((size_t)(y * s + dy) * Wp + x * s + dx) * C + c] * w[c * kk + dy * 3 + dx];
+        int ref = clampi(clampi(rshift_rnd_ref(q31_mul_ref(acc, mult[c]), shift), -32768, 32767) + 5, 0, 255);
+        int got = out[((size_t)y * Wo + x) * C + c];
+        if (ref != got) {
+          printf("  MISMATCH y=%d x=%d c=%d ref=%d got=%d\n", y, x, c, ref, got);
+          bad++;
+        }
+      }
+  printf("  check %s\n", bad ? "FAIL" : "PASS");
+  return bad;
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) return 2;
   enable_cycle_counter();
   int check = !strcmp(argv[argc - 1], "check");
+  for (int i = 2; i < argc; i++)
+    if (!strcmp(argv[i], "warm")) {
+      warm = 1;
+      for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+      argc--;
+      break;
+    }
   if (!strcmp(argv[1], "pw4")) {
     getenv_n4 = 1;
     return run_pw(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), check, 0);
@@ -558,6 +1148,12 @@ int main(int argc, char **argv) {
     return run_pw(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), check, argv[1][2] == '1');
   if (!strcmp(argv[1], "dw")) return run_dw(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), check);
   if (!strcmp(argv[1], "dwc")) return run_dwc(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), check);
+  if (!strcmp(argv[1], "dwc2"))
+    return run_dwc2(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), argc > 7 && argv[7][0] != 'c' ? atoi(argv[7]) : 4, check);
+  if (!strcmp(argv[1], "dwc3"))
+    return run_dwc3(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), argc > 7 && argv[7][0] != 'c' ? atoi(argv[7]) : 2, check);
+  if (!strcmp(argv[1], "dwc4")) return run_dwc4(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), check);
+  if (!strcmp(argv[1], "dw3")) return run_dw3(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), check);
   if (!strcmp(argv[1], "gelu")) return run_lut(atoi(argv[2]), check);
   return 2;
 }

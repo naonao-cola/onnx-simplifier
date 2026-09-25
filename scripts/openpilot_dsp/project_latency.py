@@ -5,7 +5,8 @@ listed separately) is mapped to one measured kernel run on its real shape:
 
 - 1x1 conv            -> `pw`   P=H*W (padded to 32), K=Cin, N=Cout   (uint8 input)  / `pw16` (uint16 input)
 - dense kxk conv      -> `pw`   on the im2col'd input, K=Cin*k*k padded to 4 (im2col itself: estimated)
-- depthwise kxk       -> `dwc`  channels-last, C padded to 128        (uint16 input: 2x, estimated)
+- depthwise kxk       -> `dw3` (3x3) / `dwc3` (5x5, 7x7), or round 1's `dwc` with --dw-kernel dwc; channels-last,
+                         C padded to 128 (uint16 input: 2x, estimated)
 - elementwise (Gelu, Add, Mul, ...) on backbone activations: the measured `gelu` LUT rate per byte
   (uint16: 2x bytes, estimated)
 - 1x1 conv at 1x1 spatial (a GEMV): weight bytes / an assumed DDR bandwidth (estimated)
@@ -110,6 +111,12 @@ def main():
     ap.add_argument("--act", default="uint8", choices=["uint8", "uint16"])
     ap.add_argument("--policy")
     ap.add_argument(
+        "--dw-kernel",
+        default="best",
+        choices=["dwc", "best"],
+        help="depthwise kernel: dwc (round 1) or best (dw3 for 3x3, dwc3 otherwise; §7)",
+    )
+    ap.add_argument(
         "--w16",
         default="",
         help="comma list of conv node names with int16 weights, or 'all' "
@@ -150,7 +157,13 @@ def main():
         P = y[2] * y[3]
         macs = P * w[0] * w[1] * k * k
         if L["group"] > 1:
-            cyc = sim_cycles(["dwc", x[1], x[2], x[3], k, s], cache) * (2 if u16 else 1)
+            if args.dw_kernel == "dwc":
+                dw_args = ["dwc", x[1], x[2], x[3], k, s]
+            elif k == 3:
+                dw_args = ["dw3", x[1], x[2], x[3], s]
+            else:
+                dw_args = ["dwc3", x[1], x[2], x[3], k, s, 2]
+            cyc = sim_cycles(dw_args, cache) * (2 if u16 else 1)
             rows.append(
                 (
                     L["name"],
