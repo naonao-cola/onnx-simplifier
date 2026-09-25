@@ -129,9 +129,14 @@ remain in the report. The fused graph is written beside the JSON output.
 
 M4 results for the Hexagon-deployed YOLO11n, YOLO26n, and YOLO26s models are
 in [`bench/RESULTS_m4_hexagon_yolo_coreml_metal.md`](../../bench/RESULTS_m4_hexagon_yolo_coreml_metal.md).
-The Core ML translator lowers the models' static nearest-neighbor Resize
-(`asymmetric` coordinates, `floor` rounding) to constant index gathers, which
-preserves ONNX's sampling rule and avoids a Core ML resize runtime limitation.
+The Core ML translator lowers static nearest-neighbor Resize to Core ML's own
+`resize_nearest_neighbor` when the resize is a whole-number replication of its
+input, and otherwise to constant index gathers, which preserve ONNX's sampling
+rule. The gate is deliberate: measured on Core ML, a downscale or a fractional
+upscale samples *different* rows than ONNX does, so only the replication case
+uses the native kernel, and it requires iOS15/macOS12 or newer. On M4 this took
+Fast-BEV M0's encoder from 95.6 ms to 65.9 ms and its end-to-end Core ML chain
+from 174.3 ms to 143.9 ms, with ORT parity unchanged (cosine 1.0).
 
 ## rustnn WebNN vs. tinygrad benchmark (`benchmark_webnn_tinygrad.py`)
 
