@@ -5,8 +5,9 @@ tinygrad graph on the DSP, lowered by the fork's HMX int8 TensorCore rules -- th
 Layout: every activation is a padded flat grid -- NHWC, a ring of `pad` pixels holding its zero point, flattened to
 (rows, C) at row stride Wp = W + 2*pad, plus a tail the consumers' windows may overrun into. A k x k / stride s conv is
 tinygrad's ordinary (A * W).sum() over the windowed view A(p, dy, dx, c) = x[s*p + dy*Wp + dx, c] (hmxsim_conv.py), on an
-output grid at the input's row stride; a copy crops that grid into the next padded tensor. The stem's 3 input channels are
-padded to 4 and its window to 7 x 8 (zero weights), so each tap row is one 32-byte K block. Adds are ops_dsp.hmx_qlinear_add over whole padded buffers (the pads of zp_a + zp_b come out as
+output grid at the input's row stride; a copy crops that grid into the next padded tensor. The stride-2 stem runs as a
+stride-1 4x4 conv on the input's 2x2 phase split (4 phases x 8 padded channels = one 32-byte K block per tap), written
+straight into MaxPool's padded input. Adds are ops_dsp.hmx_qlinear_add over whole padded buffers (the pads of zp_a + zp_b come out as
 zp_y: checked per Add). MaxPool is the windowed view's max.
 
 The reference is qdq_graph.py's exact emulator (itself checked against ORT CPU).
@@ -26,15 +27,16 @@ f32 = np.float32
 r64 = lambda n: (n + 63) // 64 * 64
 
 class Act:
-  """a padded flat grid: t (L, C) uint8, H x W pixels inside a ring of `pad`, row stride Wp"""
-  def __init__(self, t, H, W, C, pad, zp):
+  """a padded flat grid: t (L, C) uint8, H x W pixels inside a ring of `pad` (wider on the right when Wp > W + 2 pad), row
+  stride Wp"""
+  def __init__(self, t, H, W, C, pad, zp, Wp=None):
     self.t, self.H, self.W, self.C, self.pad, self.zp = t, H, W, C, pad, zp
-    self.Wp = W + 2 * pad
+    self.Wp = Wp or W + 2 * pad
 
-def need_rows(H, W, pad, k, s, kx=None):
-  """rows of a padded grid (H x W, ring pad, row stride W + 2 pad) a k x kx / s conv or pool reads: its output grid is
-  Ho x Wp pixels padded to 64, pixel p reading s*p + base + dy*Wp + dx, base = the window's top-left in the ring"""
-  Wp, Ho, kx = W + 2 * pad, (H - 1) // s + 1, kx or k
+def need_rows(H, W, pad, k, s, kx=None, Wp=None):
+  """rows of a padded grid (H x W, ring pad, row stride Wp = W + 2 pad by default) a k x kx / s conv or pool reads: its output
+  grid is Ho x Wp pixels padded to 64, pixel p reading s*p + base + dy*Wp + dx, base = the window's top-left in the ring"""
+  Wp, Ho, kx = Wp or W + 2 * pad, (H - 1) // s + 1, kx or k
   base = (pad - k // 2) * (Wp + 1)
   return base + s * (r64(Ho * Wp) - 1) + (k - 1) * Wp + kx
 
@@ -44,16 +46,16 @@ def canon(g, Ho, Wo, Wg, C, zp, pad, L):
   x = x.pad(((pad, pad), (pad, pad), (0, 0)), value=zp).reshape(-1, C)
   return x.pad(((0, L - x.shape[0]), (0, 0)), value=zp).contiguous()
 
-def into_grid(y:Tensor, H, W, C, zp, L) -> Tensor:
+def into_grid(y:Tensor, H, W, C, zp, L, Wp=None) -> Tensor:
   """a stride-1 conv's output grid (row stride Wp = W + 2, pixel p = i*Wp + j) written straight into the next padded grid:
   pixel (i, j) belongs at (i+1)*Wp + (j+1) = p + Wp + 1, so the grid goes in at that offset and its 2 garbage columns per row
   land on the pad columns; then the ring (and the rows the grid overran into) is rewritten with zp. No copy of the tensor"""
-  Wp, P64 = W + 2, y.shape[0]
+  Wp, P64 = Wp or W + 2, y.shape[0]
   assert L >= Wp + 1 + P64
   g = Tensor.empty(L, C, dtype=dtypes.uint8, device=y.device)
   g[Wp + 1: Wp + 1 + P64].assign(y)
   v = g[: (H + 2) * Wp].reshape(H + 2, Wp, C)
-  for sl in ((slice(0, 1), slice(0, Wp)), (slice(H + 1, H + 2), slice(0, Wp)), (slice(1, H + 1), slice(0, 1)), (slice(1, H + 1), slice(Wp - 1, Wp))):
+  for sl in ((slice(0, 1), slice(0, Wp)), (slice(H + 1, H + 2), slice(0, Wp)), (slice(1, H + 1), slice(0, 1)), (slice(1, H + 1), slice(W + 1, Wp))):
     v[sl].assign(Tensor.full(v[sl].shape, zp, dtype=dtypes.uint8, device=y.device))
   return g
 
@@ -71,12 +73,22 @@ class Net:
     self.L: dict[str, int] = {}
     def need(t, pad, k, s):
       self.L[t.name] = max(self.L.get(t.name, 0), need_rows(t.h, t.w, pad, k, s), (t.h + 2 * pad) * (t.w + 2 * pad))
-    need(self.xin, 3, 7, 2)
-    self.L[self.xin.name] = max(self.L[self.xin.name], need_rows(self.xin.h, self.xin.w, 3, 7, 2, 8))  # the stem's 8-wide rows
+    # the stem (k x k, stride 2, on the input) runs as a stride-1 (k+1)/2-square conv on the input's 2x2 phase split S: pixel
+    # (u, v) of S holds x_pad[2u + by, 2v + bx, c] at channel (2 by + bx) * 8 + c -- 32 bytes, one K block per tap
+    st = self.ops[0]
+    assert st["op"] == "conv" and st["x"] is self.xin and st["s"] == 2 and self.xin.c <= 8
+    self.sk = (st["k"] + 1) // 2
+    self.Hs, self.Ws = (self.xin.h + 2 * (st["k"] // 2) + 1) // 2, (self.xin.w + 2 * (st["k"] // 2) + 1) // 2
+    self.L["S"] = max(self.Hs * self.Ws, r64(st["y"].h * self.Ws) - 1 + (self.sk - 1) * self.Ws + self.sk)  # window from its top-left
+    self.Wg: dict[str, int] = {st["y"].name: self.Ws}  # grids whose row stride isn't W + 2
     for o in self.ops:
-      if o["op"] == "conv": need(o["x"], 1 if o["x"] is not self.xin else 3, o["k"], o["s"])
-      elif o["op"] == "maxpool": need(o["x"], 1, 3, 2)
+      if o["op"] == "conv" and o["x"] is not self.xin: need(o["x"], 1, o["k"], o["s"])
+      elif o["op"] == "maxpool":
+        Wp = self.Wg.get(o["x"].name)
+        self.L[o["x"].name] = max(self.L.get(o["x"].name, 0), need_rows(o["x"].h, o["x"].w, 1, 3, 2, Wp=Wp))
       need(o["y"], 1, 1, 1)
+    y0 = st["y"]  # the stem writes its grid straight into its consumer's padded grid (row stride Ws)
+    self.L[y0.name] = max(self.L[y0.name], self.Ws + 1 + r64(y0.h * self.Ws), (y0.h + 2) * self.Ws)
     for o in self.ops:  # a stride-1 conv writes its whole output grid into the next padded grid at offset Wp + 1
       if o["op"] == "conv" and o["s"] == 1 and o["x"] is not self.xin:
         y, Wp = o["y"], o["y"].w + 2
@@ -91,23 +103,39 @@ class Net:
         n = max(self.L[o[k].name] for k in ("a", "b", "y"))
         for k in ("a", "b", "y"): self.L[o[k].name] = n
 
-  def build(self, x_nhwc:Tensor) -> Tensor:
+  def build(self, x_nhwc:Tensor, upto:int|None=None) -> Tensor:
     """x_nhwc: (H, W, 3) uint8 at the input's quantization -> the output (C, H, W) uint8 (as ORT's NCHW output)"""
-    xin = self.xin
-    # stem input: channels padded to 4, a ring of 3; the stem's window is 7 x 8 (the 8th column with zero weights), so each
-    # tap row's dx*4 + c is exactly one 32-byte K block (K = 7 x 32 instead of 49 x 32 with channels padded to 32)
-    x = x_nhwc.pad(((3, 3), (3, 3), (0, 4 - xin.c)), value=xin.zp).reshape(-1, 4)
-    x = x.pad(((0, self.L[xin.name] - x.shape[0]), (0, 0)), value=xin.zp).contiguous()
-    vals = {xin.name: Act(x, xin.h, xin.w, 4, 3, xin.zp)}
+    xin, st = self.xin, self.ops[0]
     self.consts: list[Tensor] = []
-    for o in self.ops:
+    # stem: the 2x2 phase split of the padded input (one copy), then a stride-1 sk x sk conv on it, K = sk*sk blocks of 32
+    k0, p0, Hs, Ws, sk = st["k"], st["k"] // 2, self.Hs, self.Ws, self.sk
+    x = x_nhwc.pad(((p0, 2 * Hs - xin.h - p0), (p0, 2 * Ws - xin.w - p0), (0, 8 - xin.c)), value=xin.zp)
+    S = x.reshape(Hs, 2, Ws, 2, 8).permute(0, 2, 1, 3, 4).reshape(Hs * Ws, 32)
+    S = S.pad(((0, self.L["S"] - Hs * Ws), (0, 0)), value=xin.zp).contiguous()
+    wq, bq, N = st["wq"], st["bq"].astype(np.int64), st["wq"].shape[0]
+    wk = np.zeros((sk, sk, 2, 2, 8, N), np.int8)                    # (ay, ax, by, bx, c, n): tap (2 ay + by, 2 ax + bx)
+    for dy in range(k0):
+      for dx in range(k0): wk[dy // 2, dx // 2, dy % 2, dx % 2, :xin.c] = wq[:, :, dy, dx].T
+    yt = st["y"]
+    bias = (bq - int(xin.zp) * wq.reshape(N, -1).astype(np.int64).sum(1)).astype(np.int32)
+    m = (f32(xin.scale) * st["swa"].astype(f32) / f32(yt.scale)).astype(f32)
+    W_, B_, M_ = Tensor(wk.reshape(sk, sk, 32, N)), Tensor(bias), Tensor(m)
+    self.consts += [W_, B_, M_]
+    P64 = r64(yt.h * Ws)
+    v = window(S, Ws, sk, 1, P64, 0)
+    acc = (v.reshape(P64, 1, sk, sk, 32).cast(dtypes.int32) *
+           W_.permute(3, 0, 1, 2).reshape(1, N, sk, sk, 32).cast(dtypes.int32)).sum((2, 3, 4)) + B_
+    y = ((acc.cast(dtypes.float32) * M_).round() + float(yt.zp)).clip(0, 255).cast(dtypes.uint8)
+    if getenv("QDQ_STEM_COPY"): vals = {yt.name: Act(canon(y.contiguous(), yt.h, yt.w, Ws, N, yt.zp, 1, self.L[yt.name]), yt.h, yt.w, N, 1, yt.zp)}
+    else: vals = {yt.name: Act(into_grid(y, yt.h, yt.w, N, yt.zp, self.L[yt.name], Wp=Ws), yt.h, yt.w, N, 1, yt.zp, Wp=Ws)}
+    for o in self.ops[1:(upto + 1 if upto is not None else None)]:
       if o["op"] == "conv":
         a, yt, k, s = vals[o["x"].name], o["y"], o["k"], o["s"]
         wq, bq = o["wq"], o["bq"].astype(np.int64)
         N, Cw = wq.shape[0], wq.shape[1]
-        kx = k + 1 if (k * a.C) % 32 and ((k + 1) * a.C) % 32 == 0 else k  # the stem: 7 x 8 window, 32-byte tap rows
+        kx = k
         wk = np.zeros((k, kx, a.C, N), np.int8)
-        wk[:, :k, :Cw, :] = wq.transpose(2, 3, 1, 0)                  # (dy, dx, C, N), padded channels / column 0
+        wk[:, :k, :Cw, :] = wq.transpose(2, 3, 1, 0)                  # (dy, dx, C, N)
         bias = (bq - int(a.zp) * wq.reshape(N, -1).astype(np.int64).sum(1)).astype(np.int32)  # zero point folded in
         m = (f32(o["x"].scale) * o["swa"].astype(f32) / f32(yt.scale)).astype(f32)             # ORT: fp32(fp32(sx sw) / sy)
         W_, B_, M_ = Tensor(wk), Tensor(bias), Tensor(m)
@@ -118,7 +146,7 @@ class Net:
         acc = (v.reshape(P64, 1, k, kx, a.C).cast(dtypes.int32) *
                W_.permute(3, 0, 1, 2).reshape(1, N, k, kx, a.C).cast(dtypes.int32)).sum((2, 3, 4)) + B_
         y = ((acc.cast(dtypes.float32) * M_).round() + float(yt.zp)).clip(0, 255).cast(dtypes.uint8)
-        if s == 1 and a.pad == 1 and getenv("QDQ_INTO_GRID", 1):  # same row stride: straight into the next padded grid
+        if s == 1 and a.pad == 1 and a.Wp == a.W + 2 and getenv("QDQ_INTO_GRID", 1):  # same row stride: straight into the next padded grid
           vals[yt.name] = Act(into_grid(y, Ho, Wo, N, yt.zp, self.L[yt.name]), Ho, Wo, N, 1, yt.zp)
         else:
           # materialized on its grid: fused with the crop that follows, tinygrad splits the pixel axis again (no TensorCore)
@@ -138,7 +166,7 @@ class Net:
         P64 = r64(Ho * a.Wp)
         y = window(a.t, a.Wp, 3, 2, P64, 0).max(axis=(1, 2)).contiguous()
         vals[yt.name] = Act(canon(y, Ho, Wo, a.Wp, a.C, yt.zp, 1, self.L[yt.name]), Ho, Wo, a.C, 1, yt.zp)
-    out = vals[self.yout.name]
+    out = vals[self.yout.name if upto is None else self.ops[upto]["y"].name]
     y = out.t[: (out.H + 2) * out.Wp].reshape(out.H + 2, out.Wp, out.C)[1:out.H + 1, 1:out.W + 1]
     return y.permute(2, 0, 1).contiguous()
 
@@ -266,7 +294,8 @@ if __name__ == "__main__":
   outdir = pathlib.Path(sys.argv[2])
   net = Net(model)
   x = Tensor.empty(net.xin.h, net.xin.w, net.xin.c, dtype=dtypes.uint8)
-  y = net.build(x)
+  upto = int(sys.argv[sys.argv.index("--dump") + 1]) if "--dump" in sys.argv else None  # stop after op N (debugging)
+  y = net.build(x, upto)
   calls, bufs = capture(y, net.consts, x)
   kinds = {}
   for name, src, ids, outs in calls:
@@ -278,12 +307,17 @@ if __name__ == "__main__":
   if "--sim" in sys.argv:  # the whole graph on hexagon-sim vs qdq_graph's exact emulator
     xin_path = sys.argv[sys.argv.index("--sim") + 1]
     xq = np.fromfile(xin_path, np.uint8).reshape(1, net.xin.h, net.xin.w, net.xin.c)
-    ref = qdq_graph.emulate(net.tensors, net.ops, net.xin, xq)[net.yout.name]
+    ref = qdq_graph.emulate(net.tensors, net.ops, net.xin, xq)[net.yout.name if upto is None else net.ops[upto]["y"].name]
     got, cyc = run_sim(outdir, xq.tobytes(), ref.nbytes)
     got = np.frombuffer(got, np.uint8).reshape(ref.shape)
     bad = int((got != ref).sum())
+    if bad and os.environ.get("QDQ_DIFF"):
+      c, h, w = np.nonzero(got != ref)
+      print("  mismatch positions (h, w):", sorted(set(zip(h.tolist(), w.tolist())))[:20], "channels", sorted(set(c.tolist()))[:10])
+      d = got.astype(int) - ref
+      print("  diffs:", {int(k): int(v) for k, v in zip(*np.unique(d[d != 0], return_counts=True))})
     print(f"hexagon-sim: {bad}/{ref.size} mismatches vs the exact emulator; {cyc} pcycles/inference "
           f"({'PASS' if bad == 0 else 'FAIL'})")
-    if len(sys.argv) > sys.argv.index("--sim") + 2:
+    if upto is None and len(sys.argv) > sys.argv.index("--sim") + 2 and not sys.argv[sys.argv.index("--sim") + 2].startswith("--"):
       ort = np.fromfile(sys.argv[sys.argv.index("--sim") + 2], np.uint8)
       print(f"  vs ORT CPU's output: {int((got.ravel() != ort).sum())}/{ort.size} mismatches")

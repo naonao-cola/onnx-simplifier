@@ -47,7 +47,7 @@ env:
   TINYGRAD_REPO: https://github.com/onnxsim/tinygrad.git
   # onnxsim/tinygrad hvx-hmx-qdq (PR #8, int8 :cm HMX TensorCore + fused requantization, stacked on #7 hvx-hmx-mcc and #6 hvx-hmx; contains
   # 9aa4f66a1 vrmpy GEMV and fccd84cfa max-chain fix)
-  TINYGRAD_SHA: ad90b995a3bc3d2daaa554cdb530c243f9f1280d
+  TINYGRAD_SHA: c4b6209121e32fc69bc4680e7b72d9b62a033067
   HEXAGON_TOOLCHAIN_VERSION: "19.0.02"
   HEXAGON_TOOLCHAIN_URL: https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 
