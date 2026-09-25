@@ -18,7 +18,8 @@ import java.util.Locale;
  *   model   yolo26n (default), yolo11n, yolo26n-seg, yolo11n-seg (instance masks) or rfdetr_nano:
  *           <files>/models/<model>.onnx
  *   opts    YoloEngine options, e.g. "conf=0.25" (post=end2end for yolo26*, detr for rfdetr*,
- *           nms otherwise)
+ *           nms otherwise); "engine=tinygrad" runs <files>/models/<model>.tg, the tinygrad AOT OpenCL bundle
+ *           (../tinygrad_aot), on the Adreno GPU instead of the HTP
  * The model buttons switch YOLO models in place (the engine re-inits its HTP session).
  */
 public class YoloActivity extends MainActivity {
@@ -65,7 +66,10 @@ public class YoloActivity extends MainActivity {
 
     /** One line of per-stage times from the running averages of Result.times. */
     String stages(double[] avg) {
-        return String.format(Locale.US, "pre %.1f  htp %.2f  post %.2f ms", avg[YoloEngine.T_PRE], avg[YoloEngine.T_HTP],
+        // engine=tinygrad (tinygrad AOT OpenCL bundle on the Adreno) reports its inference in the same slot
+        String opts = getIntent().getStringExtra("opts");
+        String eng = opts != null && opts.contains("engine=tinygrad") ? "tinygrad gpu" : "htp";
+        return String.format(Locale.US, "pre %.1f  %s %.2f  post %.2f ms", avg[YoloEngine.T_PRE], eng, avg[YoloEngine.T_HTP],
                 avg[YoloEngine.T_POST]);
     }
 

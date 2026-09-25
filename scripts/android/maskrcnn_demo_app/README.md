@@ -50,6 +50,12 @@ Measured on the phone (medians of the app's running averages, under the shared p
 
 <img src="docs/yolo26n_images.jpg" width="240" alt="YOLO26n on COCO val2017 #139 in the app">
 
+**tinygrad engine** (`--es opts engine=tinygrad`): the same model as a tinygrad ahead-of-time OpenCL bundle
+(`../tinygrad_aot`, deployed with `TG=<bundle>/yolo11n.tg ./deploy.sh`) on the Adreno GPU, same input and
+post-processing. YOLO11n, test images: **44.3 ms** inference, 16.2 FPS end to end (vs the HTP's 2.58 ms / 94 FPS), and
+closer to fp32 than the int8 HTP graph (90/91 vs 79/91 fp32 detections matched on 20 COCO images, 0 vs 21 extra
+boxes); details in `../tinygrad_aot/README.md`. QNN stays the default engine.
+
 Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
 bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
 The camera preprocessing (4.5-5.6 ms at 640x480) is the column-wise plane reads of the 90-degree

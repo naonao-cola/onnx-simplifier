@@ -4,6 +4,7 @@
 #   MODELS=<build_models.py --out dir> ./deploy.sh      models pushed from the host instead
 #   IMGS="a.jpg b.jpg ..." ./deploy.sh                  JPEGs for the "images" test mode
 #   YOLO="<deploy work>/yolo26n/pipe/yolo26n.onnx ..." ./deploy.sh   models for the YOLO mode
+#   TG="<export_cl.py bundle dir, named <model>.tg> ..." ./deploy.sh   tinygrad engines (--es opts engine=tinygrad)
 #   RFDETR=<rfdetr export.py model, e.g. ~/.cache/onnxsim-rfdetr/work/nano@320.u8.onnx> ./deploy.sh
 #                                   the RF-DETR button (pushed as rfdetr_nano.onnx)
 #   RTDETR=<rtdetr split.py work dir, e.g. ~/.cache/onnxsim-rtdetr/work/split> ./deploy.sh   RT-DETR
@@ -66,6 +67,16 @@ if [ -n "${YOLO:-}" ]; then
     "${A[@]}" push -q "$f" "$STAGE/yolo/"
     b=$(basename "$f")
     RA "cmp -s $STAGE/yolo/$b files/models/$b || { cp $STAGE/yolo/$b files/models/ && rm -f files/models/${b%.onnx}.ctx0*; }"
+  done
+fi
+# tinygrad AOT OpenCL bundles (../tinygrad_aot/export_cl.py output dirs, named <model>.tg, e.g.
+# TG="yolo11n.tg"): what engine=tinygrad loads instead of the HTP session (--es opts engine=tinygrad)
+if [ -n "${TG:-}" ]; then
+  for d in $TG; do
+    b=$(basename "$d")
+    "${A[@]}" shell "mkdir -p $STAGE/tg/$b"
+    for f in kernels.cl plan.txt consts.bin meta.txt; do "${A[@]}" push -q "$d/$f" "$STAGE/tg/$b/"; done
+    RA "mkdir -p files/models/$b && for f in kernels.cl plan.txt consts.bin meta.txt; do cmp -s $STAGE/tg/$b/\$f files/models/$b/\$f || cp $STAGE/tg/$b/\$f files/models/$b/; done"
   done
 fi
 # RF-DETR (the YOLO activity's post=detr): one strict-HTP model from ../vision_models/rfdetr (uint8
