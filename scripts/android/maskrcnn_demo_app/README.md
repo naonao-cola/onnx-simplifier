@@ -54,7 +54,8 @@ Measured on the phone (medians of the app's running averages, under the shared p
 (`../tinygrad_aot`, deployed with `TG=<bundle>/yolo11n.tg ./deploy.sh`) on the Adreno GPU, same input and
 post-processing. YOLO11n, test images: **44.3 ms** inference, 16.2 FPS end to end (vs the HTP's 2.58 ms / 94 FPS), and
 closer to fp32 than the int8 HTP graph (90/91 vs 79/91 fp32 detections matched on 20 COCO images, 0 vs 21 extra
-boxes); details in `../tinygrad_aot/README.md`. QNN stays the default engine.
+boxes); YOLO26n 44.8 ms, YOLO26n-seg / YOLO11n-seg 86-88 / 82-84 ms (masks included), all closer to fp32 than
+the int8 HTP graphs; details in `../tinygrad_aot/README.md`. QNN stays the default engine.
 
 Inference alone would allow ~110 FPS from the camera and ~330 FPS from decoded images; end to end is
 bounded by the camera (30 FPS) and, in images mode, by the Java JPEG decode + UI draw per frame.
@@ -143,6 +144,9 @@ Measured on the phone under the shared phone lock (the app's running averages):
 | RF-DETR-Nano @320, camera | 30 (camera-capped) | 30 ms | 4 | 26 | 0.3 |
 
 <img src="docs/rfdetr_images.jpg" width="240" alt="RF-DETR-Nano on a COCO image in the app">
+
+`--es opts engine=tinygrad` runs `rfdetr_nano.tg` (`../tinygrad_aot`) on the Adreno instead: 267 ms (3.3 FPS), same
+detections above threshold as fp32 on COCO #139.
 
 ## SAM mode (tap to segment, EfficientViT-SAM-L0)
 
