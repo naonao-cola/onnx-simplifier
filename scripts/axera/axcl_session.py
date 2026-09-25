@@ -115,6 +115,7 @@ class AXSession:
         self._seq = itertools.count()
         self.exec_us = 0
         self.runs = 0
+        self._resident_inputs: dict[int, set[int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def build_runner(self) -> None:
@@ -215,14 +216,33 @@ class AXSession:
 
     def unload(self, m: Model) -> None:
         self._cmd(f"UNLOAD {m.id}")
+        self._resident_inputs.pop(m.id, None)
         try:
             os.remove(m.path)
         except OSError:
             pass
 
-    def run(self, m: Model, inputs: list[np.ndarray]) -> list[np.ndarray]:
+    def run(
+        self,
+        m: Model,
+        inputs: list[np.ndarray],
+        resident_pairs: tuple[tuple[int, int], ...] = (),
+    ) -> list[np.ndarray]:
+        """Execute a model, optionally retaining input/output pairs on device.
+
+        After the first run, each resident output is copied directly into its
+        input buffer on the device and later host uploads for that input are
+        skipped. Outputs are still copied back for compatibility and metrics.
+        """
         if len(inputs) != len(m.inputs):
             raise ValueError(f"model takes {len(m.inputs)} inputs, got {len(inputs)}")
+        pairs = tuple(resident_pairs)
+        if any(
+            not (0 <= i < len(m.inputs) and 0 <= o < len(m.outputs))
+            for i, o in pairs
+        ):
+            raise ValueError(f"invalid resident pairs {pairs}")
+        resident = self._resident_inputs.setdefault(m.id, set())
         ins = []
         for k, (x, spec) in enumerate(zip(inputs, m.inputs)):
             buf = np.ascontiguousarray(x, dtype=spec.dtype).tobytes()
@@ -231,20 +251,31 @@ class AXSession:
                     f"input {spec.name}: {len(buf)} bytes, model wants {spec.nbytes}"
                 )
             p = f"t/i{k}.bin"
-            with open(os.path.join(self.host_dir, p), "wb") as f:
-                f.write(buf)
+            if k not in resident:
+                with open(os.path.join(self.host_dir, p), "wb") as f:
+                    f.write(buf)
             ins.append(f"{self.guest_dir}/{p}")
         outs = [f"t/o{k}.bin" for k in range(len(m.outputs))]
-        line = self._cmd(
-            f"RUN {m.id} {len(ins)} {' '.join(ins)} {len(outs)} "
-            + " ".join(f"{self.guest_dir}/{p}" for p in outs)
-        )
+        if pairs:
+            pair_args = " ".join(f"{i} {o}" for i, o in pairs)
+            line = self._cmd(
+                f"RUNR {m.id} {len(ins)} {' '.join(ins)} {len(pairs)} {pair_args} "
+                f"{len(outs)} "
+                + " ".join(f"{self.guest_dir}/{p}" for p in outs)
+            )
+        else:
+            line = self._cmd(
+                f"RUN {m.id} {len(ins)} {' '.join(ins)} {len(outs)} "
+                + " ".join(f"{self.guest_dir}/{p}" for p in outs)
+            )
         self.exec_us += int(line.split()[1])
         self.runs += 1
         res = []
         for p, spec in zip(outs, m.outputs):
             a = np.fromfile(os.path.join(self.host_dir, p), dtype=spec.dtype)
             res.append(a.reshape(spec.shape) if spec.shape else a)
+        for i, _ in pairs:
+            resident.add(i)
         return res
 
 

@@ -68,6 +68,10 @@ def run(
                 raise ValueError(
                     f"expected {len(builder.TRAIN_PARAMS)} state outputs, got {state_outputs}"
                 )
+            resident_pairs = tuple(
+                (input_names.index(name), output_names.index(output))
+                for name, output in zip(builder.TRAIN_PARAMS, state_outputs)
+            )
 
             def feeds():
                 values = {
@@ -82,7 +86,9 @@ def run(
                 ]
 
             for _ in range(1):
-                values = dict(zip(output_names, session.run(model, feeds())))
+                values = dict(
+                    zip(output_names, session.run(model, feeds(), resident_pairs))
+                )
                 state = {
                     name: np.asarray(values[out_name]).copy()
                     for name, out_name in zip(builder.TRAIN_PARAMS, state_outputs)
@@ -92,7 +98,9 @@ def run(
             start = time.perf_counter()
             losses = []
             for _ in range(steps):
-                values = dict(zip(output_names, session.run(model, feeds())))
+                values = dict(
+                    zip(output_names, session.run(model, feeds(), resident_pairs))
+                )
                 losses.append(
                     float(np.asarray(values[metric]).reshape(-1)[0]) / metric_scale
                 )
