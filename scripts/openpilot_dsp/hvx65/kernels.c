@@ -18,6 +18,7 @@
  * Usage: kernels <op> <args...> [check]
  *   pw   P K N (8 output channels per pass when N % 8 == 0; "pw4" forces the 4-channel kernel)
  *   pw16 P K N    dw C H W k s (planar)    dwc C H W k s (channels-last)    gelu n
+ *   gemv M K N [a16] [prefetch]  (heads: int8 weights streamed from DDR, u8 or u16 activations)
  *   dw3 C H W s           (3x3 only: weights in registers, sliding input window)
  *   dwc4 C H W k s        (channels-last, vrmpy over taps, taps shuffled once per input row)
  *   dwc3 C H W k s [pix]  (channels-last, vrmpy over 4 taps; pix = 1|2)
@@ -699,6 +700,105 @@ __attribute__((noinline)) void dw3_u8(const dw3_args *a) {
   }
 }
 
+/* ---- GEMV / skinny GEMM for the driving heads: y[M][N] = x[M][K] . W[K][N], M <= 9 ----
+ * Weights int8, prepacked [N/32][K/4][32][4] (one 128-byte vector = 32 outputs x 4 k), streamed once;
+ * activations uint8 (a16: uint16 as lo/hi byte planes, two vrmpy per weight vector), each 4-byte k-group
+ * splatted across a vector: vrmpy(Vu.ub = splat(x[m][4k..4k+3]), Vv.b = W) -> 32 int32 partial sums.
+ * The weight stream (23.5 MB for the whole driving head) does not fit L2, so the next 32-output block
+ * is l2fetch'ed while the current one computes. Output: raw int32 accumulators (the heads' requant /
+ * float epilogue is not modeled). */
+static inline void l2fetch_box(const void *p, unsigned stride, unsigned width, unsigned height) {
+  unsigned long long ctl = ((unsigned long long)stride << 32) | ((unsigned long long)width << 16) | height;
+  __asm__ __volatile__("l2fetch(%0,%1)" : : "r"(p), "r"(ctl));
+}
+
+/* MM output rows at a time, compile-time, so the accumulators stay in registers */
+static inline __attribute__((always_inline)) void gemv_rows(const uint8_t *x, const uint8_t *xhi, int K4, int N, const V *w,
+                                                            int32_t *y, const int MM, const int a16, int prefetch) {
+  const unsigned blk = (unsigned)K4 * 128;
+  for (int n = 0; n < N / 32; n++) {
+    const V *wb = w + (size_t)n * K4;
+    if (prefetch && n + 1 < N / 32) {
+      const uint8_t *nx = (const uint8_t *)(wb + K4);
+      if (blk <= 32768)
+        l2fetch_box(nx, blk, blk, 1);
+      else
+        l2fetch_box(nx, 32768, 32768, blk / 32768);
+    }
+    V acc[9], acch[9];
+    for (int m = 0; m < MM; m++) acc[m] = acch[m] = Q6_V_vzero();
+    const int32_t *xw = (const int32_t *)x, *xhw = (const int32_t *)xhi;
+#pragma unroll 2
+    for (int k = 0; k < K4; k++) {
+      V wv = wb[k];
+      for (int m = 0; m < MM; m++) {
+        acc[m] = Q6_Vw_vrmpyacc_VwVubVb(acc[m], Q6_V_vsplat_R(xw[m * K4 + k]), wv);
+        if (a16) acch[m] = Q6_Vw_vrmpyacc_VwVubVb(acch[m], Q6_V_vsplat_R(xhw[m * K4 + k]), wv);
+      }
+    }
+    for (int m = 0; m < MM; m++) {
+      V r = a16 ? Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(acch[m], 8), acc[m]) : acc[m];
+      *(HVX_UVector *)(y + (size_t)m * N + 32 * n) = r;
+    }
+  }
+}
+
+/* 9 rows (the attention block's tokens) x 2 output blocks per step, u8 activations: each splat feeds two
+ * vrmpy, halving the splats that bound the 9-row case (18 accumulators) */
+static void gemv9x2_u8(const uint8_t *x, int K4, int N, const V *w, int32_t *y, int prefetch) {
+  const unsigned blk = (unsigned)K4 * 128;
+  const int32_t *xw = (const int32_t *)x;
+  for (int n = 0; n + 2 <= N / 32; n += 2) { /* caller guarantees an even number of 32-output blocks */
+    const V *w0 = w + (size_t)n * K4, *w1 = w0 + K4;
+    if (prefetch && n + 2 < N / 32) {
+      const uint8_t *nx = (const uint8_t *)(w1 + K4);
+      if (2 * blk <= 32768)
+        l2fetch_box(nx, 2 * blk, 2 * blk, 1);
+      else
+        l2fetch_box(nx, 32768, 32768, 2 * blk / 32768);
+    }
+    V a[9], b[9];
+    for (int m = 0; m < 9; m++) a[m] = b[m] = Q6_V_vzero();
+    for (int k = 0; k < K4; k++) {
+      V u = w0[k], v = w1[k];
+      for (int m = 0; m < 9; m++) {
+        V sx = Q6_V_vsplat_R(xw[m * K4 + k]);
+        a[m] = Q6_Vw_vrmpyacc_VwVubVb(a[m], sx, u);
+        b[m] = Q6_Vw_vrmpyacc_VwVubVb(b[m], sx, v);
+      }
+    }
+    for (int m = 0; m < 9; m++) {
+      *(HVX_UVector *)(y + (size_t)m * N + 32 * n) = a[m];
+      *(HVX_UVector *)(y + (size_t)m * N + 32 * (n + 1)) = b[m];
+    }
+  }
+}
+
+__attribute__((noinline)) void gemv_u8(const uint8_t *x, int M, int K, int N, const V *w, int32_t *y, int a16,
+                                       const uint8_t *xhi, int prefetch) {
+  const int K4 = K / 4;
+  /* rows in groups of 9 (the attention block's 9 tokens: one pass over the weights), else one at a time */
+  for (int m = 0; m < M;) {
+    int r = M - m >= 9 ? 9 : 1;
+    const uint8_t *xm = x + (size_t)m * K, *xhm = xhi + (size_t)m * K;
+    int32_t *ym = y + (size_t)m * N;
+    if (r == 9 && !a16 && (N / 32) % 2 == 0) {
+      gemv9x2_u8(xm, K4, N, w, ym, prefetch);
+    } else if (r == 9) {
+      if (a16)
+        gemv_rows(xm, xhm, K4, N, w, ym, 9, 1, prefetch);
+      else
+        gemv_rows(xm, xhm, K4, N, w, ym, 9, 0, prefetch);
+    } else {
+      if (a16)
+        gemv_rows(xm, xhm, K4, N, w, ym, 1, 1, prefetch);
+      else
+        gemv_rows(xm, xhm, K4, N, w, ym, 1, 0, prefetch);
+    }
+    m += r;
+  }
+}
+
 /* ---- GELU (or any u8 -> u8 map) by table: 8 x vlut32 over the 256-entry table ---- */
 __attribute__((noinline)) void lut_u8(const uint8_t *in, uint8_t *out, int n, const V *tbl /* 8 vectors */) {
   for (int i = 0; i < n; i += 128) {
@@ -1129,6 +1229,45 @@ static int run_dw3(int C0, int H, int W, int s, int check) {
   return bad;
 }
 
+static int run_gemv(int M, int K, int N, int a16, int prefetch, int check) {
+  const int K4 = K / 4;
+  uint8_t *x = amalloc((size_t)M * K), *xh = amalloc((size_t)M * K);
+  int8_t *wt = amalloc((size_t)K * N);
+  V *w = amalloc((size_t)K * N);
+  int32_t *y = amalloc((size_t)4 * M * N + 128);
+  for (size_t i = 0; i < (size_t)M * K; i++) x[i] = rnd(), xh[i] = rnd();
+  for (size_t i = 0; i < (size_t)K * N; i++) wt[i] = (int8_t)(rnd() % 255 - 127); /* wt[k][n] */
+  int8_t *dst = (int8_t *)w;
+  for (int nb = 0; nb < N / 32; nb++)
+    for (int k4 = 0; k4 < K4; k4++)
+      for (int i = 0; i < 32; i++)
+        for (int j = 0; j < 4; j++) *dst++ = wt[(size_t)(4 * k4 + j) * N + 32 * nb + i];
+  /* x is packed so that 32-bit word m*K4+k holds x[m][4k..4k+3] (natural row-major bytes already are) */
+  /* evict: the weights must stream from DDR as they would every frame */
+  size_t junk_n = 4u << 20;
+  volatile uint8_t *junk = amalloc(junk_n);
+  for (size_t i = 0; i < junk_n; i += 32) junk[i] = (uint8_t)i;
+  uint64_t t0 = cycles();
+  gemv_u8(x, M, K, N, w, y, a16, xh, prefetch);
+  uint64_t t1 = cycles();
+  double bytes = (double)K * N;
+  printf("gemv M=%d K=%d N=%d a16=%d pf=%d cycles=%llu weight_bytes_per_cycle=%.1f macs_per_cycle=%.1f\n", M, K, N, a16, prefetch,
+         (unsigned long long)(t1 - t0), bytes / (t1 - t0), (double)M * K * N / (t1 - t0));
+  if (!check) return 0;
+  int bad = 0;
+  for (int m = 0; m < M && bad < 5; m++)
+    for (int n = 0; n < N && bad < 5; n += 7) {
+      int64_t r = 0;
+      for (int k = 0; k < K; k++) r += (int64_t)(a16 ? (x[(size_t)m * K + k] + 256 * xh[(size_t)m * K + k]) : x[(size_t)m * K + k]) * wt[(size_t)k * N + n];
+      if ((int32_t)r != y[(size_t)m * N + n]) {
+        printf("  MISMATCH m=%d n=%d ref=%lld got=%ld\n", m, n, (long long)r, (long)y[(size_t)m * N + n]);
+        bad++;
+      }
+    }
+  printf("  check %s\n", bad ? "FAIL" : "PASS");
+  return bad;
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) return 2;
   enable_cycle_counter();
@@ -1154,6 +1293,9 @@ int main(int argc, char **argv) {
     return run_dwc3(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), argc > 7 && argv[7][0] != 'c' ? atoi(argv[7]) : 2, check);
   if (!strcmp(argv[1], "dwc4")) return run_dwc4(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), check);
   if (!strcmp(argv[1], "dw3")) return run_dw3(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), check);
+  if (!strcmp(argv[1], "gemv"))
+    return run_gemv(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), argc > 5 && argv[5][0] != 'c' ? atoi(argv[5]) : 0,
+                    argc > 6 && argv[6][0] != 'c' ? atoi(argv[6]) : 1, check);
   if (!strcmp(argv[1], "gelu")) return run_lut(atoi(argv[2]), check);
   return 2;
 }
