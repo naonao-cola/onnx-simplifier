@@ -97,6 +97,25 @@ def test_exact_quantizers_are_shared_only_when_their_domain_matches():
     assert model.graph.node[-1].input == ["qx0", "qx0"]
 
 
+def test_prune_dead_values_keeps_outputs_and_removes_dead_branches():
+    dead_weight = _f32(np.ones((1,), dtype=np.float32), "dead_weight")
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Add", ["x", "live_weight"], ["y"]),
+            onnx.helper.make_node("Mul", ["x", "dead_weight"], ["dead"]),
+        ],
+        "liveness",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
+        [_f32(np.ones((1,), dtype=np.float32), "live_weight"), dead_weight],
+    )
+    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    assert brts._prune_dead_values(model) == (1, 1)
+    assert [node.output[0] for node in model.graph.node] == ["y"]
+    assert [initializer.name for initializer in model.graph.initializer] == ["live_weight"]
+    onnx.checker.check_model(model)
+
+
 def test_add_mse_loss_matches_manual_computation():
     forward = _forward_model()
     with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)

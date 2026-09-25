@@ -629,6 +629,40 @@ def _deduplicate_exact_quantizers(model: onnx.ModelProto) -> int:
     return len(removed)
 
 
+def _prune_dead_values(model: onnx.ModelProto) -> tuple[int, int]:
+    """Remove nodes and initializers that cannot reach a graph output.
+
+    The resident-step construction appends state updates and optional metric
+    nodes after the main simplify pass. Keeping this explicit liveness pass at
+    the end avoids stale branches or constants reaching a compiler/emitter,
+    while retaining every state and metric output exactly.
+    """
+    live = {output.name for output in model.graph.output}
+    kept_reversed = []
+    for node in reversed(model.graph.node):
+        if any(output in live for output in node.output):
+            kept_reversed.append(node)
+            live.update(name for name in node.input if name)
+    kept = list(reversed(kept_reversed))
+    removed_nodes = len(model.graph.node) - len(kept)
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+
+    kept_initializers = [
+        initializer
+        for initializer in model.graph.initializer
+        if initializer.name in live
+    ]
+    removed_initializers = len(model.graph.initializer) - len(kept_initializers)
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(kept_initializers)
+
+    value_info = [value for value in model.graph.value_info if value.name in live]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(value_info)
+    return removed_nodes, removed_initializers
+
+
 def build_resident_step(
     forward_and_loss: onnx.ModelProto,
     params: Sequence[str],
@@ -837,6 +871,8 @@ def build_resident_step(
     elif metric_output_only:
         raise ValueError("metric_output_only requires metric_scale")
 
+    _prune_dead_values(step_model)
+    onnx.checker.check_model(step_model)
     return step_model, step_graph.state
 
 
