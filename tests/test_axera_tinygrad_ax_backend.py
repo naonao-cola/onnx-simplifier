@@ -218,6 +218,25 @@ def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "add"
 
 
+def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(1, 64) * Tensor.empty(1, 64)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Mul"]
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

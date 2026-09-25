@@ -15,8 +15,8 @@ import dataclasses
 import os
 from collections.abc import Mapping, Sequence
 
-import compose_emit
 import binary_op_scale_emit
+import compose_emit
 import onnx
 import reshape_emit
 from onnx import numpy_helper
@@ -118,21 +118,40 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
-    if len(nodes) == 1 and nodes[0].op_type == "Add":
+    if len(nodes) == 1 and nodes[0].op_type in ("Add", "Mul"):
         add = nodes[0]
-        if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != ["x", "z"]:
-            raise ValueError("standalone Add generator requires runtime inputs named x and z")
-        if len(add.input) != 2 or tuple(values.get(name, () ) for name in add.input) != (
+        if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
+            "x",
+            "z",
+        ]:
+            raise ValueError(
+                f"standalone {add.op_type} generator requires runtime inputs named x and z"
+            )
+        if len(add.input) != 2 or tuple(values.get(name, ()) for name in add.input) != (
             values.get("x", ()), values.get("z", ())
         ):
-            raise ValueError("standalone Add inputs must be the graph inputs")
+            raise ValueError(
+                f"standalone {add.op_type} inputs must be the graph inputs"
+            )
         shape = values.get("x", ())
         if not shape or values.get("z", ()) != shape:
-            raise ValueError("standalone Add requires equal static input shapes")
+            raise ValueError(
+                f"standalone {add.op_type} requires equal static input shapes"
+            )
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
-            raise ValueError("standalone Add output shape must match its inputs")
+            raise ValueError(
+                f"standalone {add.op_type} output shape must match its inputs"
+            )
         return GraphPlan(
-            (GraphSegment("add", ("x", "z"), model.graph.output[0].name, shape, shape),)
+            (
+                GraphSegment(
+                    add.op_type.lower(),
+                    ("x", "z"),
+                    model.graph.output[0].name,
+                    shape,
+                    shape,
+                ),
+            )
         )
     if not nodes or nodes[0].op_type != "Gather":
         raise ValueError("graph must start with the measured Gather family")
@@ -227,15 +246,23 @@ def generate(
             output_path,
             position=segment.position,
         )
-    elif plan.chain == "add":
+    elif plan.chain in ("add", "mul"):
         if calibration is None:
-            raise ValueError("standalone Add generation requires explicit calibration")
+            raise ValueError(
+                f"standalone {plan.chain.title()} generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("Add calibration requires scales and zero_points mappings")
+            raise ValueError(
+                f"{plan.chain.title()} calibration requires scales and zero_points mappings"
+            )
         binary_op_scale_emit.emit(
-            "Add", plan.segments[0].input_shape, scales, zero_points, output_path
+            plan.chain.title(),
+            plan.segments[0].input_shape,
+            scales,
+            zero_points,
+            output_path,
         )
     else:
         if indices is None:

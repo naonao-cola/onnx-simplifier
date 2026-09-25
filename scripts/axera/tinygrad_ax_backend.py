@@ -1576,24 +1576,38 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
-    if root.op is Ops.ADD:
+    binary_op = {Ops.ADD: "Add", Ops.MUL: "Mul"}.get(root.op)
+    if binary_op is not None:
         if len(root.src) != 2:
-            raise ValueError("AX UOp Add lowering requires two operands")
+            raise ValueError(f"AX UOp {binary_op} lowering requires two operands")
         left, right = root.src
         if left.shape != right.shape or not left.shape:
-            raise ValueError("AX UOp Add lowering requires equal static operand shapes")
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires equal static operand shapes"
+            )
         if left.op is not Ops.RESHAPE or right.op is not Ops.RESHAPE:
-            raise ValueError("AX UOp Add lowering requires reshape-backed inputs")
-        if not left.src or not right.src or left.src[0].op is not Ops.ALLOC or right.src[0].op is not Ops.ALLOC:
-            raise ValueError("AX UOp Add lowering requires ALLOC-backed inputs")
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires reshape-backed inputs"
+            )
+        if (
+            not left.src
+            or not right.src
+            or left.src[0].op is not Ops.ALLOC
+            or right.src[0].op is not Ops.ALLOC
+        ):
+            raise ValueError(f"AX UOp {binary_op} lowering requires ALLOC-backed inputs")
         if str(root.dtype).split(".")[-1] != "float":
-            raise ValueError("AX UOp Add lowering currently supports float32 data only")
+            raise ValueError(
+                f"AX UOp {binary_op} lowering currently supports float32 data only"
+            )
         shape = tuple(int(dim) for dim in root.shape)
         if any(dim <= 0 for dim in shape):
-            raise ValueError("AX UOp Add lowering requires positive static shapes")
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires positive static shapes"
+            )
         graph = onnx.helper.make_graph(
-            [onnx.helper.make_node("Add", ["x", "z"], ["y"])],
-            "tinygrad_uop_add_ax",
+            [onnx.helper.make_node(binary_op, ["x", "z"], ["y"])],
+            f"tinygrad_uop_{binary_op.lower()}_ax",
             [
                 onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
                 onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
@@ -1675,9 +1689,9 @@ def compile_uop(
 ) -> bytes:
     """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
 
-    Standalone Add requires explicit ``calibration={"scales": {"x", "z",
-    "y"}, "zero_points": {"x", "z", "y"}}`` because its measured AX
-    program depends on quantization, not just the UOp shape.
+    Standalone Add and Mul require explicit ``calibration={"scales": {"x",
+    "z", "y"}, "zero_points": {"x", "z", "y"}}`` because their measured
+    AX programs depend on quantization, not just the UOp shape.
     """
     import graph_generator
 
