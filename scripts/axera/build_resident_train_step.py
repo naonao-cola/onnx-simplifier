@@ -188,6 +188,7 @@ def _linearize_trainable_convs(
     out_nodes = []
     linearized = set()
     geometry_constants = {}
+    exact_constants = {}
 
     for node in model.graph.node:
         w = node.input[1] if node.op_type == "Conv" and len(node.input) > 1 else None
@@ -228,8 +229,13 @@ def _linearize_trainable_convs(
         made = []
 
         def const(array, hint):
+            array = np.asarray(array)
+            key = (array.dtype.str, tuple(array.shape), array.tobytes())
+            if key in exact_constants:
+                return exact_constants[key]
             name = legalize._unique_name(model, f"{stem}_{hint}")
             model.graph.initializer.append(numpy_helper.from_array(array, name))
+            exact_constants[key] = name
             return name
 
         def op(op_type, inputs, hint, **attrs):

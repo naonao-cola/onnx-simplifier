@@ -550,6 +550,36 @@ def test_linearize_trainable_convs_matches_conv_and_drops_the_weight_transpose()
         assert np.allclose(got, ref, atol=1e-4), (cin, cout, k, stride, pad, has_bias)
 
 
+def test_linearize_trainable_convs_shares_exact_shape_constants():
+    """Same-geometry trainable Conv nodes share immutable reshape constants."""
+    rng = np.random.default_rng(12)
+    model = parser.parse_model(
+        """
+        < ir_version: 10, opset_import: ["": 17] >
+        g (float[1,1,4,4] x) => (float[1,2,4,4] y2)
+        {
+          y0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, w0)
+          y1 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, w1)
+          y2 = Add(y0, y1)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(rng.standard_normal((2, 1, 3, 3)), "w0"),
+            _f32(rng.standard_normal((2, 1, 3, 3)), "w1"),
+        ]
+    )
+    linearized = brts._linearize_trainable_convs(
+        onnx.shape_inference.infer_shapes(model), ["w0", "w1"]
+    )
+    shape_initializers = [
+        init for init in linearized.graph.initializer if init.name not in {"w0", "w1"}
+    ]
+    # index, mask, and four reshape targets are sufficient for both Conv nodes.
+    assert len(shape_initializers) == 6
+
+
 def _bottleneck_model():
     """`x -> 1x1 -> Relu -> 3x3 -> Relu -> 1x1 -> Flatten -> Gemm -> logits`:
     a resnet50-style bottleneck block's conv shape (channel-reduce 1x1,
