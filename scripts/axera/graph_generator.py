@@ -1,0 +1,153 @@
+"""Small graph-level AX model generator built from validated templates.
+
+This is the first scheduler-owned layer above the operation emitters.  It
+recognizes the measured Gather -> Reshape -> MatMul -> Transpose -> Add family,
+collapses it to one fused AX program, and retargets the Gather table without a
+Pulsar2 invocation.  Unknown graphs are rejected deliberately: a template
+emitter cannot safely be promoted to a general graph compiler without knowing
+the fused MCode and memory schedule.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import argparse
+from collections.abc import Sequence
+
+import onnx
+from onnx import numpy_helper
+
+import compose_emit
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphSegment:
+    """One scheduled fused segment and its externally visible tensors."""
+
+    chain: str
+    inputs: tuple[str, ...]
+    output: str
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphPlan:
+    """A complete plan for the currently supported single-segment generator."""
+
+    segments: tuple[GraphSegment, ...]
+
+    @property
+    def chain(self) -> str:
+        if len(self.segments) != 1:
+            raise ValueError("the current generator only emits one fused segment")
+        return self.segments[0].chain
+
+
+def _shape(value) -> tuple[int, ...]:
+    return tuple(int(d.dim_value) for d in value.type.tensor_type.shape.dim)
+
+
+def _attrs(node: onnx.NodeProto) -> dict:
+    return {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+
+
+def _initializer_map(model: onnx.ModelProto) -> dict[str, onnx.TensorProto]:
+    return {item.name: item for item in model.graph.initializer}
+
+
+def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
+    """Recognize and schedule one measured composed graph.
+
+    Accepted source graph forms are prefixes of the measured chain.  The
+    returned chain names match :func:`compose_emit.measured_chains`, so the
+    scheduler's output is a single fused AX segment rather than five host
+    launches.  Inputs ``x``, ``w`` and ``b`` are required to remain runtime
+    inputs; constant folding them would select a different compiled family.
+    """
+    nodes = list(model.graph.node)
+    if not nodes or nodes[0].op_type != "Gather":
+        raise ValueError("graph must start with the measured Gather family")
+    init = _initializer_map(model)
+    gather = nodes[0]
+    gather_attrs = _attrs(gather)
+    if gather_attrs.get("axis", 0) != 3:
+        raise ValueError("Gather axis must be 3")
+    if len(gather.input) != 2 or gather.input[1] not in init:
+        raise ValueError("Gather indices must be a constant initializer")
+    indices = numpy_helper.to_array(init[gather.input[1]])
+    if indices.size != 8:
+        raise ValueError("the measured composed family requires eight indices")
+    values = {v.name: _shape(v) for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)}
+    if values.get(gather.input[0]) != (1, 1, 4, 16):
+        raise ValueError("Gather input must have shape [1,1,4,16]")
+
+    chain = "gather_reshape"
+    expected = ["Reshape"]
+    if len(nodes) >= 2 and nodes[1].op_type == "Reshape":
+        chain = "gather_reshape"
+    else:
+        raise ValueError("measured family requires Gather -> Reshape")
+
+    if len(nodes) >= 3 and nodes[2].op_type == "MatMul":
+        chain = "gather_reshape_matmul"
+    if len(nodes) >= 4 and nodes[3].op_type == "Transpose":
+        if tuple(_attrs(nodes[3]).get("perm", ())) != (0, 1, 3, 2):
+            raise ValueError("measured MatMul chain requires Transpose perm [0,1,3,2]")
+        chain = "gather_reshape_matmul_transpose"
+    if len(nodes) >= 5 and nodes[4].op_type == "Add":
+        chain = "gather_reshape_matmul_transpose_add"
+
+    if len(nodes) != {"gather_reshape": 2, "gather_reshape_matmul": 3,
+                      "gather_reshape_matmul_transpose": 4,
+                      "gather_reshape_matmul_transpose_add": 5}[chain]:
+        raise ValueError("graph has unsupported nodes after the measured chain")
+    input_names = tuple(item.name for item in model.graph.input)
+    expected_inputs = {
+        "gather_reshape": ("x",),
+        "gather_reshape_matmul": ("x", "w"),
+        "gather_reshape_matmul_transpose": ("x", "w"),
+        "gather_reshape_matmul_transpose_add": ("x", "w", "b"),
+    }[chain]
+    if input_names != expected_inputs:
+        raise ValueError(f"runtime inputs must be {expected_inputs}, got {input_names}")
+    output = model.graph.output[0].name if model.graph.output else nodes[-1].output[0]
+    return GraphPlan((GraphSegment(chain, expected_inputs, output),))
+
+
+def generate(
+    source_path: str,
+    output_path: str,
+    *,
+    indices: Sequence[int] | None = None,
+) -> GraphPlan:
+    """Generate an AX model from a supported ONNX graph without Pulsar2.
+
+    The source graph supplies the schedule/signature.  The checked-in fused
+    template supplies the already validated MCode and IO metadata; only the
+    measured Gather index table is edited.  ``indices`` defaults to the source
+    initializer and must stay in the template's calibrated range.
+    """
+    model = onnx.load(source_path, load_external_data=False)
+    plan = schedule_graph(model)
+    if indices is None:
+        init = _initializer_map(model)
+        indices = numpy_helper.to_array(init[model.graph.node[0].input[1]]).reshape(-1).tolist()
+    compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"generator did not produce {output_path}")
+    return plan
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source")
+    parser.add_argument("output")
+    parser.add_argument("--indices", nargs=8, type=int)
+    args = parser.parse_args(argv)
+    plan = generate(args.source, args.output, indices=args.indices)
+    print(f"chain={plan.chain} segments={len(plan.segments)} output={args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
