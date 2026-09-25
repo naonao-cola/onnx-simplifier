@@ -280,6 +280,32 @@ def test_lower_and_compile_tinygrad_neg_uop_with_explicit_calibration(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "neg"
 
 
+@pytest.mark.parametrize(
+    "op,shape",
+    [("sqrt", (512, 512, 3, 3)), ("log", (16, 1000))],
+)
+def test_lower_and_compile_tinygrad_misc_uop_with_explicit_calibration(
+    tmp_path, op, shape
+):
+    from tinygrad import Tensor
+
+    tensor = Tensor.empty(*shape)
+    root = (tensor.sqrt() if op == "sqrt" else tensor.log()).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == [op.title()]
+    _, meta = misc.load_template(f"{op.title()}:{'x'.join(map(str, shape))}")
+    schedule = tmp_path / f"{op}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

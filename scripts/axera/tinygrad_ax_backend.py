@@ -1576,6 +1576,48 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    misc_op = None
+    misc_data = None
+    if root.op is Ops.SQRT and len(root.src) == 1:
+        misc_op, misc_data = "Sqrt", root.src[0]
+    elif root.op is Ops.MUL and len(root.src) == 2:
+        log2_node, constant = root.src
+        if (
+            log2_node.op is Ops.LOG2
+            and len(log2_node.src) == 1
+            and constant.op is Ops.CONST
+            and float(constant.arg) == 0.6931471805599453
+        ):
+            misc_op, misc_data = "Log", log2_node.src[0]
+    if misc_op is not None:
+        if (
+            misc_data is None
+            or misc_data.op is not Ops.RESHAPE
+            or not misc_data.src
+            or misc_data.src[0].op is not Ops.ALLOC
+        ):
+            raise ValueError(f"AX UOp {misc_op} lowering requires an ALLOC-backed input")
+        if str(root.dtype).split(".")[-1] != "float":
+            raise ValueError(f"AX UOp {misc_op} lowering currently supports float32 data only")
+        shape = tuple(int(dim) for dim in root.shape)
+        measured_shapes = {
+            "Sqrt": (512, 512, 3, 3),
+            "Log": (16, 1000),
+        }
+        if shape != measured_shapes[misc_op]:
+            raise ValueError(
+                f"AX UOp {misc_op} lowering is measured only for shape {measured_shapes[misc_op]}"
+            )
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node(misc_op, ["x"], ["y"])],
+            f"tinygrad_uop_{misc_op.lower()}_ax",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        )
+        return onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        )
+
     if root.op is Ops.MUL and len(root.src) == 2:
         data, constant = root.src
         if constant.op is Ops.CONST and float(constant.arg) == -1.0:

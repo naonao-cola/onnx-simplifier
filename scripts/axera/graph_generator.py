@@ -119,17 +119,19 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
-    if len(nodes) == 1 and nodes[0].op_type == "Neg":
+    if len(nodes) == 1 and nodes[0].op_type in ("Neg", "Sqrt", "Log"):
         neg = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
-            raise ValueError("standalone Neg generator requires one runtime input named x")
+            raise ValueError(
+                f"standalone {neg.op_type} generator requires one runtime input named x"
+            )
         shape = values.get("x", ())
         if not shape or len(neg.input) != 1 or neg.input[0] != "x":
-            raise ValueError("standalone Neg requires a static input named x")
+            raise ValueError(f"standalone {neg.op_type} requires a static input named x")
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
-            raise ValueError("standalone Neg output shape must match its input")
+            raise ValueError(f"standalone {neg.op_type} output shape must match its input")
         return GraphPlan(
-            (GraphSegment("neg", ("x",), model.graph.output[0].name, shape, shape),)
+            (GraphSegment(neg.op_type.lower(), ("x",), model.graph.output[0].name, shape, shape),)
         )
     if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
@@ -259,15 +261,21 @@ def generate(
             output_path,
             position=segment.position,
         )
-    elif plan.chain == "neg":
+    elif plan.chain in ("neg", "sqrt", "log"):
         if calibration is None:
-            raise ValueError("standalone Neg generation requires explicit calibration")
+            raise ValueError(
+                f"standalone {plan.chain.title()} generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("Neg calibration requires scales and zero_points mappings")
+            raise ValueError(
+                f"{plan.chain.title()} calibration requires scales and zero_points mappings"
+            )
         model = misc_op_record_emit.emit_model(
-            misc_op_record_emit.template_key("Neg", plan.segments[0].input_shape),
+            misc_op_record_emit.template_key(
+                plan.chain.title(), plan.segments[0].input_shape
+            ),
             scales,
             zero_points,
         )
