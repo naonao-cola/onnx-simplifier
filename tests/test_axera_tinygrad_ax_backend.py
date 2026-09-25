@@ -325,6 +325,25 @@ def test_lower_and_compile_tinygrad_softmax_uop_with_explicit_calibration(tmp_pa
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "softmax"
 
 
+def test_lower_and_compile_tinygrad_reducemean_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 512, 7, 7).mean(axis=(2, 3), keepdim=True).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceMean"]
+    _, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
+    schedule = tmp_path / "reducemean.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducemean"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

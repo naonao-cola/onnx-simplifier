@@ -1577,6 +1577,59 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     from tinygrad.uop.ops import Ops
 
     if root.op is Ops.MUL and len(root.src) == 2:
+        reduced, reciprocal = root.src
+        if (
+            reduced.op is Ops.RESHAPE
+            and reciprocal.op is Ops.RECIPROCAL
+            and len(reciprocal.src) == 1
+            and reciprocal.src[0].op is Ops.CONST
+            and float(reciprocal.src[0].arg) == 49.0
+            and reduced.src
+            and reduced.src[0].op is Ops.REDUCE
+        ):
+            reduction = reduced.src[0]
+            if (
+                reduction.arg[0] is Ops.ADD
+                and reduction.src
+                and reduction.src[0].op is Ops.PERMUTE
+                and reduction.src[0].src
+                and reduction.src[0].src[0].op is Ops.RESHAPE
+                and reduction.src[0].src[0].src
+                and reduction.src[0].src[0].src[0].op is Ops.ALLOC
+            ):
+                input_shape = tuple(int(dim) for dim in reduction.src[0].src[0].shape)
+                output_shape = tuple(int(dim) for dim in root.shape)
+                if input_shape != (16, 512, 7, 7) or output_shape != (16, 512, 1, 1):
+                    raise ValueError(
+                        "AX UOp ReduceMean lowering is measured only for [16,512,7,7]"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp ReduceMean lowering currently supports float32 data only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "ReduceMean", ["x"], ["y"], axes=[2, 3], keepdims=1
+                        )
+                    ],
+                    "tinygrad_uop_reducemean_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, input_shape
+                        )
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "y", onnx.TensorProto.FLOAT, output_shape
+                        )
+                    ],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
+    if root.op is Ops.MUL and len(root.src) == 2:
         exp2_node, reciprocal = root.src
         if (
             exp2_node.op is Ops.EXP2

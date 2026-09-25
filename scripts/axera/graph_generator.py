@@ -133,6 +133,27 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         return GraphPlan(
             (GraphSegment(neg.op_type.lower(), ("x",), model.graph.output[0].name, shape, shape),)
         )
+    if len(nodes) == 1 and nodes[0].op_type == "ReduceMean":
+        reduce_mean = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone ReduceMean requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        attrs = _attrs(reduce_mean)
+        if (
+            shape != (16, 512, 7, 7)
+            or output_shape != (16, 512, 1, 1)
+            or tuple(attrs.get("axes", ())) != (2, 3)
+            or attrs.get("keepdims") != 1
+        ):
+            raise ValueError("standalone ReduceMean requires the measured [16,512,7,7] axes [2,3] form")
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "reducemean", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
     if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
         if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
@@ -261,6 +282,17 @@ def generate(
             output_path,
             position=segment.position,
         )
+    elif plan.chain == "reducemean":
+        if calibration is None:
+            raise ValueError("standalone ReduceMean generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError("ReduceMean calibration requires scales and zero_points mappings")
+        model = misc_op_record_emit.emit_model(
+            "ReduceMean:16x512x7x7:axes2,3:k1", scales, zero_points
+        )
+        onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
         if calibration is None:
             raise ValueError(
