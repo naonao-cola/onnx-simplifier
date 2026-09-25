@@ -106,18 +106,63 @@ Phone (turbo, 50 iterations, bit-exact against numpy's int64 matmul, health chec
 hexagon-sim: 128x576x1536 193k pcycles (a naive VTCM-cached version: 325k; quad + `:deep`: 258k), hand fast-requant 167k;
 128x256x256 17.5k (480 MAC/cycle). `hmxsim_i8.py M K N [--ref]` checks it on hexagon-sim and the qemu `HMX_REF` reference.
 
+## Fused requantization: a QDQ int8 layer in one kernel (`hmxsim_rq.py`)
+
+ORT's QLinearConv / QLinearMatMul output (what a QDQ Conv or MatMul becomes after ORT's QDQ fusion),
+
+    y = clamp(rne(fp32(fp32(acc + b) * m)) + zy, lo, 255)        (lo = zy under a fused Relu, else 0)
+
+spelled in tinygrad as `((acc + b).cast(float32) * m).round() + zy).clip(lo, 255).cast(uint8)` on the int8 TensorCore's
+accumulator, fuses into the HMX kernel. The renderer recognizes the pattern per 32-lane uint8 output row, including
+`round()`'s where/trunc expansion (`_hmx_rq_lane` in `ops_dsp.py`). The four rows of one accumulator-array vector go
+through one HVX `__hmx_rq4`, which ends in four byte-predicated row stores; tinygrad's lane-by-lane float epilogue goes.
+The kernel source shrinks from 1.5 MB to 26 KB.
+
+**V69 HVX has no IEEE fp32.** The first version used the `sf` HVX instructions (`vmpy_sf_sf`, `vadd_sf_sf`) and was exact
+on hexagon-sim over 640k lanes, but 94% wrong on the phone: V69 hardware computes those encodings as qf32, while
+hexagon-sim executes them as IEEE. The simulator can't catch this; only the phone can (also noted in
+`../../../vision_models_plan.md`). The requantization is now integer HVX that emulates ORT's two fp32 roundings bit for bit:
+1. `fp32(acc)`: |acc| rounded to 24 significant bits (RNE).
+2. The 24 x 24-bit product with m's mantissa, exact in two words (`vmpyewuh_64` + `vmpyowh_64_acc` when every |acc| <= 2^24,
+   a uniform per-group check; otherwise an out-of-line full path).
+3. Rounded to 24 bits (RNE), then to an integer (RNE) at the combined exponent, saturated.
+
+Checked bit-exact against ORT's formula (numpy / scalar IEEE fp32), including exact .5 ties, near double-rounding ties,
+|acc| >= 2^24 and INT32_MIN: 960k lanes standalone on hexagon-sim, the fused layer on hexagon-sim and MOCKDSP
+(`hmxsim_rq.py`, with and without Relu and bias), and the phone.
+
+Phone (turbo, 50 iterations, health check clean), uint8 out:
+
+| layer | tinygrad int8 + fused exact requant | vs ORT | int32 out (no requant) |
+|---|---:|---:|---:|
+| 128x256x256 | 75.0 us | 0/32768 off (15 exact .5 ties) | |
+| 128x576x1536 | 547 us | 0/196608 off (102 exact .5 ties) | 161 us |
+
+hexagon-sim 128x256x256: 88.7k pcycles (int32 out: 17.5k). The requantization costs ~2 ns per output on the phone, against
+~0.58 ns for the hand kernel's `QC_EXACT` (`hmx_gemm/hmx_qconv.h`: integer fixed-point multiply plus a scalar fix inside a
+per-column window, with per-column constants precomputed on the host). The generic emulation needs no per-column
+precompute, but its four interleaved rows plus ~18 constants spill HVX registers (149 packets per 128 outputs).
+Per-column rounding positions with a tie window would close most of the gap.
+
+Fast mode (the HMX `:after:cm:sat.ub` store with a bias/scale column table; QNN-class, ~3% off by one vs ORT) is not
+lowered yet. Its table (`fp16(512 m)`, `b + lrint(zy / m)`) is per-layer constant data that `qc_pack_params` builds on the
+host, and HMX's conversion has no bit-exact model to check a MOCKDSP reference against. It belongs with the ONNX loader
+(next chunks), which can build the table once at load time.
+
 ## Files
 
 | file | what |
 |---|---|
 | `hmxsim_i8.py` | the same for the int8 TC (uint8 x int8 -> int32, exact against numpy) |
+| `hmxsim_rq.py` | a QDQ int8 layer with the requantization fused (`--relu`, `--nobias`), exact against ORT's formula |
 | `hmxsim.py` | capture the MOCKDSP kernel + real buffers, rebuild with `-mv69 -mhmx`, run on `hexagon-sim --mhmx 1`, compare bit for bit (`--ref` also runs the qemu reference; `--prepack` tries tile-layout operands) |
 | `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul) |
 | `tg_hmx_rpc.idl`, `tg_hmx_impl.c`, `tg_hmx_client.c` | FastRPC skel around the generated kernel (runtime from `hmx_gemm/hmx_runtime.h`) and a checking/timing client |
 | `build.sh`, `run.sh` | build (Hexagon SDK qaic/headers + a `-mhmx` toolchain) and push/run under the phone lock |
 
 `tests/test_hexagon_tinygrad.py::test_codegen_hmx_fp16_matmul_bit_exact` runs `hmxsim.py 64 64 64 --ref`,
-`test_codegen_hmx_int8_matmul_exact` runs `hmxsim_i8.py 128 256 256 --ref` in the Hexagon tinygrad CI job (pinned to the
+`test_codegen_hmx_int8_matmul_exact` runs `hmxsim_i8.py 128 256 256 --ref`, `test_codegen_hmx_int8_requant_exact` runs
+`hmxsim_rq.py 128 256 256 [--relu --nobias] --ref` in the Hexagon tinygrad CI job (pinned to the
 fork's `hvx-hmx-qdq` head).
 
 Reproduce (tinygrad = a checkout of `onnxsim/tinygrad` `hvx-hmx-qdq`):
@@ -131,4 +176,7 @@ PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 
 # int8: build with --i8 (4th argument), run with I8=1
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 128 576 1536 --i8
 I8=1 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 1536 5
+# int8 + fused requantization (zy 131; --relu for lo = zy): bias and scale ride in the B buffer
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 128 576 1536 --rq
+RQ=1 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 1536 5
 ```
