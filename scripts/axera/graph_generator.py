@@ -406,8 +406,13 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("ReduceMean calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            "ReduceMean:16x512x7x7:axes2,3:k1", scales, zero_points
+        model = misc_op_record_emit.emit_spec(
+            "ReduceMean",
+            plan.segments[0].input_shape,
+            axes=(2, 3),
+            keepdims=1,
+            scales=scales,
+            zero_points=zero_points,
         )
         onnx.save(model, output_path)
     elif plan.chain == "reducesum":
@@ -444,13 +449,18 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("MaxPool calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1", scales, zero_points
+        model = misc_op_record_emit.emit_spec(
+            "MaxPool",
+            plan.segments[0].input_shape,
+            attrs={"kernel_shape": (3, 3), "strides": (2, 2), "pads": (1, 1, 1, 1)},
+            scales=scales,
+            zero_points=zero_points,
         )
         onnx.save(model, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
-        model = misc_op_record_emit.emit_model(
-            f"{plan.chain.title().replace('cast', 'Cast')}:{'x'.join(map(str, plan.segments[0].input_shape))}"
+        model = misc_op_record_emit.emit_spec(
+            plan.chain.title().replace("cast", "Cast"),
+            plan.segments[0].input_shape,
         )
         onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
@@ -464,17 +474,21 @@ def generate(
             raise ValueError(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
-        model = misc_op_record_emit.emit_model(
-            (
-                f"Softmax:{'x'.join(map(str, plan.segments[0].input_shape))}:axis1"
-                if plan.chain == "softmax"
-                else misc_op_record_emit.template_key(
-                    plan.chain.title(), plan.segments[0].input_shape
-                )
-            ),
-            scales,
-            zero_points,
-        )
+        if plan.chain == "softmax":
+            model = misc_op_record_emit.emit_spec(
+                "Softmax",
+                plan.segments[0].input_shape,
+                attrs={"axis": 1},
+                scales=scales,
+                zero_points=zero_points,
+            )
+        else:
+            model = misc_op_record_emit.emit_spec(
+                plan.chain.title(),
+                plan.segments[0].input_shape,
+                scales=scales,
+                zero_points=zero_points,
+            )
         onnx.save(model, output_path)
     elif plan.chain in ("add", "sub", "mul", "div"):
         if calibration is None:

@@ -602,15 +602,17 @@ def emit_spec(
     tile counts or register records.
     """
     shape = tuple(int(dim) for dim in shape)
-    if op == "ReduceSum":
+    if op in ("ReduceSum", "ReduceMean"):
         if axes is None or keepdims is None:
-            raise ValueError("ReduceSum spec requires axes and keepdims")
+            raise ValueError(f"{op} spec requires axes and keepdims")
         axes = tuple(sorted(int(axis) % len(shape) for axis in axes))
         if len(set(axes)) != len(axes):
-            raise ValueError("ReduceSum spec axes must be unique")
+            raise ValueError(f"{op} spec axes must be unique")
         if any(axis < 0 or axis >= len(shape) for axis in axes):
-            raise ValueError("ReduceSum spec axis is outside the input rank")
-        key = template_key(op, shape, axes, int(keepdims))
+            raise ValueError(f"{op} spec axis is outside the input rank")
+        key = template_key("ReduceSum", shape, axes, int(keepdims))
+        if op == "ReduceMean":
+            key = key.replace("ReduceSum", "ReduceMean", 1)
     elif op in CALIBRATION_FREE:
         key = f"{op}:{'x'.join(str(dim) for dim in shape)}"
     elif op == "MaxPool":
@@ -620,6 +622,11 @@ def emit_spec(
         strides = "x".join(str(int(v)) for v in attrs["strides"])
         pads = ",".join(str(int(v)) for v in attrs["pads"])
         key = f"MaxPool:{'x'.join(str(dim) for dim in shape)}:k{kernel}:s{strides}:p{pads}"
+    elif op == "Softmax":
+        if attrs is None or "axis" not in attrs:
+            raise ValueError("Softmax spec requires axis")
+        axis = int(attrs["axis"]) % len(shape)
+        key = f"Softmax:{'x'.join(str(dim) for dim in shape)}:axis{axis}"
     else:
         key = f"{op}:{'x'.join(str(dim) for dim in shape)}"
     return emit_model(key, scales, zero_points)
