@@ -187,6 +187,18 @@ def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
 
+def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(1, 8, 4, 4).relu().reshape(1, 1, 8, 16).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Relu", "Reshape"]
+    schedule = tmp_path / "uop_after.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

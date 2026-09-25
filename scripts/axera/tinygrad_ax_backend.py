@@ -1568,18 +1568,26 @@ def build_generated_graph_request(
 def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """Lower one statically shaped tinygrad UOp pattern to ordinary ONNX.
 
-    The first supported pattern is tinygrad's canonical ``reshape(...).relu``
-    lowering: ``WHERE(CMPLT(0, reshaped), reshaped, 0)``.  Its source reshape
-    is retained as a graph boundary so the result can use the validated
-    Pulsar-free ``Reshape -> Relu`` generator.  This is intentionally a narrow
-    lowering boundary; arbitrary pre-schedule movement/reduction UOps still
-    need dedicated AX templates or MCode semantics.
+    The supported patterns are tinygrad's canonical Relu lowering,
+    ``WHERE(CMPLT(0, x), x, 0)``, fused with either ``Relu(Reshape(x))`` or
+    ``Reshape(Relu(x))``. Both orderings are measured by the Pulsar-free
+    generator. Arbitrary movement/reduction UOps still need dedicated AX
+    templates or MCode semantics.
     """
     from tinygrad.uop.ops import Ops
 
-    if root.op is not Ops.WHERE or len(root.src) != 3:
+    position = "before"
+    relu = root
+    if root.op is Ops.RESHAPE:
+        if len(root.src) < 1 or root.src[0].op is not Ops.WHERE:
+            raise ValueError(
+                "AX UOp lowering requires a Relu-shaped WHERE root or outer Reshape"
+            )
+        position = "after"
+        relu = root.src[0]
+    if relu.op is not Ops.WHERE or len(relu.src) != 3:
         raise ValueError("AX UOp lowering currently requires a Relu-shaped WHERE root")
-    condition, true_value, false_value = root.src
+    condition, true_value, false_value = relu.src
     if condition.op is not Ops.CMPLT or len(condition.src) != 2:
         raise ValueError("AX UOp lowering requires CMPLT(0, x) as the Relu condition")
     zero, data = condition.src
@@ -1587,26 +1595,41 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         raise ValueError("AX UOp Relu condition must compare against zero")
     if true_value is not data or false_value.op is not Ops.CONST or float(false_value.val) != 0.0:
         raise ValueError("AX UOp Relu branches are not in the supported canonical form")
-    if data.op is not Ops.RESHAPE or len(data.src) < 1 or data.src[0].op is not Ops.RESHAPE:
-        raise ValueError("AX UOp lowering requires one source reshape before Relu")
-    source = data.src[0]
-    source_shape = tuple(int(dim) for dim in source.shape)
-    target_shape = tuple(int(dim) for dim in data.shape)
+    if position == "before":
+        if data.op is not Ops.RESHAPE or len(data.src) < 1 or data.src[0].op is not Ops.RESHAPE:
+            raise ValueError("AX UOp lowering requires one source reshape before Relu")
+        source = data.src[0]
+        source_shape = tuple(int(dim) for dim in source.shape)
+        target_shape = tuple(int(dim) for dim in data.shape)
+    else:
+        if data.op is not Ops.RESHAPE or len(data.src) < 1:
+            raise ValueError("AX UOp lowering requires an ALLOC-backed input to Relu")
+        source = data
+        source_shape = tuple(int(dim) for dim in data.shape)
+        target_shape = tuple(int(dim) for dim in root.shape)
     if not source_shape or not target_shape or any(dim <= 0 for dim in (*source_shape, *target_shape)):
         raise ValueError("AX UOp lowering requires positive static shapes")
     if source.src[0].op is not Ops.ALLOC:
         raise ValueError("AX UOp lowering requires an ALLOC-backed input")
-    if root.dtype != data.dtype:
+    if relu.dtype != data.dtype or root.dtype != relu.dtype:
         raise ValueError("AX UOp Relu output dtype differs from its data input")
-    if str(root.dtype).split(".")[-1] not in {"float", "half"}:
-        raise ValueError("AX UOp lowering currently supports floating-point data only")
+    if str(root.dtype).split(".")[-1] != "float":
+        raise ValueError("AX UOp lowering currently supports float32 data only")
 
     shape_name = "uop_reshape_shape"
-    graph = onnx.helper.make_graph(
+    nodes = (
         [
             onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
             onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
-        ],
+        ]
+        if position == "before"
+        else [
+            onnx.helper.make_node("Relu", ["x"], ["relu"]),
+            onnx.helper.make_node("Reshape", ["relu", shape_name], ["y"]),
+        ]
+    )
+    graph = onnx.helper.make_graph(
+        nodes,
         "tinygrad_uop_ax",
         [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
         [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],

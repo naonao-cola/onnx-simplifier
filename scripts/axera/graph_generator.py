@@ -201,13 +201,6 @@ def generate(
         with open(schedule_path, "w", encoding="utf-8") as stream:
             json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
             stream.write("\n")
-    if indices is None:
-        init = _initializer_map(model)
-        indices = (
-            numpy_helper.to_array(init[model.graph.node[0].input[1]])
-            .reshape(-1)
-            .tolist()
-        )
     if plan.chain == "reshape_relu":
         segment = plan.segments[0]
         reshape_emit.emit_fused_reshape_axmodel(
@@ -217,6 +210,13 @@ def generate(
             position=segment.position,
         )
     else:
+        if indices is None:
+            init = _initializer_map(model)
+            indices = (
+                numpy_helper.to_array(init[model.graph.node[0].input[1]])
+                .reshape(-1)
+                .tolist()
+            )
         compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
