@@ -48,6 +48,21 @@ def test_schedule_fuses_measured_chain():
     assert plan.segments[0].inputs == ("x", "w", "b")
 
 
+def test_schedule_arbitrary_matmul_carries_both_operand_shapes():
+    model = _model(
+        [onnx.helper.make_node("MatMul", ["x", "z"], ["y"])],
+        [
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [2, 3, 4]),
+            onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, [4, 5]),
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [2, 3, 5])],
+    )
+    plan = graph_generator.schedule_graph(model)
+    assert plan.chain == "matmul"
+    assert plan.segments[0].input_shape == (2, 3, 4)
+    assert plan.segments[0].operand_shape == (4, 5)
+
+
 def test_generate_uses_one_fused_template(tmp_path):
     source = tmp_path / "source.onnx"
     output = tmp_path / "generated.axmodel"

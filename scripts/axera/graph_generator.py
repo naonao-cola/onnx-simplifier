@@ -35,6 +35,7 @@ class GraphSegment:
     input_shape: tuple[int, ...] = ()
     output_shape: tuple[int, ...] = ()
     position: str = ""
+    operand_shape: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,13 +144,17 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError("standalone MatMul requires runtime inputs named x and z")
         input_shapes = tuple(values.get(name, ()) for name in matmul.input)
         output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
-        if input_shapes != ((16, 1000), (1000, 512)) or output_shape != (16, 512):
-            raise ValueError("standalone MatMul requires the measured FC dX form")
+        if any(not shape for shape in input_shapes) or not output_shape:
+            raise ValueError("standalone MatMul requires static operand and output shapes")
+        if len(input_shapes[0]) < 2 or len(input_shapes[1]) < 2:
+            raise ValueError("standalone MatMul requires rank-2-or-higher operands")
+        if input_shapes[0][-1] != input_shapes[1][-2]:
+            raise ValueError("standalone MatMul operands have incompatible contraction dimensions")
         return GraphPlan(
             (
                 GraphSegment(
                     "matmul", ("x", "z"), model.graph.output[0].name,
-                    input_shapes[0], output_shape, "fc_dX_MatMul_36"
+                    input_shapes[0], output_shape, "", input_shapes[1]
                 ),
             )
         )
@@ -426,7 +431,7 @@ def generate(
         segment = plan.segments[0]
         model = matmul_record_emit.emit_standalone_matmul(
             segment.input_shape,
-            (1000, 512),
+            segment.operand_shape,
             scales,
             zero_points,
         )
