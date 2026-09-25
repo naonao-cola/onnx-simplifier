@@ -549,6 +549,16 @@ def test_lower_tinygrad_arbitrary_shape_matmul_uop_to_onnx(a_shape, b_shape, out
     assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
 
 
+def test_lower_tinygrad_batched_bias_matmul_to_matmul_add():
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(2, 3, 4) @ Tensor.empty(4, 5) + Tensor.empty(5)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul", "Add"]
+    assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
+    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == (2, 3, 5)
+
+
 def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     from tinygrad import Tensor
 
