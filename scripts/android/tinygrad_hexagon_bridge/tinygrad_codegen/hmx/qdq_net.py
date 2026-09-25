@@ -6,7 +6,7 @@ Layout: every activation is a padded flat grid -- NHWC, a ring of `pad` pixels h
 (rows, C) at row stride Wp = W + 2*pad, plus a tail the consumers' windows may overrun into. A k x k / stride s conv is
 tinygrad's ordinary (A * W).sum() over the windowed view A(p, dy, dx, c) = x[s*p + dy*Wp + dx, c] (hmxsim_conv.py), on an
 output grid at the input's row stride; a copy crops that grid into the next padded tensor. The stem's 3 input channels are
-padded to 32 (zero weights). Adds are ops_dsp.hmx_qlinear_add over whole padded buffers (the pads of zp_a + zp_b come out as
+padded to 4 and its window to 7 x 8 (zero weights), so each tap row is one 32-byte K block. Adds are ops_dsp.hmx_qlinear_add over whole padded buffers (the pads of zp_a + zp_b come out as
 zp_y: checked per Add). MaxPool is the windowed view's max.
 
 The reference is qdq_graph.py's exact emulator (itself checked against ORT CPU).
@@ -30,12 +30,12 @@ class Act:
     self.t, self.H, self.W, self.C, self.pad, self.zp = t, H, W, C, pad, zp
     self.Wp = W + 2 * pad
 
-def need_rows(H, W, pad, k, s):
-  """rows of a padded grid (H x W, ring pad, row stride W + 2 pad) a k x k / s conv or pool reads: its output grid is
+def need_rows(H, W, pad, k, s, kx=None):
+  """rows of a padded grid (H x W, ring pad, row stride W + 2 pad) a k x kx / s conv or pool reads: its output grid is
   Ho x Wp pixels padded to 64, pixel p reading s*p + base + dy*Wp + dx, base = the window's top-left in the ring"""
-  Wp, Ho = W + 2 * pad, (H - 1) // s + 1
+  Wp, Ho, kx = W + 2 * pad, (H - 1) // s + 1, kx or k
   base = (pad - k // 2) * (Wp + 1)
-  return base + s * (r64(Ho * Wp) - 1) + (k - 1) * (Wp + 1) + 1
+  return base + s * (r64(Ho * Wp) - 1) + (k - 1) * Wp + kx
 
 def canon(g, Ho, Wo, Wg, C, zp, pad, L):
   """output grid (rows at stride Wg, Ho x Wo valid) -> a padded flat grid of L rows (ring `pad` and tail = zp)"""
@@ -43,12 +43,12 @@ def canon(g, Ho, Wo, Wg, C, zp, pad, L):
   x = x.pad(((pad, pad), (pad, pad), (0, 0)), value=zp).reshape(-1, C)
   return x.pad(((0, L - x.shape[0]), (0, 0)), value=zp).contiguous()
 
-def window(x:Tensor, Wp, k, s, P64, base):
-  """(L, C) -> (P64, dy, dx, C): x[base + s*p + dy*Wp + dx]"""
-  C = x.shape[1]
-  v = x[base:].permute(1, 0)._pool((k,), 1, 1)                     # (C, L', k): dx
-  v = v.permute(0, 2, 1)._pool((k,), s, Wp)                        # (C, k, P', k): dy, stride s over the grid
-  return v.shrink(((0, C), (0, k), (0, P64), (0, k))).permute(2, 3, 1, 0)
+def window(x:Tensor, Wp, k, s, P64, base, kx=None):
+  """(L, C) -> (P64, dy, dx, C): x[base + s*p + dy*Wp + dx], dy < k, dx < kx (default k)"""
+  C, kx = x.shape[1], kx or k
+  v = x[base:].permute(1, 0)._pool((kx,), 1, 1)                    # (C, L', kx): dx
+  v = v.permute(0, 2, 1)._pool((k,), s, Wp)                        # (C, kx, P', k): dy, stride s over the grid
+  return v.shrink(((0, C), (0, kx), (0, P64), (0, k))).permute(2, 3, 1, 0)
 
 class Net:
   def __init__(self, model):
@@ -58,6 +58,7 @@ class Net:
     def need(t, pad, k, s):
       self.L[t.name] = max(self.L.get(t.name, 0), need_rows(t.h, t.w, pad, k, s), (t.h + 2 * pad) * (t.w + 2 * pad))
     need(self.xin, 3, 7, 2)
+    self.L[self.xin.name] = max(self.L[self.xin.name], need_rows(self.xin.h, self.xin.w, 3, 7, 2, 8))  # the stem's 8-wide rows
     for o in self.ops:
       if o["op"] == "conv": need(o["x"], 1 if o["x"] is not self.xin else 3, o["k"], o["s"])
       elif o["op"] == "maxpool": need(o["x"], 1, 3, 2)
@@ -75,27 +76,29 @@ class Net:
   def build(self, x_nhwc:Tensor) -> Tensor:
     """x_nhwc: (H, W, 3) uint8 at the input's quantization -> the output (C, H, W) uint8 (as ORT's NCHW output)"""
     xin = self.xin
-    # stem input: channels padded to 32, a ring of 3
-    x = x_nhwc.pad(((3, 3), (3, 3), (0, 32 - xin.c)), value=xin.zp).reshape(-1, 32)
+    # stem input: channels padded to 4, a ring of 3; the stem's window is 7 x 8 (the 8th column with zero weights), so each
+    # tap row's dx*4 + c is exactly one 32-byte K block (K = 7 x 32 instead of 49 x 32 with channels padded to 32)
+    x = x_nhwc.pad(((3, 3), (3, 3), (0, 4 - xin.c)), value=xin.zp).reshape(-1, 4)
     x = x.pad(((0, self.L[xin.name] - x.shape[0]), (0, 0)), value=xin.zp).contiguous()
-    vals = {xin.name: Act(x, xin.h, xin.w, 32, 3, xin.zp)}
+    vals = {xin.name: Act(x, xin.h, xin.w, 4, 3, xin.zp)}
     self.consts: list[Tensor] = []
     for o in self.ops:
       if o["op"] == "conv":
         a, yt, k, s = vals[o["x"].name], o["y"], o["k"], o["s"]
         wq, bq = o["wq"], o["bq"].astype(np.int64)
         N, Cw = wq.shape[0], wq.shape[1]
-        wk = np.zeros((k, k, a.C, N), np.int8)
-        wk[:, :, :Cw, :] = wq.transpose(2, 3, 1, 0)                   # (dy, dx, C, N), padded channels 0
+        kx = k + 1 if (k * a.C) % 32 and ((k + 1) * a.C) % 32 == 0 else k  # the stem: 7 x 8 window, 32-byte tap rows
+        wk = np.zeros((k, kx, a.C, N), np.int8)
+        wk[:, :k, :Cw, :] = wq.transpose(2, 3, 1, 0)                  # (dy, dx, C, N), padded channels / column 0
         bias = (bq - int(a.zp) * wq.reshape(N, -1).astype(np.int64).sum(1)).astype(np.int32)  # zero point folded in
         m = (f32(o["x"].scale) * o["swa"].astype(f32) / f32(yt.scale)).astype(f32)             # ORT: fp32(fp32(sx sw) / sy)
         W_, B_, M_ = Tensor(wk), Tensor(bias), Tensor(m)
         self.consts += [W_, B_, M_]
         Ho, Wo = (a.H - 1) // s + 1, (a.W - 1) // s + 1
         P64 = r64(Ho * a.Wp)
-        v = window(a.t, a.Wp, k, s, P64, (a.pad - k // 2) * (a.Wp + 1))
-        acc = (v.reshape(P64, 1, k, k, a.C).cast(dtypes.int32) *
-               W_.permute(3, 0, 1, 2).reshape(1, N, k, k, a.C).cast(dtypes.int32)).sum((2, 3, 4)) + B_
+        v = window(a.t, a.Wp, k, s, P64, (a.pad - k // 2) * (a.Wp + 1), kx)
+        acc = (v.reshape(P64, 1, k, kx, a.C).cast(dtypes.int32) *
+               W_.permute(3, 0, 1, 2).reshape(1, N, k, kx, a.C).cast(dtypes.int32)).sum((2, 3, 4)) + B_
         # materialized on its grid: fused with the crop that follows, tinygrad splits the pixel axis again (no TensorCore)
         y = ((acc.cast(dtypes.float32) * M_).round() + float(yt.zp)).clip(0, 255).cast(dtypes.uint8).contiguous()
         vals[yt.name] = Act(canon(y, Ho, Wo, a.Wp, N, yt.zp, 1, self.L[yt.name]), Ho, Wo, N, 1, yt.zp)
@@ -173,14 +176,15 @@ def emit(outdir, calls, bufs, xid:int, yid:int) -> dict:
       body = src.split("/* DSP boilerplate */")[0]
       body = re.sub(rf"\bvoid\s+{re.escape(name)}\(", f"void {kn}(", body)
       (out / f"{kn}.c").write_text(body)
-    lines.append(f"  {knames[src]}({', '.join(f'B[{idx[b]}]' for b in ids)});  /* {name} */")
-  rnd = lambda n: (n + 127) // 128 * 128
+    lines.append(f"  {knames[src]}({', '.join(f'B[{idx[b]}]' for b in ids)}); G_PROF({len(lines)});  /* {name} */")
+  rnd = lambda n: (n + 127) // 128 * 128 + 128  # + 128: slack for the A packer's unaligned row loads
   h = [f"/* generated by qdq_net.py: {len(calls)} kernel calls, {len(knames)} distinct kernels, {len(order)} buffers */",
        f"#define G_NBUF {len(order)}", f"#define G_INPUT {idx[xid]}", f"#define G_OUTPUT {idx[yid]}", f"#define G_BLOB_BYTES {len(blob)}",
        f"#define G_VTCM_KB {int(os.environ.get('HMX_VTCM_KB', 256))}",
        "static const unsigned G_BYTES[G_NBUF] = {" + ", ".join(str(rnd(bufs[b][1])) for b in order) + "};",
        "static const int G_OFF[G_NBUF] = {" + ", ".join(str(off.get(b, -1)) for b in order) + "};",
        *[f"void {k}();" for k in knames.values()],
+       "#ifndef G_PROF\n#define G_PROF(i)\n#endif  /* per-call timing hook: G_PROF(call index) after each call */",
        "static void g_run(unsigned char** B) {", *lines, "}"]
   (out / "graph.h").write_text("\n".join(h) + "\n")
   (out / "blob.bin").write_bytes(bytes(blob))
@@ -190,10 +194,12 @@ def emit(outdir, calls, bufs, xid:int, yid:int) -> dict:
 SIM_MAIN = r"""#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+extern unsigned long long hexagon_sim_read_pcycles(void);
+static unsigned long long g_prof[256], g_last;
+#define G_PROF(i) (g_prof[i] += hexagon_sim_read_pcycles() - g_last, g_last = hexagon_sim_read_pcycles())
 #include "graph.h"
 unsigned char* __hmx_vtcm;
 unsigned int __hmx_gen = 1;
-extern unsigned long long hexagon_sim_read_pcycles(void);
 static void rd(const char* p, void* d, unsigned n) { FILE* f = fopen(p, "rb"); if (!f || fread(d, 1, n, f) != n) { printf("read %s\n", p); exit(1); } fclose(f); }
 int main(int argc, char** argv) {
   int reps = argc > 1 ? atoi(argv[1]) : 1;
@@ -209,10 +215,11 @@ int main(int argc, char** argv) {
   }
   rd("input.bin", B[G_INPUT], INPUT_BYTES);
   unsigned long long t0 = hexagon_sim_read_pcycles();
-  for (int i = 0; i < reps; i++) g_run(B);
+  for (int i = 0; i < reps; i++) { g_last = hexagon_sim_read_pcycles(); g_run(B); }
   unsigned long long t1 = hexagon_sim_read_pcycles();
   FILE* f = fopen("out.bin", "wb"); fwrite(B[G_OUTPUT], 1, OUTPUT_BYTES, f); fclose(f);
   printf("graph pcycles %llu\n", (t1 - t0) / reps);
+  for (int i = 0; i < 256 && g_prof[i]; i++) printf("call %d pcycles %llu\n", i, g_prof[i] / reps);
   return 0;
 }
 """
@@ -229,6 +236,7 @@ def run_sim(outdir, x_bytes:bytes, y_nbytes:int, reps:int=1) -> tuple[bytes, int
   from tinygrad.runtime import ops_dsp
   r = subprocess.run([str(tools / "bin/hexagon-sim"), "-mv69", "--mhmx", "1", "--timing", "g.elf", "--", str(reps)], cwd=out,
                      env=ops_dsp._hexsim_env(tools, out), capture_output=True, text=True, check=True)
+  (out / "sim_profile.txt").write_text(r.stdout)
   return (out / "out.bin").read_bytes(), int(re.search(r"graph pcycles (\d+)", r.stdout).group(1))
 
 if __name__ == "__main__":
