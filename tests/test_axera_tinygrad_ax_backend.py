@@ -507,6 +507,19 @@ def test_generic_reducesum_lowering_selects_indexed_template(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
 
 
+def test_emit_spec_selects_reducesum_mcode_by_shape_and_axes():
+    _, meta = misc.load_template("ReduceSum:16x1x64x576:axes0:k0")
+    model = misc.emit_spec(
+        "ReduceSum",
+        (16, 1, 64, 576),
+        axes=(0,),
+        keepdims=0,
+        scales=meta["scales"],
+        zero_points=meta["zero_points"],
+    )
+    assert [node.op_type for node in model.graph.node] == ["neu mode"]
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

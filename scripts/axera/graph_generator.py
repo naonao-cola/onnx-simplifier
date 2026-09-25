@@ -224,7 +224,8 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         }
         axes = tuple(attrs.get("axes", ()))
         keepdims = attrs.get("keepdims")
-        key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        key = dynamic_key
         try:
             misc_op_record_emit.load_template(key)
         except ValueError:
@@ -416,9 +417,25 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("ReduceSum calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            plan.segments[0].position, scales, zero_points
-        )
+        segment = plan.segments[0]
+        attrs = _attrs(model.graph.node[0])
+        shape = segment.input_shape
+        axes = tuple(attrs.get("axes", ()))
+        keepdims = attrs.get("keepdims")
+        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        if plan.segments[0].position == dynamic_key:
+            model = misc_op_record_emit.emit_spec(
+                "ReduceSum",
+                shape,
+                axes=axes,
+                keepdims=keepdims,
+                scales=scales,
+                zero_points=zero_points,
+            )
+        else:
+            model = misc_op_record_emit.emit_model(
+                plan.segments[0].position, scales, zero_points
+            )
         onnx.save(model, output_path)
     elif plan.chain == "maxpool":
         if calibration is None:

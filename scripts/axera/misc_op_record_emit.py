@@ -583,6 +583,48 @@ def emit_model(
     return step_recalibrate.with_mcode(model, mc)
 
 
+def emit_spec(
+    op: str,
+    shape,
+    *,
+    axes: Sequence[int] | None = None,
+    keepdims: int | None = None,
+    scales: Mapping[str, float] | None = None,
+    zero_points: Mapping[str, int] | None = None,
+    attrs: Mapping[str, Sequence[int] | int] | None = None,
+) -> onnx.ModelProto:
+    """Emit a measured MCode model from an operator specification.
+
+    This is the generic dispatch boundary used by the Pulsar-free scheduler:
+    shape and reduction attributes become a template key, while MCode bytes
+    and calibration retargeting remain owned by the validated record emitter.
+    It deliberately refuses a missing exact template instead of inventing
+    tile counts or register records.
+    """
+    shape = tuple(int(dim) for dim in shape)
+    if op == "ReduceSum":
+        if axes is None or keepdims is None:
+            raise ValueError("ReduceSum spec requires axes and keepdims")
+        axes = tuple(sorted(int(axis) % len(shape) for axis in axes))
+        if len(set(axes)) != len(axes):
+            raise ValueError("ReduceSum spec axes must be unique")
+        if any(axis < 0 or axis >= len(shape) for axis in axes):
+            raise ValueError("ReduceSum spec axis is outside the input rank")
+        key = template_key(op, shape, axes, int(keepdims))
+    elif op in CALIBRATION_FREE:
+        key = f"{op}:{'x'.join(str(dim) for dim in shape)}"
+    elif op == "MaxPool":
+        if not attrs:
+            raise ValueError("MaxPool spec requires kernel_shape, strides and pads")
+        kernel = "x".join(str(int(v)) for v in attrs["kernel_shape"])
+        strides = "x".join(str(int(v)) for v in attrs["strides"])
+        pads = ",".join(str(int(v)) for v in attrs["pads"])
+        key = f"MaxPool:{'x'.join(str(dim) for dim in shape)}:k{kernel}:s{strides}:p{pads}"
+    else:
+        key = f"{op}:{'x'.join(str(dim) for dim in shape)}"
+    return emit_model(key, scales, zero_points)
+
+
 # ReduceSum nodes Pulsar2 cannot tile ("Can not tile", also inside the step's
 # own Reshape -> ReduceSum -> Reshape chain) whose reduction, over the same
 # contiguous bytes with different shape labels, does compile: [16,1,64,12544]
