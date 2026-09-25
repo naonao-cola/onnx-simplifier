@@ -284,3 +284,205 @@ Reproduce (host builds; phone steps under `PHONE_LOCK_OWNER=<branch> ~/.cache/an
 python qnn_parity/gen_models.py $M && REMOTE_DIR=/data/local/tmp/<dir>/qnn \
   ../htp_exploration/ceiling/run_ceiling.sh $M 25 burst && ../htp_exploration/ceiling/summarize_ceiling.py $M burst
 ```
+
+## QDQ-exact 1x1 convolution (`hmx_qconv.h`)
+
+The `:cm` GEMM above as a drop-in for a QDQ `Conv` in the form onnxsim's `full_qdq` / QNN use: uint8
+activations with a zero point (128), per-channel symmetric int8 weights, int32 bias, uint8 output with its own
+scale and zero point, optional fused Relu. The reference is ORT CPU itself (it fuses `DQ -> Conv -> Q` into
+QLinearConv): `y = clamp(rne(fp32(fp32(acc) * M[c])) + zy)`, `M[c] = fp32(fp32(sx * sw[c]) / sy)`, where
+`acc = sum (xq - zx) * wq + bq`. `qnn_parity/qdq_ref.py` is that formula in numpy and matches ORT's output
+exactly (0 mismatches over 1.4 M outputs of four layers).
+
+### What the HMX conversion can and cannot do (hexagon-sim, `bias = mxmem2`)
+
+The 64-bit column table (`bias = mxmem2`, 256 B, **256-byte aligned** -- a 128-aligned table loads garbage)
+in int8 mode:
+
+- **high word: an int32 added exactly to the accumulator.** The activation zero point therefore folds into
+  it (`bq - zx * sum_k wq`), and the HMX consumes the raw uint8 activations.
+- low word bits 15:0: the fp16 scale `s`; **bit 22: +0.5 before the floor** (round half up). No other low-word
+  bits had an effect.
+- conversion: `floor(trunc(acc + B) * s / 512 [+ 0.5])`, where **the accumulator is truncated to a multiple of
+  `2^(5 - E)`** (`E` = the exponent of `s`): only ~4 fractional output bits survive, and the scale has 11 bits.
+  So a QDQ conv cannot be bit-exact through this path.
+- **`mxmem(C, 0):after:cm.ub = acc` (no `:sat`) wraps**, and `:retain` keeps the accumulator: four stores at
+  scales 1, 2^-8, 2^-16, 2^-24 (`0x6000 0x4000 0x2000 0x0800`) give the four bytes of the exact int32 accumulator,
+  two's complement (0 mismatches, |acc| up to 1.3 M, both halves of a weight `:deep` op). The 16-bit stores
+  (`:uh acc:2x1 / 2x2`) are no use after `:cm`: they expose only the odd rows.
+- An HMX tile store drops the low 11 address bits (2 KB alignment) -- a misaligned scratch tile silently
+  overwrote its neighbour.
+
+### Two requantization modes
+
+| mode | how | vs ORT |
+|---|---|---|
+| `QC_FAST` | one `:cm:sat.ub` store; table = fp16(512 M), round bit, int32 `B = bq - zx sum w + round(zy / M) + 2^(4-E)` (the last term centres the truncation) | off by one on ~1-3% of outputs |
+| `QC_EXACT` | 4 byte-plane stores -> exact acc; HVX integer requant `r = round(acc 2^L bm / 2^31) ~ v 2^F` (per-column `L`, `F`, `bm` so nothing overflows and `F` <= 21), `y = round-half-up(r / 2^F) + zy`; outputs whose `r` is within a per-column window of a .5 boundary (our error + fp32's own rounding in ORT's formula) are recomputed on the scalar core with ORT's fp32 formula (`convert_w2sf`, `sfmpy`, `convert_sf2w`) | **bit-exact** |
+
+Scalar loads from VTCM are slow (a tile needing the fix took 38 k cycles until HVX copied the group into stack
+memory first). The fix path runs for 0.1-0.5% of 4-row groups.
+
+### Phone (Xiaomi 12S, turbo, one HMX context; `qnn_parity/qdq_layer.py` layers, M = 2048 = 32x64 pixels)
+
+| layer | QNN HTP vs ORT | ours `QC_FAST` vs ORT | ours `QC_EXACT` vs ORT | `QC_FAST` time | `QC_EXACT` time | QNN per layer |
+|---|---:|---:|---:|---:|---:|---:|
+| 256->256 | 7.46% off by one | 3.14% | **0** | 8.1 us (16.6 TMAC/s) | 304 us | -- |
+| 256->256 + Relu (zy = 0) | 5.57% | 1.34% | **0** | 8.1 us | 347 us | -- |
+| 512->512 | 7.07% | 3.02% | **0** | 31.4 us (17.1) | 721 us | 65 us (per-tensor chain above) |
+| 1024->1024 | 7.39% | 3.23% | **0** | 125 us (17.2) | 1478 us | 155 us |
+| 3x3 128->128, stride 1 / 2 (QNN only, for chunk 2) | 7.55% / 7.74% | | | | | |
+
+- **QNN's HTP is not bit-exact against ORT either**: ~7% of outputs are off by one on every layer here
+  (`qdq_layer.py` model through `qnn_run`, strict HTP; mostly -1). "QNN-class accuracy" is therefore a 7%
+  off-by-one rate, and `QC_FAST` halves it at full HMX speed.
+- `QC_EXACT` is bit-exact on all 4.2 M outputs, but its HVX requant (~0.6 ns per output on one thread) is
+  10-40x slower than the HMX. Spreading it over the other HVX threads is the obvious next step.
+
+Reproduce: `qnn_parity/qdq_layer.py <dir> 1024 1024 32 64` (model + ORT reference), `qnn_parity/export_case.py
+<dir> <case>`, push the case, `./run.sh qconv <case> 20`; `sim/qconv_sim.c <case>` on hexagon-sim.
+`tests/test_hmx_gemm.py::test_hmx_qconv_qdq_exact_on_hexagon_sim` builds a small layer and checks both modes.
+
+## QDQ 3x3 convolution, stride 1 and 2 (`hmx_qconv3.h`)
+
+Same requantization as above (`QC_FAST` / `QC_EXACT`), for `Conv` 3x3 with pad 1.
+
+### The instruction form: `:single` row-offset windows (hexagon-sim one-hot map)
+
+`activation.ub = mxmem(Rs, Rt):single:cm` reads a 64-row window that starts `4 * Rs[10:7]` rows into the crouton at
+`Rs` (2 KB aligned) and continues into the crouton at `Rs + Rt[31:11]` (`Rt[10:0] = 0x7ff` as for `:cm`); `Rs[1]`
+had no effect, so window starts are multiples of 4 rows. It runs at the full `:cm` + weight `:deep` rate (11 200
+MAC/cycle in `hexagon-sim --timing`). `:above:cm` behaved the same in the plain probe, but hung the simulator in a
+loop with a guessed `Rt`: QNN's 3x3 kernels (`hmx_convbbb_stride1`) pair it with per-instruction offset fields
+from a table, which this directory has not mapped. `weight.b ... :dilate` ran at the same rate as the plain
+weight load; its layout is not mapped either.
+
+### Layout and taps
+
+Activations are stored *flat*: pixel (y, x) is flat pixel `M0 + (y+1)*Wp + x`, with row stride `Wp = roundup(W+1, 4)`
+(padding columns W..Wp-1), a padding row above and below, and a margin `M0` chosen so that the output region starts
+on a 64-pixel block (an output tile is directly a block of the next layer's input). Padding pixels hold the
+activation zero point, so padding is exact. Pixels go 64 per crouton (the `:cm` row dimension).
+
+- Tap (dy, dx) of an output block reads the 64 input pixels at flat offset `dy*Wp + dx`. `dy*Wp` is a multiple of
+  4, which is exactly a `:single` window (second crouton = next pixel block, `Rt[31:11] = kt * 2 KB`). `dx = -1/+1`
+  read two one-pixel-shifted copies of the input (HVX `vlalign`/`valign` by 32 bytes).
+- A 3x3 conv is then `9 * kt` `:single` instructions (with weight `:deep`, 64 output channels) per output tile
+  pair, accumulating like a longer K. No im2col.
+- Stride 2: HVX splits the input into its four row/column phases (`vdeal` by 32 bytes: even/odd pixels) in the
+  output's flat geometry. Tap (dy, dx) reads phase (dy != 0, dx != 0) with a row offset of -1 for dy = -1 and the
+  one-pixel-shifted odd-column phase for dx = -1. The stride-1 machinery then runs on quarter-size maps.
+- **The 256 KB VTCM rule bites `:single`**: its two croutons are kt * 2 KB apart, and a pair straddling a 256 KB
+  boundary faulted the PD (`Bad VA` just below the boundary; the simulator does not model it). About 1-3% of
+  windows straddle. `qc_conv3x3_plan` finds them once per layer and routes them through side croutons that
+  `qc_conv3x3_stitch` fills each run (16 vector moves each). `sim/qconv3_stitch_sim.c` forces every offset window
+  through that path.
+- The per-instruction addresses are a table built once per layer (building it per call cost more than the conv).
+
+### Phone (Xiaomi 12S, turbo; `qdq_layer.py` layers at 32x64, both modes vs ORT CPU)
+
+| layer | QNN vs ORT | `QC_FAST` vs ORT | `QC_EXACT` vs ORT | `QC_FAST` per layer (prep) | `QC_EXACT` per layer | QNN per layer |
+|---|---:|---:|---:|---:|---:|---:|
+| 3x3 128->128, s1 | 7.55% | 3.37% | **0** | 33.8 us (13.4) | 227 us | 14 us (L22 - L2 chain) |
+| 3x3 256->256, s1 | -- | 3.12% | **0** | 103.9 us (28.9) | 1070 us | 82 us |
+| 3x3 128->128, s2 | 7.74% | 3.40% | **0** | 29.1 us (23.9) | 81.5 us | not separable (whole 1-layer model 0.25 ms incl. ~0.2 ms launch/IO) |
+| 3x3 64->64, s1 8x12 / s2 9x11 (odd sizes) | | 3.2% / 3.7% | **0** / **0** | | | |
+
+- **Correctness: bit-exact against ORT CPU in `QC_EXACT` for stride 1 and 2, odd sizes, fused Relu**, on the
+  phone and on hexagon-sim (stitched and direct windows).
+- **Speed: QNN is still ahead on 3x3** (14 vs 34 us at 128 channels, 82 vs 104 us at 256). About 13-29 us of ours
+  is the HVX shifted copies (and the phase split at stride 2), which QNN avoids. Its 21.6 TMAC/s at 128 channels
+  is also above our `:cm` + `:deep` MAC-loop ceiling (17.2), so QNN's `:above`/`:dilate` pairing (2D spatial
+  croutons with X offsets, presumably) does something this form does not. Mapping those is the lever. Running
+  the copies on another HVX thread in parallel with the previous layer's HMX work would hide most of our prep.
+
+Reproduce: `qdq_layer.py <dir> 128 128 32 64 3 1` (or `... 3 2` for stride 2), `export_case.py`, `./run.sh qconv
+<case>`; `sim/qconv3_sim.c <case>`. QNN chains: `qnn_parity/gen_models.py <dir> 2 22 conv3x3` + `run_ceiling.sh`.
+
+## A QDQ graph on the DSP in one FastRPC call: ResNet-18, bit-exact against ORT (`runner/`)
+
+The conversion + runtime part of an SNPE/QNN replacement, on top of the kernels above.
+
+- **Converter** (`runner/qdq_graph.py`, host Python): takes a static QDQ ONNX in onnxsim's `full_qdq` +
+  `quantized_io(nhwc_inputs=...)` form and lowers it to a program. Supported ops: Conv (k x k, stride 1/2, pad k/2,
+  per-channel int8, int32 bias; a Relu folded into the output Q is implicit), Add (ORT's QLinearAdd), MaxPool
+  (3x3 s2 p1) and the NHWC input Transpose. Any other op stops with an error naming the node (no fallback
+  partitioning yet). It also contains an **exact integer emulator** of the program, checked against ORT CPU.
+- **Loader / planner** (`runner/rn_load.h`, portable C: the phone client and hexagon-sim):
+  - packs the weights and the requantization params (`qc_pack_wk`, `qc_pack_params`); the stem's 3 input channels
+    are padded to 32;
+  - gives every tensor a flat geometry (`qc_geom2`: padding rows/columns per class of tensors that must share one);
+  - builds each window op's sources and taps: column-shifted copies for stride 1; row/column phases plus their
+    shifted copies for stride 2, including the 7x7 stem;
+  - plans VTCM with liveness-based first-fit reuse (7.4 MB peak for ResNet-18 at 224x224).
+- **DSP executor** (`runner/rn_exec.h`, skel RPCs `rn_load` / `rn_run` / `rn_unload`):
+  - The weights (11.6 MB) stay in the DSP heap. `rn_load` acquires VTCM and plans every conv's instruction-address
+    table.
+  - `rn_run` executes the whole op list in **one FastRPC call**: HMX convs (`qc_convk`), the HVX Add and MaxPool,
+    and padding maintenance after each op.
+  - A second HVX thread prefetches the next conv's weights while the current ops run.
+
+### Semantics that had to match ORT exactly
+
+- Conv: `rne(fp32(acc) * M)` as above. Every conv and the MaxPool matched ORT in isolation from the start.
+- **Add (ORT's MLAS QLinearAdd) is `rne(rb*b + (ra*a + fixed))`, `fixed = zy - (ra*za + rb*zb)`, with separate
+  (unfused) fp32 operations in exactly that order.** Other orders, or a fused multiply-add, were 1 LSB off on 2 of
+  200 k outputs of the first Add. Through the ReLU network those 2 LSBs grew into **20% of the final output**, so
+  "close enough" is not: one LSB anywhere compounds.
+- The DSP Add computes `a * ra` exactly: `a` times ra's 24-bit mantissa, split into 12-bit halves (`vmpy` + shifts).
+  Lanes whose fraction is within the window of fp32's own rounding in ORT's formula are recomputed on the scalar
+  core with that formula (`sfmpy`/`sfadd`/`convert_sf2w`). Build the loader with `-ffp-contract=off`.
+
+### Result (Xiaomi 12S, V69, turbo; `runner/resnet18_qdq.py`: torchvision weights, onnxsim `full_qdq` calibrated on 32 coco128 images, 224x224, stem .. layer4 = 20 Conv + 8 Add + MaxPool)
+
+| | vs ORT CPU (25 088 outputs of layer4) | time per inference |
+|---|---:|---:|
+| **ours, `QC_EXACT`** | **0 mismatches (bit-exact)** | **3.43 ms** on the DSP, 5.3-5.7 ms wall per call |
+| ours, `QC_FAST` | 35.0% off (errors compound through the net) | 1.83 ms on the DSP, 3.5-3.9 ms wall per call |
+| QNN HTP (ORT QNN EP 2.6.0 / QNN 2.50, strict, EP-context, burst) | **35.6% off** (4427 by more than 1, max 9; cosine 0.9963) | **0.43 ms** wall |
+
+- **Accuracy: QNN's own result is 35.6% off ORT on this model.** Every conv and Add's 1-LSB differences compound.
+  Our exact mode is the only one of the three that reproduces ORT, and our fast mode lands in the same class as QNN.
+- **Speed: QNN is 4.3x faster on the DSP time (8x on wall).** Where our fast-mode 1.83 ms goes (`RN_OPS=1` per op
+  and phase):
+  - HMX + requant (all convs): ~0.52 ms. The MACs alone would be ~0.1 ms at 17 TMAC/s. The 7x7 stem computes
+    32 padded channels for 3 real ones (10x), and small layers pay per-tile overheads.
+  - Source building (shifted copies, phase splits): ~0.35 ms, 0.16 ms of it the stem. QNN's `:above`/`:dilate`
+    instruction forms (unmapped here) avoid these copies.
+  - Adds: ~0.64 ms, of which 0.23 ms is scalar near-tie fixes in the first three; the HVX loop is 0.55 cycles per
+    element in hexagon-sim.
+  - Layer4 weight streaming: ~0.25 ms that the one-op-ahead prefetch does not hide yet, since the Adds in between
+    are short. DMA would help, as would prefetching two ops ahead.
+  - MaxPool: 0.17 ms.
+- Exact mode adds ~1.6 ms: the HVX integer requant on one thread (0.47 ms more on the stem alone). Spreading it over
+  the idle HVX threads is the next step there.
+- Wall per call adds ~1.7-2 ms on top of the DSP time: FastRPC copies the 1.65 MB flat input (zero-copy rpcmem
+  buffers and packing on the DSP from the 150 KB NHWC input would remove most of it), plus thread and lock setup.
+
+Optimizations measured on the way (phone, fast mode):
+
+| step | per inference |
+|---|---:|
+| first working version | 3.75 ms |
+| shift copies without a per-vector select (2.2x faster in sim) | |
+| Add with exact mantissa products (window ~100 instead of ~350) and branch-free inner loop (4.6x in sim) | |
+| Add near-tie rescan by 64-bit words instead of bytes (0.6 -> 0.12 ms on the first Add) | 2.18 ms |
+| page-aligned input (aligned HVX loads) + `l2fetch` of the next input rows in the stem's phase split (stem sources 510 -> 165 us) | 1.82 ms |
+| one-conv-ahead weight prefetch on a second HVX thread (vs synchronous copies) | 1.83 vs 2.00 ms |
+
+Exact mode went from 23.9 ms to 3.43 ms. Two things fixed on the way:
+- Near-dead output channels (tiny M) had made the stem's near-tie window enormous, flagging every output. Their
+  output is exactly zy, which is now short-circuited.
+- The fp32(acc) rounding term is dropped where those outputs saturate anyway.
+
+Reproduce:
+
+```
+python runner/resnet18_qdq.py resnet18-f37072fd.pth <coco images> $R     # model, input, ORT reference
+python runner/qdq_graph.py $R/backbone_qdq.onnx $R/prog $R/input.bin $R/ref.bin   # program + emulator check
+./build.sh; D=/data/local/tmp/<dir> ./run.sh setup; adb push $OUT/hmx_runner_client $R/prog $R/input.bin $R/ref.bin $D/...
+adb shell "cd $D && ADSP_LIBRARY_PATH=$D RN_OPS=1 ./hmx_runner_client '<uri>' prog input.bin ref.bin 20"
+```
+
+`tests/test_hmx_gemm.py::test_hmx_graph_runner_bit_exact_on_hexagon_sim` runs the whole runner on hexagon-sim for a
+tiny ResNet-shaped graph (`runner/make_tiny.py`) and requires 0 mismatches against ORT.
