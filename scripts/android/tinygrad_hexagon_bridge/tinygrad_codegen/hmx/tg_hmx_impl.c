@@ -25,7 +25,7 @@ static void worker(void* p) {
   j->codes[3] = j->codes[2] ? -1 : HAP_compute_res_hmx_lock(j->rt->ctx);
   if (j->codes[3] == 0) {
     unsigned long long t0 = HAP_perf_get_time_us();
-    for (int it = 0; it < j->iters; it++) TG_KERNEL(j->c, j->a, j->b);
+    for (int it = 0; it < j->iters; it++) TG_CALL(j->c, j->a, j->b);
     j->t[0] = HAP_perf_get_time_us() - t0;
     HAP_compute_res_hmx_unlock(j->rt->ctx);
   }
@@ -34,7 +34,7 @@ static void worker(void* p) {
 }
 
 #define SA (TG_M * TG_K * (int)sizeof(tg_a_t))
-#define SB (TG_K * TG_N * (int)sizeof(tg_b_t))
+#define SB (TG_K * TG_N * (int)sizeof(tg_b_t) + TG_B_EXTRA)
 #define SC (TG_M * TG_N * (int)sizeof(tg_c_t))
 int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const uint8* b, int bLen, uint8* c, int cLen,
                    uint64* t, int tLen, int* codes, int codesLen) {

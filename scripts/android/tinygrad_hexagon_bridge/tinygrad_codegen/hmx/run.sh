@@ -7,7 +7,7 @@ S="${ANDROID_SERIAL:-239dbd8f}"; D="${D:-/data/local/tmp/codex-android-tinygrad-
 B="${OUT:-$(cd "$(dirname "$0")" && pwd)/build}"; A=(adb -s "$S")
 case "$1" in
   setup) "${A[@]}" shell "mkdir -p $D" && "${A[@]}" push "$B/tg_hmx_client" "$B/tg_hmx_rpc.so" $D/ >/dev/null && "${A[@]}" shell "chmod 755 $D/tg_hmx_client" ;;
-  run) shift; "${A[@]}" shell "cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D I8=${I8:-0} timeout ${RUN_TIMEOUT:-60} ./tg_hmx_client \
+  run) shift; "${A[@]}" shell "cd $D && LD_LIBRARY_PATH=/vendor/lib64 ADSP_LIBRARY_PATH=$D I8=${I8:-0} RQ=${RQ:-0} ZY=${ZY:-131} LO=${LO:-0} timeout ${RUN_TIMEOUT:-60} ./tg_hmx_client \
          'file:///tg_hmx_rpc.so?tg_hmx_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp' $*; echo exit=\$?" ;;
   clean) "${A[@]}" shell "rm -rf $D" ;;
 esac
