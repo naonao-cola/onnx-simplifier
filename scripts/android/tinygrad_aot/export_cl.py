@@ -65,6 +65,29 @@ class AdrenoCLRenderer(OpenCLRenderer):
     if dtype == dtypes.bool and addrspace == AddrSpace.GLOBAL: dtype = dtypes.uint8
     return super()._render_dtype(dtype, sz, addrspace, mutable, override_ptr, shape)
 
+def GridSample(X:Tensor, grid:Tensor, align_corners:int=0, mode:str="linear", padding_mode:str="zeros"):
+  """ONNX GridSample, 2D, bilinear, zero padding (what RF-DETR's deformable attention uses; tinygrad's OnnxRunner has
+  no GridSample): four gathers from the flattened feature map, masked where a corner falls outside"""
+  if mode not in ("linear", "bilinear") or padding_mode != "zeros" or X.ndim != 4:
+    raise NotImplementedError(f"GridSample {mode=} {padding_mode=} ndim={X.ndim}")
+  N, C, H, W = X.shape
+  _, Ho, Wo, _ = grid.shape
+  gx, gy = grid[..., 0], grid[..., 1]
+  if align_corners: x, y = (gx + 1) * (W - 1) / 2, (gy + 1) * (H - 1) / 2
+  else: x, y = ((gx + 1) * W - 1) / 2, ((gy + 1) * H - 1) / 2
+  x0, y0 = x.floor(), y.floor()
+  flat = X.reshape(N, C, H * W)
+  out = None
+  for dy in (0, 1):
+    for dx in (0, 1):
+      xi, yi = x0 + dx, y0 + dy
+      w = (1 - (x - xi).abs()) * (1 - (y - yi).abs())
+      valid = (xi >= 0) & (xi <= W - 1) & (yi >= 0) & (yi <= H - 1)
+      idx = (yi.clip(0, H - 1) * W + xi.clip(0, W - 1)).cast(dtypes.int32).reshape(N, 1, Ho * Wo).expand(N, C, Ho * Wo)
+      v = flat.gather(2, idx).reshape(N, C, Ho, Wo) * (w * valid).reshape(N, 1, Ho, Wo)
+      out = v if out is None else out + v
+  return out
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("onnx"); ap.add_argument("out")
@@ -116,7 +139,22 @@ def main():
         return prg
     cg.to_program = rz.to_program = to_program_fallback
 
+  # OnnxRunner reads shape-like inputs (Gather indices, Reshape shapes, ...) back as Python values; for a scalar
+  # constant that means realizing a CONST with a kernel on tinygrad's CPU device, which needs a C compiler the
+  # Android CPython doesn't have. Read constants straight off the graph instead.
+  import tinygrad.nn.onnx as onnx_mod
+  orig_const = onnx_mod._to_python_const
+  def to_python_const(t:Tensor):
+    b = t.uop.base
+    if b.op is Ops.CAST and b.src[0].op is Ops.CONST: b = b.src[0]  # a scalar initializer: CAST(CONST)
+    if b.op is Ops.CONST and t.dtype != dtypes.uint8 and all(isinstance(d, int) for d in t.shape):
+      v = (int if dtypes.is_int(t.dtype) else bool if t.dtype == dtypes.bool else float)(b.arg)
+      def nest(shape): return v if not shape else [nest(shape[1:]) for _ in range(shape[0])]
+      return nest(tuple(t.shape))
+    return orig_const(t)
+  onnx_mod._to_python_const = to_python_const
   runner = OnnxRunner(Path(args.onnx))
+  runner.onnx_ops = {**runner.onnx_ops, "GridSample": GridSample}
   (iname, itensor), = runner.graph_inputs.items()
   ishape = tuple(itensor.shape)
   if args.u8_nhwc:

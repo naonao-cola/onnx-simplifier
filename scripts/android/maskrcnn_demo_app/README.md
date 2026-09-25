@@ -145,6 +145,9 @@ Measured on the phone under the shared phone lock (the app's running averages):
 
 <img src="docs/rfdetr_images.jpg" width="240" alt="RF-DETR-Nano on a COCO image in the app">
 
+`--es opts engine=tinygrad` runs `rfdetr_nano.tg` (`../tinygrad_aot`) on the Adreno instead: 267 ms (3.3 FPS), same
+detections above threshold as fp32 on COCO #139.
+
 ## SAM mode (tap to segment, EfficientViT-SAM-L0)
 
 The "SAM" button runs Segment Anything (`SamActivity`, its own process `:sam`,
