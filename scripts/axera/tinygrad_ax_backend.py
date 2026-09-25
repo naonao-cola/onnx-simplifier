@@ -521,7 +521,13 @@ class TemplateEntry:
 
 
 class TemplateCache:
-    """Resolves keys to committed Pulsar2-built fixtures. No builds."""
+    """Resolves measured templates and performs safe Pulsar-free graph reuse.
+
+    Op-level misses remain explicit errors because synthesizing a new fused
+    program still requires a compiler.  A complete source graph can however
+    reuse a validated AX model when its topology is identical; that path is
+    delegated to :mod:`template_model_generator` and never invokes Pulsar2.
+    """
 
     def lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
@@ -581,6 +587,47 @@ class TemplateCache:
 
     def load(self, key: TemplateKey) -> onnx.ModelProto:
         return _load_gz_model(self.lookup(key).path)
+
+    def generate_graph_template(
+        self,
+        source_path: str,
+        template_source_path: str,
+        template_axmodel_path: str,
+        output_path: str,
+    ) -> str:
+        """Copy a validated same-topology AX template without Pulsar2.
+
+        The source graph is checked against the graph used to validate the
+        compiled template.  This deliberately does not patch weights or
+        constants: those changes need an emitter with a corresponding
+        validation record.  Returning the output path makes this suitable for
+        the tinygrad compiler/cache seam while keeping the generic generator
+        independently usable from the command line.
+        """
+        from template_model_generator import generate
+
+        generate(
+            source_path,
+            template_source_path,
+            template_axmodel_path,
+            output_path,
+        )
+        return output_path
+
+    def generate_graph_template_bytes(
+        self,
+        source_path: str,
+        template_source_path: str,
+        template_axmodel_path: str,
+    ) -> bytes:
+        """Return a validated same-topology AX model without disk IO."""
+        from template_model_generator import generate_model
+
+        return generate_model(
+            source_path,
+            template_source_path,
+            template_axmodel_path,
+        ).SerializeToString()
 
     def get_or_build(self, key: TemplateKey, onnx_bytes: bytes | None = None):
         """Plan section 6: build on a miss. Builds are Pulsar2 runs, out of scope
@@ -1481,6 +1528,537 @@ def build_request(
     return json.dumps(req, sort_keys=True)
 
 
+def build_graph_template_request(
+    source_path: str,
+    template_source_path: str,
+    template_axmodel_path: str,
+    output_path: str | None = None,
+) -> str:
+    """Build the JSON source accepted by ``AXCompiler`` for graph reuse."""
+    req = {
+        "kind": "graph_template",
+        "source": source_path,
+        "template_source": template_source_path,
+        "template_axmodel": template_axmodel_path,
+    }
+    if output_path is not None:
+        req["output"] = output_path
+    return json.dumps(req, sort_keys=True)
+
+
+def build_generated_graph_request(
+    source_path: str,
+    output_path: str | None = None,
+    schedule_path: str | None = None,
+) -> str:
+    """Build the JSON request for a measured graph generator family.
+
+    Unlike ``build_graph_template_request``, this request does not need a
+    source/template AX pair: ``graph_generator`` selects a validated fused
+    family and emits its model plus optional scheduler sidecar directly.
+    """
+    req = {"kind": "generated_graph", "source": source_path}
+    if output_path is not None:
+        req["output"] = output_path
+    if schedule_path is not None:
+        req["schedule"] = schedule_path
+    return json.dumps(req, sort_keys=True)
+
+
+def lower_uop_to_onnx(root) -> onnx.ModelProto:
+    """Lower one statically shaped tinygrad UOp pattern to ordinary ONNX.
+
+    The supported patterns are tinygrad's canonical Relu lowering,
+    ``WHERE(CMPLT(0, x), x, 0)``, fused with either ``Relu(Reshape(x))`` or
+    ``Reshape(Relu(x))``. Both orderings are measured by the Pulsar-free
+    generator. Arbitrary movement/reduction UOps still need dedicated AX
+    templates or MCode semantics.
+    """
+    from tinygrad.uop.ops import Ops
+
+    if root.op is Ops.CAST and len(root.src) == 1:
+        comparison = root.src[0]
+        if comparison.op is Ops.CMPLT and len(comparison.src) == 2:
+            left, right = comparison.src
+            if left.op is Ops.CONST and float(left.arg) == 0.0:
+                comparison_op, data = "Greater", right
+            elif right.op is Ops.CONST and float(right.arg) == 0.0:
+                comparison_op, data = "Less", left
+            else:
+                comparison_op = None
+                data = None
+            if comparison_op is not None:
+                shape = tuple(int(dim) for dim in root.shape)
+                if (
+                    data.op is not Ops.RESHAPE
+                    or not data.src
+                    or data.src[0].op is not Ops.ALLOC
+                    or shape != (16, 64, 112, 112)
+                ):
+                    raise ValueError(
+                        "AX UOp comparison lowering is measured only for "
+                        "[16,64,112,112] ALLOC-backed inputs"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp comparison lowering currently supports float32 casts only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            comparison_op, ["x", "zero"], ["comparison"]
+                        ),
+                        onnx.helper.make_node("Cast", ["comparison"], ["y"], to=1),
+                    ],
+                    f"tinygrad_uop_{comparison_op.lower()}cast_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, shape
+                        )
+                    ],
+                    [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+                    [onnx.numpy_helper.from_array(np.asarray(0.0, dtype=np.float32), "zero")],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
+    if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and len(root.src) == 1:
+        permuted = root.src[0]
+        if (
+            permuted.op is Ops.PERMUTE
+            and tuple(int(axis) for axis in permuted.arg) == (0, 2, 3, 1)
+            and len(permuted.src) == 1
+            and permuted.src[0].op is Ops.RESHAPE
+            and permuted.src[0].src
+            and permuted.src[0].src[0].op is Ops.ALLOC
+        ):
+            input_shape = tuple(int(dim) for dim in permuted.src[0].shape)
+            output_shape = tuple(int(dim) for dim in root.shape)
+            if input_shape != (16, 64, 112, 112) or output_shape != (64,):
+                raise ValueError(
+                    "AX UOp ReduceSum lowering is measured only for "
+                    "[16,64,112,112] -> [64]"
+                )
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError(
+                    "AX UOp ReduceSum lowering currently supports float32 data only"
+                )
+            graph = onnx.helper.make_graph(
+                [
+                    onnx.helper.make_node(
+                        "ReduceSum", ["x"], ["y"], axes=[0, 2, 3], keepdims=0
+                    )
+                ],
+                "tinygrad_uop_reducesum_ax",
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "x", onnx.TensorProto.FLOAT, input_shape
+                    )
+                ],
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "y", onnx.TensorProto.FLOAT, output_shape
+                    )
+                ],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
+    if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and len(root.src) == 1:
+        outer_permute = root.src[0]
+        if (
+            outer_permute.op is Ops.PERMUTE
+            and tuple(int(axis) for axis in outer_permute.arg) == (4, 5, 0, 1, 2, 3)
+            and len(outer_permute.src) == 1
+        ):
+            inner_permute = outer_permute.src[0]
+            if (
+                inner_permute.op is Ops.PERMUTE
+                and tuple(int(axis) for axis in inner_permute.arg) == (0, 1, 3, 5, 2, 4)
+                and len(inner_permute.src) == 1
+                and inner_permute.src[0].op is Ops.RESHAPE
+            ):
+                windowed = inner_permute.src[0]
+                input_shape = (16, 64, 112, 112)
+                output_shape = tuple(int(dim) for dim in root.shape)
+                if tuple(int(dim) for dim in windowed.shape) != (
+                    16,
+                    64,
+                    3,
+                    56,
+                    3,
+                    56,
+                ) or output_shape != (16, 64, 56, 56):
+                    raise ValueError(
+                        "AX UOp MaxPool lowering is measured only for "
+                        "[16,64,112,112] -> [16,64,56,56]"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp MaxPool lowering currently supports float32 data only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "MaxPool",
+                            ["x"],
+                            ["y"],
+                            kernel_shape=[3, 3],
+                            strides=[2, 2],
+                            pads=[1, 1, 1, 1],
+                        )
+                    ],
+                    "tinygrad_uop_maxpool_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, input_shape
+                        )
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "y", onnx.TensorProto.FLOAT, output_shape
+                        )
+                    ],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
+    if root.op is Ops.MUL and len(root.src) == 2:
+        reduced, reciprocal = root.src
+        if (
+            reduced.op is Ops.RESHAPE
+            and reciprocal.op is Ops.RECIPROCAL
+            and len(reciprocal.src) == 1
+            and reciprocal.src[0].op is Ops.CONST
+            and float(reciprocal.src[0].arg) == 49.0
+            and reduced.src
+            and reduced.src[0].op is Ops.REDUCE
+        ):
+            reduction = reduced.src[0]
+            if (
+                reduction.arg[0] is Ops.ADD
+                and reduction.src
+                and reduction.src[0].op is Ops.PERMUTE
+                and reduction.src[0].src
+                and reduction.src[0].src[0].op is Ops.RESHAPE
+                and reduction.src[0].src[0].src
+                and reduction.src[0].src[0].src[0].op is Ops.ALLOC
+            ):
+                input_shape = tuple(int(dim) for dim in reduction.src[0].src[0].shape)
+                output_shape = tuple(int(dim) for dim in root.shape)
+                if input_shape != (16, 512, 7, 7) or output_shape != (16, 512, 1, 1):
+                    raise ValueError(
+                        "AX UOp ReduceMean lowering is measured only for [16,512,7,7]"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp ReduceMean lowering currently supports float32 data only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "ReduceMean", ["x"], ["y"], axes=[2, 3], keepdims=1
+                        )
+                    ],
+                    "tinygrad_uop_reducemean_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, input_shape
+                        )
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "y", onnx.TensorProto.FLOAT, output_shape
+                        )
+                    ],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
+    if root.op is Ops.MUL and len(root.src) == 2:
+        exp2_node, reciprocal = root.src
+        if (
+            exp2_node.op is Ops.EXP2
+            and len(exp2_node.src) == 1
+            and reciprocal.op is Ops.RECIPROCAL
+            and len(reciprocal.src) == 1
+        ):
+            exp2_mul = exp2_node.src[0]
+            if exp2_mul.op is Ops.MUL and len(exp2_mul.src) == 2:
+                centered, log2e = exp2_mul.src
+                if (
+                    log2e.op is Ops.CONST
+                    and float(log2e.arg) == 1.4426950408889634
+                    and centered.op is Ops.ADD
+                    and len(centered.src) == 2
+                ):
+                    data, max_term = centered.src
+                    if (
+                        data.op is Ops.RESHAPE
+                        and data.src
+                        and data.src[0].op is Ops.ALLOC
+                        and max_term.op is Ops.MUL
+                        and len(max_term.src) == 2
+                        and max_term.src[1].op is Ops.CONST
+                        and float(max_term.src[1].arg) == -1.0
+                    ):
+                        max_detach = max_term.src[0]
+                        if max_detach.op is Ops.DETACH and len(max_detach.src) == 1:
+                            max_reshape = max_detach.src[0]
+                            if max_reshape.op is Ops.RESHAPE and max_reshape.src:
+                                max_reduce = max_reshape.src[0]
+                                sum_reshape = reciprocal.src[0]
+                                if sum_reshape.op is Ops.RESHAPE and sum_reshape.src:
+                                    sum_reduce = sum_reshape.src[0]
+                                    if (
+                                        max_reduce.op is Ops.REDUCE
+                                        and max_reduce.arg[0] is Ops.MAX
+                                        and max_reduce.src
+                                        and max_reduce.src[0].op is Ops.PERMUTE
+                                        and max_reduce.src[0].src[0] is data
+                                        and sum_reduce.op is Ops.REDUCE
+                                        and sum_reduce.arg[0] is Ops.ADD
+                                        and sum_reduce.src
+                                        and sum_reduce.src[0].op is Ops.PERMUTE
+                                        and sum_reduce.src[0].src[0] is exp2_node
+                                    ):
+                                        shape = tuple(int(dim) for dim in root.shape)
+                                        if shape != (16, 1000):
+                                            raise ValueError(
+                                                "AX UOp Softmax lowering is measured only for shape (16, 1000)"
+                                            )
+                                        if str(root.dtype).split(".")[-1] != "float":
+                                            raise ValueError(
+                                                "AX UOp Softmax lowering currently supports float32 data only"
+                                            )
+                                        graph = onnx.helper.make_graph(
+                                            [onnx.helper.make_node("Softmax", ["x"], ["y"], axis=1)],
+                                            "tinygrad_uop_softmax_ax",
+                                            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+                                            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+                                        )
+                                        return onnx.helper.make_model(
+                                            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                                        )
+
+    misc_op = None
+    misc_data = None
+    if root.op is Ops.SQRT and len(root.src) == 1:
+        misc_op, misc_data = "Sqrt", root.src[0]
+    elif root.op is Ops.MUL and len(root.src) == 2:
+        log2_node, constant = root.src
+        if (
+            log2_node.op is Ops.LOG2
+            and len(log2_node.src) == 1
+            and constant.op is Ops.CONST
+            and float(constant.arg) == 0.6931471805599453
+        ):
+            misc_op, misc_data = "Log", log2_node.src[0]
+    if misc_op is not None:
+        if (
+            misc_data is None
+            or misc_data.op is not Ops.RESHAPE
+            or not misc_data.src
+            or misc_data.src[0].op is not Ops.ALLOC
+        ):
+            raise ValueError(f"AX UOp {misc_op} lowering requires an ALLOC-backed input")
+        if str(root.dtype).split(".")[-1] != "float":
+            raise ValueError(f"AX UOp {misc_op} lowering currently supports float32 data only")
+        shape = tuple(int(dim) for dim in root.shape)
+        measured_shapes = {
+            "Sqrt": (512, 512, 3, 3),
+            "Log": (16, 1000),
+        }
+        if shape != measured_shapes[misc_op]:
+            raise ValueError(
+                f"AX UOp {misc_op} lowering is measured only for shape {measured_shapes[misc_op]}"
+            )
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node(misc_op, ["x"], ["y"])],
+            f"tinygrad_uop_{misc_op.lower()}_ax",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        )
+        return onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        )
+
+    if root.op is Ops.MUL and len(root.src) == 2:
+        data, constant = root.src
+        if constant.op is Ops.CONST and float(constant.arg) == -1.0:
+            if data.op is not Ops.RESHAPE or not data.src or data.src[0].op is not Ops.ALLOC:
+                raise ValueError("AX UOp Neg lowering requires an ALLOC-backed input")
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError("AX UOp Neg lowering currently supports float32 data only")
+            shape = tuple(int(dim) for dim in root.shape)
+            if shape != (1, 1):
+                raise ValueError("AX UOp Neg lowering is measured only for shape [1,1]")
+            graph = onnx.helper.make_graph(
+                [onnx.helper.make_node("Neg", ["x"], ["y"])],
+                "tinygrad_uop_neg_ax",
+                [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+                [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
+    binary_op = None
+    left = right = None
+    if root.op is Ops.ADD and len(root.src) == 2:
+        left, right = root.src
+        if (
+            right.op is Ops.MUL
+            and len(right.src) == 2
+            and right.src[1].op is Ops.CONST
+            and float(right.src[1].arg) == -1.0
+        ):
+            binary_op = "Sub"
+            right = right.src[0]
+        else:
+            binary_op = "Add"
+    elif root.op is Ops.MUL and len(root.src) == 2:
+        left, right = root.src
+        if right.op is Ops.RECIPROCAL and len(right.src) == 1:
+            binary_op = "Div"
+            right = right.src[0]
+        else:
+            binary_op = "Mul"
+    if binary_op is not None:
+        if len(root.src) != 2:
+            raise ValueError(f"AX UOp {binary_op} lowering requires two operands")
+        assert left is not None and right is not None
+        if left.shape != right.shape or not left.shape:
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires equal static operand shapes"
+            )
+        if left.op is not Ops.RESHAPE or right.op is not Ops.RESHAPE:
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires reshape-backed inputs"
+            )
+        if (
+            not left.src
+            or not right.src
+            or left.src[0].op is not Ops.ALLOC
+            or right.src[0].op is not Ops.ALLOC
+        ):
+            raise ValueError(f"AX UOp {binary_op} lowering requires ALLOC-backed inputs")
+        if str(root.dtype).split(".")[-1] != "float":
+            raise ValueError(
+                f"AX UOp {binary_op} lowering currently supports float32 data only"
+            )
+        shape = tuple(int(dim) for dim in root.shape)
+        if any(dim <= 0 for dim in shape):
+            raise ValueError(
+                f"AX UOp {binary_op} lowering requires positive static shapes"
+            )
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node(binary_op, ["x", "z"], ["y"])],
+            f"tinygrad_uop_{binary_op.lower()}_ax",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        )
+        return onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        )
+
+    position = "before"
+    relu = root
+    if root.op is Ops.RESHAPE:
+        if len(root.src) < 1 or root.src[0].op is not Ops.WHERE:
+            raise ValueError(
+                "AX UOp lowering requires a Relu-shaped WHERE root or outer Reshape"
+            )
+        position = "after"
+        relu = root.src[0]
+    if relu.op is not Ops.WHERE or len(relu.src) != 3:
+        raise ValueError("AX UOp lowering currently requires a Relu-shaped WHERE root")
+    condition, true_value, false_value = relu.src
+    if condition.op is not Ops.CMPLT or len(condition.src) != 2:
+        raise ValueError("AX UOp lowering requires CMPLT(0, x) as the Relu condition")
+    zero, data = condition.src
+    if zero.op is not Ops.CONST or float(zero.val) != 0.0:
+        raise ValueError("AX UOp Relu condition must compare against zero")
+    if true_value is not data or false_value.op is not Ops.CONST or float(false_value.val) != 0.0:
+        raise ValueError("AX UOp Relu branches are not in the supported canonical form")
+    if position == "before":
+        if data.op is not Ops.RESHAPE or len(data.src) < 1 or data.src[0].op is not Ops.RESHAPE:
+            raise ValueError("AX UOp lowering requires one source reshape before Relu")
+        source = data.src[0]
+        source_shape = tuple(int(dim) for dim in source.shape)
+        target_shape = tuple(int(dim) for dim in data.shape)
+    else:
+        if data.op is not Ops.RESHAPE or len(data.src) < 1:
+            raise ValueError("AX UOp lowering requires an ALLOC-backed input to Relu")
+        source = data
+        source_shape = tuple(int(dim) for dim in data.shape)
+        target_shape = tuple(int(dim) for dim in root.shape)
+    if not source_shape or not target_shape or any(dim <= 0 for dim in (*source_shape, *target_shape)):
+        raise ValueError("AX UOp lowering requires positive static shapes")
+    if source.src[0].op is not Ops.ALLOC:
+        raise ValueError("AX UOp lowering requires an ALLOC-backed input")
+    if relu.dtype != data.dtype or root.dtype != relu.dtype:
+        raise ValueError("AX UOp Relu output dtype differs from its data input")
+    if str(root.dtype).split(".")[-1] != "float":
+        raise ValueError("AX UOp lowering currently supports float32 data only")
+
+    shape_name = "uop_reshape_shape"
+    nodes = (
+        [
+            onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
+            onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
+        ]
+        if position == "before"
+        else [
+            onnx.helper.make_node("Relu", ["x"], ["relu"]),
+            onnx.helper.make_node("Reshape", ["relu", shape_name], ["y"]),
+        ]
+    )
+    graph = onnx.helper.make_graph(
+        nodes,
+        "tinygrad_uop_ax",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],
+        [onnx.numpy_helper.from_array(np.asarray(target_shape, dtype=np.int64), shape_name)],
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+
+
+def compile_uop(
+    root,
+    schedule_path: str | None = None,
+    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+) -> bytes:
+    """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
+
+    Standalone binary operations require explicit
+    ``calibration={"scales": {"x", "z", "y"}, "zero_points": {"x", "z",
+    "y"}}`` because their measured AX programs depend on quantization, not
+    just the UOp shape.
+    """
+    import graph_generator
+
+    model = lower_uop_to_onnx(root)
+    with tempfile.TemporaryDirectory() as directory:
+        source = os.path.join(directory, "uop.onnx")
+        output = os.path.join(directory, "uop.axmodel")
+        onnx.save(model, source)
+        graph_generator.generate(
+            source, output, schedule_path=schedule_path, calibration=calibration
+        )
+        with open(output, "rb") as stream:
+            return stream.read()
+
+
 def apply_policy(
     key: TemplateKey, policy: QuantPolicy, node: str | None = None
 ) -> TemplateKey:
@@ -1512,6 +2090,48 @@ def compile_request(
     src: str, cache: TemplateCache | None = None, policy: QuantPolicy | None = None
 ) -> bytes:
     req = json.loads(src)
+    if req.get("kind") == "graph_template":
+        required = ("source", "template_source", "template_axmodel")
+        missing = [name for name in required if not isinstance(req.get(name), str)]
+        if missing:
+            raise ValueError(f"graph_template request missing paths: {missing}")
+        cache = cache or TemplateCache()
+        output = req.get("output")
+        if output is None:
+            return cache.generate_graph_template_bytes(
+                req["source"],
+                req["template_source"],
+                req["template_axmodel"],
+            )
+        cache.generate_graph_template(
+            req["source"],
+            req["template_source"],
+            req["template_axmodel"],
+            output,
+        )
+        with open(output, "rb") as f:
+            return f.read()
+    if req.get("kind") == "generated_graph":
+        source = req.get("source")
+        if not isinstance(source, str):
+            raise ValueError("generated_graph request missing source path")
+        import graph_generator
+
+        output = req.get("output")
+        schedule = req.get("schedule")
+        if output is not None and not isinstance(output, str):
+            raise ValueError("generated_graph output must be a path")
+        if schedule is not None and not isinstance(schedule, str):
+            raise ValueError("generated_graph schedule must be a path")
+        if output is None:
+            with tempfile.TemporaryDirectory() as directory:
+                output = os.path.join(directory, "generated.axmodel")
+                graph_generator.generate(source, output, schedule_path=schedule)
+                with open(output, "rb") as f:
+                    return f.read()
+        graph_generator.generate(source, output, schedule_path=schedule)
+        with open(output, "rb") as f:
+            return f.read()
     key = TemplateKey.from_json(req["key"])
     if policy is not None:
         key = apply_policy(key, policy, req.get("node"))

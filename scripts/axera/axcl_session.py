@@ -70,6 +70,7 @@ class IOSpec:
     nbytes: int
     dtype: type
     shape: tuple[int, ...]
+    elem_type: int = 0
 
 
 @dataclass
@@ -78,6 +79,133 @@ class Model:
     path: str
     inputs: list[IOSpec] = field(default_factory=list)
     outputs: list[IOSpec] = field(default_factory=list)
+
+
+def _validate_schedule(model: Model, schedule: dict) -> None:
+    """Check that a Pulsar-free schedule matches the loaded AX model IO."""
+    if schedule.get("schema_version") != 1:
+        raise DeviceError("unsupported or missing schedule schema_version")
+    try:
+        memory_size = int(schedule["memory_size"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise DeviceError("schedule has no valid memory plan") from error
+    allocations = schedule.get("allocations")
+    if not isinstance(allocations, list):
+        raise DeviceError("schedule has no allocation list")
+    allocation_by_name = {}
+    allocation_ranges = []
+    for allocation in allocations:
+        try:
+            name = allocation["name"]
+            offset = int(allocation["offset"])
+            nbytes = int(allocation["nbytes"])
+            first_kernel = int(allocation["first_kernel"])
+            last_kernel = int(allocation["last_kernel"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeviceError("schedule contains a malformed allocation") from error
+        if (
+            not isinstance(name, str)
+            or offset < 0
+            or nbytes <= 0
+            or offset % 64
+            or first_kernel < 0
+            or first_kernel > last_kernel
+            or offset + nbytes > memory_size
+        ):
+            raise DeviceError(
+                f"schedule allocation is outside its memory plan: {allocation}"
+            )
+        if name in allocation_by_name:
+            raise DeviceError(f"schedule has duplicate allocation {name!r}")
+        allocation_by_name[name] = allocation
+        allocation_ranges.append(
+            (name, offset, offset + nbytes, first_kernel, last_kernel)
+        )
+    kernels = schedule.get("kernels")
+    if not isinstance(kernels, list) or not kernels:
+        raise DeviceError("schedule has no executable kernels")
+    if any(
+        first >= len(kernels) or last >= len(kernels)
+        for _, _, _, first, last in allocation_ranges
+    ):
+        raise DeviceError("schedule allocation lifetime exceeds kernel list")
+    for index, left in enumerate(allocation_ranges):
+        for right in allocation_ranges[index + 1 :]:
+            live = left[3] <= right[4] and right[3] <= left[4]
+            overlaps = left[1] < right[2] and right[1] < left[2]
+            if live and overlaps:
+                raise DeviceError(
+                    f"schedule allocations overlap while live: {left[0]!r}, {right[0]!r}"
+                )
+    kernel_names = [kernel.get("name") for kernel in kernels]
+    if any(not isinstance(name, str) or not name for name in kernel_names):
+        raise DeviceError("schedule contains a malformed kernel")
+    if len(set(kernel_names)) != len(kernel_names):
+        raise DeviceError("schedule contains duplicate kernel names")
+    kernel_buffers = set()
+    for kernel in kernels:
+        inputs = kernel.get("inputs")
+        output = kernel.get("output")
+        if (
+            not isinstance(inputs, list | tuple)
+            or not isinstance(output, str)
+            or not output
+            or any(not isinstance(name, str) or not name for name in inputs)
+        ):
+            raise DeviceError(f"schedule contains a malformed kernel {kernel!r}")
+        kernel_buffers.update(inputs)
+        kernel_buffers.add(output)
+    missing_buffers = kernel_buffers - set(allocation_by_name)
+    if missing_buffers:
+        raise DeviceError(
+            "schedule has no allocation for kernel buffer(s): "
+            + ", ".join(sorted(missing_buffers))
+        )
+    unused_buffers = set(allocation_by_name) - kernel_buffers
+    if unused_buffers:
+        raise DeviceError(
+            "schedule contains allocation(s) unused by kernels: "
+            + ", ".join(sorted(unused_buffers))
+        )
+    kernel_index = {name: index for index, name in enumerate(kernel_names)}
+    dependencies = schedule.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise DeviceError("schedule dependencies must be a list")
+    for dependency in dependencies:
+        if (
+            not isinstance(dependency, list | tuple)
+            or len(dependency) != 2
+            or dependency[0] not in kernel_index
+            or dependency[1] not in kernel_index
+            or kernel_index[dependency[0]] >= kernel_index[dependency[1]]
+        ):
+            raise DeviceError(f"schedule contains an invalid dependency {dependency!r}")
+    for kind, specs in (("inputs", model.inputs), ("outputs", model.outputs)):
+        entries = schedule.get(kind)
+        if not isinstance(entries, list) or len(entries) != len(specs):
+            raise DeviceError(
+                f"schedule {kind} count does not match model ({len(entries or [])} != {len(specs)})"
+            )
+        for index, (spec, entry) in enumerate(zip(specs, entries)):
+            expected = (
+                entry.get("name"),
+                tuple(entry.get("shape", ())),
+                int(entry.get("elem_type", -1)),
+                int(entry.get("nbytes", -1)),
+            )
+            actual = (spec.name, spec.shape, spec.elem_type, spec.nbytes)
+            if expected != actual:
+                raise DeviceError(
+                    f"schedule {kind}[{index}] does not match model: "
+                    f"scheduled={expected}, loaded={actual}"
+                )
+            allocation = allocation_by_name.get(spec.name)
+            if allocation is None:
+                raise DeviceError(
+                    f"schedule has no allocation for model {kind[:-1]} {spec.name!r}"
+                )
+    if memory_size <= 0:
+        raise DeviceError("schedule has no positive memory plan")
 
 
 def _vm_share(vm: str, device: str = "share") -> tuple[str, str]:
@@ -115,6 +243,7 @@ class AXSession:
         self._seq = itertools.count()
         self.exec_us = 0
         self.runs = 0
+        self._resident_inputs: dict[int, set[int]] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def build_runner(self) -> None:
@@ -193,7 +322,8 @@ class AXSession:
         return line
 
     # -- models ------------------------------------------------------------
-    def load(self, model: bytes | str) -> Model:
+    def load(self, model: bytes | str, schedule_path: str | None = None) -> Model:
+        """Load an AX model, optionally enforcing its Pulsar-free schedule."""
         n = next(self._seq)
         name = f"m{n}.axmodel"
         dst = os.path.join(self.host_dir, name)
@@ -208,21 +338,51 @@ class AXSession:
             kind, _, tname, nbytes, dt, *dims = line.split()
             spec = IOSpec(
                 tname, int(nbytes), _DTYPES.get(int(dt), np.uint8),
-                tuple(int(d) for d in dims),
+                tuple(int(d) for d in dims), int(dt),
             )  # fmt: skip
             (m.inputs if kind == "IN" else m.outputs).append(spec)
+        if schedule_path is not None:
+            try:
+                with open(schedule_path, encoding="utf-8") as stream:
+                    _validate_schedule(m, json.load(stream))
+            except Exception:
+                self._cmd(f"UNLOAD {m.id}")
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
         return m
 
     def unload(self, m: Model) -> None:
         self._cmd(f"UNLOAD {m.id}")
+        self._resident_inputs.pop(m.id, None)
         try:
             os.remove(m.path)
         except OSError:
             pass
 
-    def run(self, m: Model, inputs: list[np.ndarray]) -> list[np.ndarray]:
+    def run(
+        self,
+        m: Model,
+        inputs: list[np.ndarray],
+        resident_pairs: tuple[tuple[int, int], ...] = (),
+    ) -> list[np.ndarray]:
+        """Execute a model, optionally retaining input/output pairs on device.
+
+        After the first run, each resident output is copied directly into its
+        input buffer on the device and later host uploads for that input are
+        skipped. Outputs are still copied back for compatibility and metrics.
+        """
         if len(inputs) != len(m.inputs):
             raise ValueError(f"model takes {len(m.inputs)} inputs, got {len(inputs)}")
+        pairs = tuple(resident_pairs)
+        if any(
+            not (0 <= i < len(m.inputs) and 0 <= o < len(m.outputs))
+            for i, o in pairs
+        ):
+            raise ValueError(f"invalid resident pairs {pairs}")
+        resident = self._resident_inputs.setdefault(m.id, set())
         ins = []
         for k, (x, spec) in enumerate(zip(inputs, m.inputs)):
             buf = np.ascontiguousarray(x, dtype=spec.dtype).tobytes()
@@ -231,20 +391,31 @@ class AXSession:
                     f"input {spec.name}: {len(buf)} bytes, model wants {spec.nbytes}"
                 )
             p = f"t/i{k}.bin"
-            with open(os.path.join(self.host_dir, p), "wb") as f:
-                f.write(buf)
+            if k not in resident:
+                with open(os.path.join(self.host_dir, p), "wb") as f:
+                    f.write(buf)
             ins.append(f"{self.guest_dir}/{p}")
         outs = [f"t/o{k}.bin" for k in range(len(m.outputs))]
-        line = self._cmd(
-            f"RUN {m.id} {len(ins)} {' '.join(ins)} {len(outs)} "
-            + " ".join(f"{self.guest_dir}/{p}" for p in outs)
-        )
+        if pairs:
+            pair_args = " ".join(f"{i} {o}" for i, o in pairs)
+            line = self._cmd(
+                f"RUNR {m.id} {len(ins)} {' '.join(ins)} {len(pairs)} {pair_args} "
+                f"{len(outs)} "
+                + " ".join(f"{self.guest_dir}/{p}" for p in outs)
+            )
+        else:
+            line = self._cmd(
+                f"RUN {m.id} {len(ins)} {' '.join(ins)} {len(outs)} "
+                + " ".join(f"{self.guest_dir}/{p}" for p in outs)
+            )
         self.exec_us += int(line.split()[1])
         self.runs += 1
         res = []
         for p, spec in zip(outs, m.outputs):
             a = np.fromfile(os.path.join(self.host_dir, p), dtype=spec.dtype)
             res.append(a.reshape(spec.shape) if spec.shape else a)
+        for i, _ in pairs:
+            resident.add(i)
         return res
 
 

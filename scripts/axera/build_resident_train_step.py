@@ -76,6 +76,7 @@ bought on a real AX650N.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from typing import Dict, Sequence, Tuple
@@ -187,6 +188,7 @@ def _linearize_trainable_convs(
     out_nodes = []
     linearized = set()
     geometry_constants = {}
+    exact_constants = {}
 
     for node in model.graph.node:
         w = node.input[1] if node.op_type == "Conv" and len(node.input) > 1 else None
@@ -227,8 +229,13 @@ def _linearize_trainable_convs(
         made = []
 
         def const(array, hint):
+            array = np.asarray(array)
+            key = (array.dtype.str, tuple(array.shape), array.tobytes())
+            if key in exact_constants:
+                return exact_constants[key]
             name = legalize._unique_name(model, f"{stem}_{hint}")
             model.graph.initializer.append(numpy_helper.from_array(array, name))
+            exact_constants[key] = name
             return name
 
         def op(op_type, inputs, hint, **attrs):
@@ -569,10 +576,99 @@ def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
+def _deduplicate_exact_quantizers(model: onnx.ModelProto) -> int:
+    """Merge equivalent quantize/dequantize computations.
+
+    The key includes every input and serialized attribute, so quantizers with
+    different scales, zero points, axes, or domains are never merged.
+    """
+    producers: dict[tuple, str] = {}
+    replacements: dict[str, str] = {}
+    removed: set[str] = set()
+    for node in model.graph.node:
+        if node.op_type not in {"QuantizeLinear", "DequantizeLinear"}:
+            continue
+        if len(node.output) != 1 or any(not name for name in node.input):
+            continue
+        key = (
+            node.domain,
+            node.op_type,
+            tuple(node.input),
+            tuple(
+                (attribute.name, attribute.SerializeToString())
+                for attribute in sorted(node.attribute, key=lambda item: item.name)
+            ),
+        )
+        canonical = producers.get(key)
+        if canonical is None:
+            producers[key] = node.output[0]
+        else:
+            replacements[node.output[0]] = canonical
+            removed.add(node.output[0])
+
+    if not replacements:
+        return 0
+
+    def resolve(name: str) -> str:
+        while name in replacements:
+            name = replacements[name]
+        return name
+
+    for node in model.graph.node:
+        for index, name in enumerate(node.input):
+            node.input[index] = resolve(name)
+    for output in model.graph.output:
+        output.name = resolve(output.name)
+    kept = [
+        node
+        for node in model.graph.node
+        if not any(name in removed for name in node.output)
+    ]
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+    return len(removed)
+
+
+def _prune_dead_values(model: onnx.ModelProto) -> tuple[int, int]:
+    """Remove nodes and initializers that cannot reach a graph output.
+
+    The resident-step construction appends state updates and optional metric
+    nodes after the main simplify pass. Keeping this explicit liveness pass at
+    the end avoids stale branches or constants reaching a compiler/emitter,
+    while retaining every state and metric output exactly.
+    """
+    live = {output.name for output in model.graph.output}
+    kept_reversed = []
+    for node in reversed(model.graph.node):
+        if any(output in live for output in node.output):
+            kept_reversed.append(node)
+            live.update(name for name in node.input if name)
+    kept = list(reversed(kept_reversed))
+    removed_nodes = len(model.graph.node) - len(kept)
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+
+    kept_initializers = [
+        initializer
+        for initializer in model.graph.initializer
+        if initializer.name in live
+    ]
+    removed_initializers = len(model.graph.initializer) - len(kept_initializers)
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(kept_initializers)
+
+    value_info = [value for value in model.graph.value_info if value.name in live]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(value_info)
+    return removed_nodes, removed_initializers
+
+
 def build_resident_step(
     forward_and_loss: onnx.ModelProto,
     params: Sequence[str],
     loss_output: str = "loss",
+    metric_scale: float | None = None,
+    metric_output_only: bool = False,
 ) -> Tuple[onnx.ModelProto, Dict[str, str]]:
     """The full pipeline (this module's docstring, steps 2-7) over a forward
     model that already has its loss appended (`add_mse_loss`, or your own).
@@ -585,6 +681,13 @@ def build_resident_step(
             exactly `qat_graph.StepGraph.state`, restricted to `params`
             (the optimizer's own extra state, if any, is not exposed here
             since plain SGD carries none).
+    :param metric_scale: optional positive scale for an output-only
+            ``loss_scaled`` metric. The backward path still differentiates
+            ``loss``; scaling is applied after graph construction so it only
+            improves visibility of sub-LSB losses on int8 output quantization.
+    :param metric_output_only: when true, export only ``loss_scaled`` instead
+            of both metrics. The raw ``loss`` remains an internal tensor used
+            by the backward graph, so this changes output traffic only.
     """
     model = onnx.ModelProto()
     model.CopyFrom(forward_and_loss)
@@ -725,6 +828,51 @@ def build_resident_step(
     if not ok:
         raise RuntimeError("post-legalize simplify() failed its own correctness check")
 
+    _deduplicate_exact_quantizers(step_model)
+    onnx.checker.check_model(step_model)
+
+    if metric_scale is not None:
+        if not math.isfinite(metric_scale) or metric_scale <= 0:
+            raise ValueError("metric_scale must be a finite positive number")
+        if any(output.name == "loss_scaled" for output in step_model.graph.output):
+            raise ValueError("step graph already has a loss_scaled output")
+        scale_name = legalize._unique_name(step_model, "loss_metric_scale")
+        step_model.graph.initializer.append(
+            numpy_helper.from_array(
+                np.array(metric_scale, dtype=np.float32), scale_name
+            )
+        )
+        step_model.graph.node.append(
+            helper.make_node(
+                "Mul",
+                [loss_output, scale_name],
+                ["loss_scaled"],
+                name=legalize._unique_name(step_model, "loss_metric_scale_node"),
+            )
+        )
+        step_model.graph.output.append(
+            helper.make_tensor_value_info("loss_scaled", TensorProto.FLOAT, [1])
+        )
+        if metric_output_only:
+            state_names = set(step_graph.state.values())
+            state_outputs = [
+                output
+                for output in step_model.graph.output
+                if output.name in state_names
+            ]
+            del step_model.graph.output[:]
+            step_model.graph.output.append(
+                helper.make_tensor_value_info("loss_scaled", TensorProto.FLOAT, [1])
+            )
+            # State outputs are appended by make_step_graph and must stay
+            # visible for the resident runner's device-side update.
+            step_model.graph.output.extend(state_outputs)
+        onnx.checker.check_model(step_model)
+    elif metric_output_only:
+        raise ValueError("metric_output_only requires metric_scale")
+
+    _prune_dead_values(step_model)
+    onnx.checker.check_model(step_model)
     return step_model, step_graph.state
 
 

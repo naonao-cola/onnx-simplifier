@@ -156,7 +156,11 @@ markers = [
 # The vendored single-header option parser is not our code to reformat.
 # tflite_schema/schema_py_generated.py is flatc-generated TFLite schema
 # bindings (see that file's own header) -- not our code either.
-extend-exclude = ["onnxsim/cxxopts.hpp", "tools/onnx-cardputer-flash/scripts/tflite_schema/schema_py_generated.py"]
+extend-exclude = [
+  "onnxsim/cxxopts.hpp",
+  "onnxsim/version.py",
+  "tools/onnx-cardputer-flash/scripts/tflite_schema/schema_py_generated.py",
+]
 
 [tool.ruff.lint]
 # pycodestyle errors (E), Pyflakes (F), and isort (I). Import sorting is applied

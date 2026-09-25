@@ -28,6 +28,7 @@ import binary_op_scale_validate as bsv  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import emitter  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
+import misc_op_record_emit as misc  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
 _FIX = os.path.join(_AXERA_DIR, "fixtures")
@@ -85,6 +86,338 @@ def test_cache_refuses_unmeasured_keys(key):
 def test_cache_miss_is_not_built():
     with pytest.raises(NotImplementedError, match="Pulsar2 build"):
         axb.TemplateCache().get_or_build(axb.TemplateKey("Mul", ((1, 64, 56, 56),)))
+
+
+def test_cache_generates_same_topology_without_pulsar2(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    output = tmp_path / "generated.axmodel"
+    for path in (source, template_source, axmodel):
+        onnx.save(template, str(path))
+
+    got = axb.TemplateCache().generate_graph_template(
+        str(source), str(template_source), str(axmodel), str(output)
+    )
+
+    assert got == str(output)
+    assert onnx.load(str(output), load_external_data=False).SerializeToString() == (
+        template.SerializeToString()
+    )
+
+
+def test_cache_graph_template_refuses_topology_change(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = onnx.ModelProto()
+    source.CopyFrom(template)
+    source.graph.node[0].attribute[0].s = b"different"
+    source_path = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    onnx.save(source, str(source_path))
+    onnx.save(template, str(template_source))
+    onnx.save(template, str(axmodel))
+
+    with pytest.raises(ValueError, match="topology"):
+        axb.TemplateCache().generate_graph_template(
+            str(source_path),
+            str(template_source),
+            str(axmodel),
+            str(tmp_path / "out.axmodel"),
+        )
+
+
+def test_compiler_request_generates_graph_template_without_pulsar2(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    for path in (source, template_source, axmodel):
+        onnx.save(template, str(path))
+
+    request = axb.build_graph_template_request(
+        str(source), str(template_source), str(axmodel)
+    )
+    assert axb.compile_request(request) == template.SerializeToString()
+
+
+def test_compiler_request_runs_measured_generator_without_pulsar2(tmp_path):
+    shape = numpy_helper.from_array(np.array([1, 1, 8, 16], dtype=np.int64), "shape")
+    source_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Reshape", ["x", "shape"], ["r"]),
+                onnx.helper.make_node("Relu", ["r"], ["y"]),
+            ],
+            "source",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 8, 4, 4])],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 8, 16])],
+            [shape],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    source = tmp_path / "source.onnx"
+    output = tmp_path / "generated.axmodel"
+    schedule = tmp_path / "generated.schedule.json"
+    onnx.save(source_model, source)
+    request = axb.build_generated_graph_request(str(source), str(output), str(schedule))
+    generated = onnx.load_from_string(axb.compile_request(request))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(1, 8, 4, 4).reshape(1, 1, 8, 16).relu().uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Reshape", "Relu"]
+    schedule = tmp_path / "uop.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_lower_and_compile_tinygrad_relu_reshape_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(1, 8, 4, 4).relu().reshape(1, 1, 8, 16).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Relu", "Reshape"]
+    schedule = tmp_path / "uop_after.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_lower_and_compile_tinygrad_add_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(1, 64) + Tensor.empty(1, 64)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Add"]
+    _, meta = bse.load_template("Add", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "add.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "add"
+
+
+def test_lower_and_compile_tinygrad_mul_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(1, 64) * Tensor.empty(1, 64)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Mul"]
+    _, meta = bse.load_template("Mul", (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / "mul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "mul"
+
+
+@pytest.mark.parametrize("op", ["sub", "div"])
+def test_lower_and_compile_tinygrad_compound_binary_uop_with_explicit_calibration(
+    tmp_path, op
+):
+    from tinygrad import Tensor
+
+    left, right = Tensor.empty(1, 64), Tensor.empty(1, 64)
+    root = (left - right if op == "sub" else left / right).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == [op.title()]
+    _, meta = bse.load_template(op.title(), (1, 64), {"x": 0, "y": 0, "z": 0})
+    schedule = tmp_path / f"{op}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op
+
+
+def test_lower_and_compile_tinygrad_neg_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (-Tensor.empty(1, 1)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Neg"]
+    _, meta = misc.load_template("Neg:1x1")
+    schedule = tmp_path / "neg.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "neg"
+
+
+@pytest.mark.parametrize(
+    "op,shape",
+    [("sqrt", (512, 512, 3, 3)), ("log", (16, 1000))],
+)
+def test_lower_and_compile_tinygrad_misc_uop_with_explicit_calibration(
+    tmp_path, op, shape
+):
+    from tinygrad import Tensor
+
+    tensor = Tensor.empty(*shape)
+    root = (tensor.sqrt() if op == "sqrt" else tensor.log()).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == [op.title()]
+    _, meta = misc.load_template(f"{op.title()}:{'x'.join(map(str, shape))}")
+    schedule = tmp_path / f"{op}.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op
+
+
+def test_lower_and_compile_tinygrad_softmax_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 1000).softmax().uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Softmax"]
+    _, meta = misc.load_template("Softmax:16x1000:axis1")
+    schedule = tmp_path / "softmax.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "softmax"
+
+
+def test_lower_and_compile_tinygrad_reducemean_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 512, 7, 7).mean(axis=(2, 3), keepdim=True).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceMean"]
+    _, meta = misc.load_template("ReduceMean:16x512x7x7:axes2,3:k1")
+    schedule = tmp_path / "reducemean.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducemean"
+
+
+def test_lower_and_compile_tinygrad_reducesum_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 64, 112, 112).sum(axis=(0, 2, 3)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
+    _, meta = misc.load_template("ReduceSum:16x64x112x112:axes0,2,3:k0")
+    schedule = tmp_path / "reducesum.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
+
+
+def test_lower_and_compile_tinygrad_maxpool_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 64, 112, 112).max_pool2d(
+        kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)
+    ).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["MaxPool"]
+    _, meta = misc.load_template("MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1")
+    schedule = tmp_path / "maxpool.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
+
+
+def test_lower_and_compile_tinygrad_greatercast_uop_without_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(16, 64, 112, 112) > 0).cast("float32").uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Greater", "Cast"]
+    schedule = tmp_path / "greatercast.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "greatercast"
+
+
+def test_lower_uop_rejects_unvalidated_pattern():
+    from tinygrad import Tensor
+
+    with pytest.raises(ValueError, match="reshape-backed"):
+        axb.lower_uop_to_onnx((Tensor.empty(4) + Tensor.empty(4)).uop)
+
+
+def test_cache_graph_template_bytes_avoids_output_file(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    for path in (source, template_source, axmodel):
+        onnx.save(template, str(path))
+
+    got = axb.TemplateCache().generate_graph_template_bytes(
+        str(source), str(template_source), str(axmodel)
+    )
+    assert got == template.SerializeToString()
 
 
 def test_gather_edit_writes_indices_and_keeps_mcode():

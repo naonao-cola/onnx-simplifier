@@ -69,6 +69,53 @@ def _run(model, feeds, output_names=None):
     return sess.run(output_names, feeds)
 
 
+def test_exact_quantizers_are_shared_only_when_their_domain_matches():
+    scale = _f32(np.array([0.25]), "scale")
+    zero_point = onnx.numpy_helper.from_array(
+        np.array([0], dtype=np.uint8), "zero_point"
+    )
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "QuantizeLinear", ["x", "scale", "zero_point"], ["qx0"]
+            ),
+            onnx.helper.make_node(
+                "QuantizeLinear", ["x", "scale", "zero_point"], ["qx1"]
+            ),
+            onnx.helper.make_node("Add", ["qx0", "qx1"], ["y"]),
+        ],
+        "quant_dedup",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 4])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.UINT8, [1, 4])],
+        [scale, zero_point],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+    assert brts._deduplicate_exact_quantizers(model) == 1
+    assert [node.output[0] for node in model.graph.node] == ["qx0", "y"]
+    assert model.graph.node[-1].input == ["qx0", "qx0"]
+
+
+def test_prune_dead_values_keeps_outputs_and_removes_dead_branches():
+    dead_weight = _f32(np.ones((1,), dtype=np.float32), "dead_weight")
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Add", ["x", "live_weight"], ["y"]),
+            onnx.helper.make_node("Mul", ["x", "dead_weight"], ["dead"]),
+        ],
+        "liveness",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])],
+        [_f32(np.ones((1,), dtype=np.float32), "live_weight"), dead_weight],
+    )
+    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    assert brts._prune_dead_values(model) == (1, 1)
+    assert [node.output[0] for node in model.graph.node] == ["y"]
+    assert [initializer.name for initializer in model.graph.initializer] == ["live_weight"]
+    onnx.checker.check_model(model)
+
+
 def test_add_mse_loss_matches_manual_computation():
     forward = _forward_model()
     with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
@@ -118,6 +165,77 @@ def test_state_output_is_sgd_update_of_the_input():
     outs = dict(zip(out_names, _run(step_model, feeds, out_names)))
     assert np.array_equal(outs[state["cw"]], cw0)
     assert np.array_equal(outs[state["gw"]], gw0)
+
+
+def test_output_only_loss_metric_scale_does_not_change_backward_outputs():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    plain, plain_state = brts.build_resident_step(with_loss, params=["cw", "gw"])
+    scaled, scaled_state = brts.build_resident_step(
+        with_loss, params=["cw", "gw"], metric_scale=1000.0
+    )
+    assert [o.name for o in scaled.graph.output][-1] == "loss_scaled"
+    assert any(n.name == "loss_metric_scale_node" for n in scaled.graph.node)
+    assert plain_state == scaled_state
+
+    rng = np.random.default_rng(12)
+    feeds = {
+        "x": rng.standard_normal((1, 1, 4, 4)).astype(np.float32),
+        "y": rng.standard_normal((1, 10)).astype(np.float32),
+        "lr": np.array([0.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": onnx.numpy_helper.to_array(
+            next(i for i in forward.graph.initializer if i.name == "cw")
+        ),
+        "gw": onnx.numpy_helper.to_array(
+            next(i for i in forward.graph.initializer if i.name == "gw")
+        ),
+    }
+    plain_out = dict(
+        zip(
+            (o.name for o in plain.graph.output),
+            _run(plain, feeds, [o.name for o in plain.graph.output]),
+        )
+    )
+    scaled_out = dict(
+        zip(
+            (o.name for o in scaled.graph.output),
+            _run(scaled, feeds, [o.name for o in scaled.graph.output]),
+        )
+    )
+    assert np.allclose(scaled_out["loss_scaled"], plain_out["loss"] * 1000.0)
+    for name in plain_state.values():
+        assert np.array_equal(scaled_out[name], plain_out[name])
+
+
+def test_metric_output_only_keeps_state_and_removes_raw_loss_output():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    scaled, state = brts.build_resident_step(
+        with_loss,
+        params=["cw", "gw"],
+        metric_scale=1000.0,
+        metric_output_only=True,
+    )
+    assert [output.name for output in scaled.graph.output] == [
+        "loss_scaled",
+        state["cw"],
+        state["gw"],
+    ]
+    assert any(
+        node.input[0] == "loss" for node in scaled.graph.node if node.op_type == "Mul"
+    )
+
+
+def test_metric_output_only_requires_a_metric_scale():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    with pytest.raises(ValueError, match="requires metric_scale"):
+        brts.build_resident_step(
+            with_loss,
+            params=["cw"],
+            metric_output_only=True,
+        )
 
 
 def test_rank1_state_update_is_reshaped_around_the_sub():
@@ -449,6 +567,36 @@ def test_linearize_trainable_convs_matches_conv_and_drops_the_weight_transpose()
         (got,) = _run(linearized, {"x": x}, ["y"])
         assert got.shape == ref.shape
         assert np.allclose(got, ref, atol=1e-4), (cin, cout, k, stride, pad, has_bias)
+
+
+def test_linearize_trainable_convs_shares_exact_shape_constants():
+    """Same-geometry trainable Conv nodes share immutable reshape constants."""
+    rng = np.random.default_rng(12)
+    model = parser.parse_model(
+        """
+        < ir_version: 10, opset_import: ["": 17] >
+        g (float[1,1,4,4] x) => (float[1,2,4,4] y2)
+        {
+          y0 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, w0)
+          y1 = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(x, w1)
+          y2 = Add(y0, y1)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(rng.standard_normal((2, 1, 3, 3)), "w0"),
+            _f32(rng.standard_normal((2, 1, 3, 3)), "w1"),
+        ]
+    )
+    linearized = brts._linearize_trainable_convs(
+        onnx.shape_inference.infer_shapes(model), ["w0", "w1"]
+    )
+    shape_initializers = [
+        init for init in linearized.graph.initializer if init.name not in {"w0", "w1"}
+    ]
+    # index, mask, and four reshape targets are sufficient for both Conv nodes.
+    assert len(shape_initializers) == 6
 
 
 def _bottleneck_model():

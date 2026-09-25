@@ -184,6 +184,17 @@ def make_work_dir(
                     arr = np.array(
                         [1e-4 * (1.0 + 1e-3 * rng.standard_normal())], dtype=np.float32
                     )
+                elif inp.name == "grad_seed":
+                    # The normal runtime seed is one.  Keep the default
+                    # calibration centred there instead of treating this
+                    # control scalar as an arbitrary trainable tensor.  A
+                    # caller that deliberately uses loss/gradient scaling
+                    # should pass ``real_data={"grad_seed": [...]}`` with
+                    # the intended range; otherwise AX quantization can pin
+                    # the seed to an unrelated random value.
+                    arr = np.array(
+                        [1.0 + 1e-3 * rng.standard_normal()], dtype=np.float32
+                    )
                 elif inp.name == x_name:
                     arr = (rng.standard_normal(dims) * x_scale).astype(np.float32)
                 else:
@@ -193,6 +204,13 @@ def make_work_dir(
                     # initializer of their own (see build_resident_step),
                     # so there is nothing else to center calibration on.
                     arr = (rng.standard_normal(dims) * weight_scale).astype(np.float32)
+                # ``real_data`` trajectories are commonly written as scalar
+                # schedules for rank-1 runtime inputs such as ``lr``.  The
+                # ONNX/Pulsar2 Numpy loader requires the sample shape to
+                # match the graph input exactly, so lift a scalar to the
+                # declared shape before putting it in the tar archive.
+                if dims and np.asarray(arr).ndim == 0:
+                    arr = np.full(dims, arr, dtype=np.float32)
                 buf = io.BytesIO()
                 np.save(buf, arr)
                 data = buf.getvalue()

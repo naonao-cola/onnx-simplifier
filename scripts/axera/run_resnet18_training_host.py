@@ -62,9 +62,13 @@ def run(out_dir: str, batch: int, steps: int, lr: float, seed: int = 7):
     state_outputs = (
         [state[name] for name in state_inputs]
         if state is not None
-        else [name for name in output_names if name != "loss"]
+        else [name for name in output_names if name not in {"loss", "loss_scaled"}]
     )
-    missing = [name for name in state_inputs + state_outputs if name not in input_names | set(output_names)]
+    missing = [
+        name
+        for name in state_inputs + state_outputs
+        if name not in input_names | set(output_names)
+    ]
     if missing:
         raise RuntimeError(f"step graph is missing expected state names: {missing}")
 
