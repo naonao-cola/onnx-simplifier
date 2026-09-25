@@ -1619,6 +1619,66 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                 graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
             )
 
+    if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and len(root.src) == 1:
+        outer_permute = root.src[0]
+        if (
+            outer_permute.op is Ops.PERMUTE
+            and tuple(int(axis) for axis in outer_permute.arg) == (4, 5, 0, 1, 2, 3)
+            and len(outer_permute.src) == 1
+        ):
+            inner_permute = outer_permute.src[0]
+            if (
+                inner_permute.op is Ops.PERMUTE
+                and tuple(int(axis) for axis in inner_permute.arg) == (0, 1, 3, 5, 2, 4)
+                and len(inner_permute.src) == 1
+                and inner_permute.src[0].op is Ops.RESHAPE
+            ):
+                windowed = inner_permute.src[0]
+                input_shape = (16, 64, 112, 112)
+                output_shape = tuple(int(dim) for dim in root.shape)
+                if tuple(int(dim) for dim in windowed.shape) != (
+                    16,
+                    64,
+                    3,
+                    56,
+                    3,
+                    56,
+                ) or output_shape != (16, 64, 56, 56):
+                    raise ValueError(
+                        "AX UOp MaxPool lowering is measured only for "
+                        "[16,64,112,112] -> [16,64,56,56]"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp MaxPool lowering currently supports float32 data only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "MaxPool",
+                            ["x"],
+                            ["y"],
+                            kernel_shape=[3, 3],
+                            strides=[2, 2],
+                            pads=[1, 1, 1, 1],
+                        )
+                    ],
+                    "tinygrad_uop_maxpool_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, input_shape
+                        )
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "y", onnx.TensorProto.FLOAT, output_shape
+                        )
+                    ],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
     if root.op is Ops.MUL and len(root.src) == 2:
         reduced, reciprocal = root.src
         if (
