@@ -243,6 +243,11 @@ jobs:
           cp "${SO_PATH}" "${DEMO_ROOT}/onnxsim_cpp2py_export.abi3.so"
           cp scripts/convertmodel/test/model.onnx "${DEMO_ROOT}/model.onnx"
           cp onnxsim/*.py "${DEMO_ROOT}/onnxsim_src/"
+          python - <<'PY' > "${DEMO_ROOT}/onnxsim_src/files.json"
+          import json
+          from pathlib import Path
+          print(json.dumps(sorted(p.name for p in Path("onnxsim").glob("*.py"))))
+          PY
           echo "DEMO_ROOT=${DEMO_ROOT}" >> "$GITHUB_ENV"
 
       - name: Install Playwright and Chromium

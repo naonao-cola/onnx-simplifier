@@ -50,7 +50,14 @@ try {
   await new Promise((resolveListen) => server.listen(port, "127.0.0.1", resolveListen));
   const address = server.address();
   const url = `http://127.0.0.1:${address.port}/`;
-  browser = await chromium.launch({ headless: true });
+  // Pyodide's side module is larger than Chromium's default 8 MiB limit for
+  // synchronous WebAssembly compilation. The page's import path is
+  // intentionally synchronous from Python, so enable the Chromium feature
+  // that Pyodide itself recommends for large dynamic modules.
+  browser = await chromium.launch({
+    headless: true,
+    args: ["--enable-features=WebAssemblyUnlimitedSyncCompilation"],
+  });
   page = await browser.newPage();
   page.on("pageerror", (error) => browserErrors.push(`pageerror: ${error.stack || error}`));
   page.on("console", (message) => {
