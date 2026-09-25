@@ -231,13 +231,20 @@ Every kernel of one realize is captured in order (source, buffers, outputs) inst
 
 | ResNet-18 backbone, 224x224, Xiaomi 12S (turbo) | vs ORT CPU (25088 outputs of layer4) | per inference |
 |---|---:|---:|
-| **tinygrad** (52 kernels: 20 HMX convs, 8 Adds, 24 copies/pool; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **32.7 ms** (first version 35.9) |
+| **tinygrad** (20 HMX convs, 8 Adds, pool, copies; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **24.1 ms** (35.9 -> 32.7 -> 29.9 -> 24.1) |
 | hand runner, `QC_EXACT` (`hmx_gemm/runner`) | 0 | 3.43 ms |
 | QNN HTP | 35.6% off by one or more | 0.43 ms |
 
 `make_tiny.py`'s net (every op kind): 18 kernels, 0/2048 off vs ORT on hexagon-sim and the phone, 541.6 us.
 
-Where the 10x to the hand runner goes (hexagon-sim, 37.7M pcycles, `G_PROF` per call in `sim_profile.txt`): the stem is
+Steps so far: stride-1 convs write straight into the next padded grid (the output grid has its row stride; four tiny
+assigns rewrite the ring): 32.7 -> 29.9 ms. The stem runs as a stride-1 4x4 conv on the input's 2x2 phase split (each
+pixel 4 phases x 8 channels = one 32-byte K block per tap; no overlapping rows, half the output grid) written straight into
+MaxPool's input grid: 29.9 -> 24.1 ms (hexagon-sim 33.7M -> 26.8M pcycles; the stem 13.8M -> 7.5M). That grid exposed a
+renderer bug fixed in the fork: vector accesses assumed natural alignment, and HVX drops the low address bits, so a
+misaligned 128-byte store wrote the aligned vector around it; unprovable indices now use an unaligned type.
+
+Where the (first version's) 10x to the hand runner went (hexagon-sim, 37.7M pcycles, `G_PROF` per call in `sim_profile.txt`): the stem is
 13.8M (37%). It is a 7x8 window on 4 padded channels (K = 7 x 32; with channels padded to 32 it was 18M), but its output
 grid is 112 x 230 pixels (the stride-2 grid keeps the input's row stride: half the pixels garbage), and each of its 2821
 activation tiles packs 64 overlapping 32-byte rows at 8-byte steps. The 24 crop/re-pad copies are 21%; the other 19 convs
