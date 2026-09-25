@@ -130,6 +130,23 @@ def test_cache_graph_template_refuses_topology_change(tmp_path):
         )
 
 
+def test_compiler_request_generates_graph_template_without_pulsar2(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    for path in (source, template_source, axmodel):
+        onnx.save(template, str(path))
+
+    request = axb.build_graph_template_request(
+        str(source), str(template_source), str(axmodel)
+    )
+    assert axb.compile_request(request) == template.SerializeToString()
+
+
 def test_gather_edit_writes_indices_and_keeps_mcode():
     key = _gather_key()
     template = axb.TemplateCache().load(key)

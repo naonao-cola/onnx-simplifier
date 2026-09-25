@@ -1513,6 +1513,24 @@ def build_request(
     return json.dumps(req, sort_keys=True)
 
 
+def build_graph_template_request(
+    source_path: str,
+    template_source_path: str,
+    template_axmodel_path: str,
+    output_path: str | None = None,
+) -> str:
+    """Build the JSON source accepted by ``AXCompiler`` for graph reuse."""
+    req = {
+        "kind": "graph_template",
+        "source": source_path,
+        "template_source": template_source_path,
+        "template_axmodel": template_axmodel_path,
+    }
+    if output_path is not None:
+        req["output"] = output_path
+    return json.dumps(req, sort_keys=True)
+
+
 def apply_policy(
     key: TemplateKey, policy: QuantPolicy, node: str | None = None
 ) -> TemplateKey:
@@ -1544,6 +1562,32 @@ def compile_request(
     src: str, cache: TemplateCache | None = None, policy: QuantPolicy | None = None
 ) -> bytes:
     req = json.loads(src)
+    if req.get("kind") == "graph_template":
+        required = ("source", "template_source", "template_axmodel")
+        missing = [name for name in required if not isinstance(req.get(name), str)]
+        if missing:
+            raise ValueError(f"graph_template request missing paths: {missing}")
+        cache = cache or TemplateCache()
+        output = req.get("output")
+        temporary = output is None
+        if temporary:
+            with tempfile.NamedTemporaryFile(suffix=".axmodel", delete=False) as f:
+                output = f.name
+        try:
+            cache.generate_graph_template(
+                req["source"],
+                req["template_source"],
+                req["template_axmodel"],
+                output,
+            )
+            with open(output, "rb") as f:
+                return f.read()
+        finally:
+            if temporary:
+                try:
+                    os.unlink(output)
+                except FileNotFoundError:
+                    pass
     key = TemplateKey.from_json(req["key"])
     if policy is not None:
         key = apply_policy(key, policy, req.get("node"))
