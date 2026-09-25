@@ -488,6 +488,25 @@ def test_lower_and_compile_tinygrad_wide_reducesum_uop(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
 
 
+def test_generic_reducesum_lowering_selects_indexed_template(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 1, 64, 576).sum(axis=0).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
+    _, meta = misc.load_template("ReduceSum:16x1x64x576:axes0:k0")
+    schedule = tmp_path / "generic_reducesum.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

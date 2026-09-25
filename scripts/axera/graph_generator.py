@@ -222,11 +222,18 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             ((16, 1000), (16, 1), (1,), 1):
                 "ReduceSum:16x1000:axes1:k1",
         }
-        key = key_by_signature.get(
-            (shape, output_shape, tuple(attrs.get("axes", ())), attrs.get("keepdims"))
-        )
+        axes = tuple(attrs.get("axes", ()))
+        keepdims = attrs.get("keepdims")
+        key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        try:
+            misc_op_record_emit.load_template(key)
+        except ValueError:
+            key = key_by_signature.get((shape, output_shape, axes, keepdims))
         if key is None:
-            raise ValueError("standalone ReduceSum requires a measured form")
+            raise ValueError(
+                "standalone ReduceSum has no validated template for "
+                f"shape={shape}, axes={axes}, keepdims={keepdims}"
+            )
         return GraphPlan(
             (
                 GraphSegment(

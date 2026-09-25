@@ -1788,6 +1788,49 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                 graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
             )
 
+    # Generic canonical tinygrad reduction lowering.  tinygrad moves reduced
+    # dimensions to the front of a permuted view, so the first ``count``
+    # entries of the permutation are the original ONNX axes.  A plain reshape
+    # is the fast path for a leading-axis reduction.
+    reduction_root = root
+    keepdims = 0
+    if root.op is Ops.RESHAPE and root.src and root.src[0].op is Ops.REDUCE:
+        reduction_root = root.src[0]
+        keepdims = 1
+    if reduction_root.op is Ops.REDUCE and reduction_root.arg[0] is Ops.ADD:
+        source = reduction_root.src[0] if reduction_root.src else None
+        count = int(reduction_root.arg[1])
+        axes = None
+        input_shape = ()
+        if source is not None and source.op is Ops.PERMUTE and source.src:
+            base = source.src[0]
+            if base.op is Ops.RESHAPE and base.src and base.src[0].op is Ops.ALLOC:
+                axes = tuple(sorted(int(axis) for axis in source.arg[:count]))
+                input_shape = tuple(int(dim) for dim in base.shape)
+        elif source is not None and source.op is Ops.RESHAPE and source.src:
+            if source.src[0].op is Ops.ALLOC:
+                axes = tuple(range(count))
+                input_shape = tuple(int(dim) for dim in source.shape)
+        output_shape = tuple(int(dim) for dim in root.shape)
+        if axes is not None and input_shape and str(root.dtype).split(".")[-1] == "float":
+            expected_output = tuple(
+                1 if axis in axes else dim for axis, dim in enumerate(input_shape)
+            ) if keepdims else tuple(dim for axis, dim in enumerate(input_shape) if axis not in axes)
+            if output_shape == expected_output:
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "ReduceSum", ["x"], ["y"], axes=list(axes), keepdims=keepdims
+                        )
+                    ],
+                    "tinygrad_uop_reducesum_ax",
+                    [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, input_shape)],
+                    [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, output_shape)],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
     if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and len(root.src) == 1:
         outer_permute = root.src[0]
         if (
