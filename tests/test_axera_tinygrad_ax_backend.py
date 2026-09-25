@@ -623,6 +623,21 @@ def test_lower_tinygrad_arbitrary_shape_conv_uop_to_onnx(
     assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
 
 
+@pytest.mark.parametrize("groups", [2, 4])
+def test_lower_tinygrad_grouped_conv_uop_to_onnx(groups):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(2, 4, 16, 16).conv2d(
+        Tensor.empty(8, 4 // groups, 3, 3), padding=1, groups=groups
+    ).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    node = lowered.graph.node[0]
+    attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
+    assert node.op_type == "Conv"
+    assert attrs["group"] == groups
+    assert attrs["pads"] == [1, 1, 1, 1]
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

@@ -1683,9 +1683,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         reduction_shape = tuple(int(dim) for dim in reduction.shape)
         if (
             len(output_shape) == 4
-            and len(reduction_shape) == 5
-            and reduction_shape[1] == 1
-            and reduction_shape[2:] == output_shape[1:]
+            and len(reduction_shape) >= 5
         ):
             alloc_reshapes = [
                 node
@@ -1709,6 +1707,12 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             if len(input_candidates) == 1 and len(weight_candidates) == 1:
                 input_shape = input_candidates[0]
                 weight_shape = weight_candidates[0]
+                if (
+                    input_shape[1] % weight_shape[1] != 0
+                    or output_shape[1] % (input_shape[1] // weight_shape[1]) != 0
+                ):
+                    return None
+                groups = input_shape[1] // weight_shape[1]
                 _, _, kernel_h, kernel_w = weight_shape
                 stride = None
                 pad_h = pad_w = None
@@ -1739,6 +1743,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                                 ["y"],
                                 strides=[stride, stride],
                                 pads=[pad_h, pad_w, pad_h, pad_w],
+                                **({"group": groups} if groups != 1 else {}),
                             )
                         ],
                         "tinygrad_uop_conv_ax",
