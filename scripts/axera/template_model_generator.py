@@ -58,6 +58,17 @@ def signature(model: onnx.ModelProto) -> GraphSignature:
     )
 
 
+def _io_signature(model: onnx.ModelProto) -> tuple[tuple, tuple]:
+    """Return the compiled model's externally visible IO contract."""
+    inputs = tuple(
+        sorted((v.name, v.type.tensor_type.elem_type, _shape(v)) for v in model.graph.input)
+    )
+    outputs = tuple(
+        sorted((v.name, v.type.tensor_type.elem_type, _shape(v)) for v in model.graph.output)
+    )
+    return inputs, outputs
+
+
 def _load(path: str) -> onnx.ModelProto:
     return onnx.load(path, load_external_data=False)
 
@@ -76,6 +87,8 @@ def generate(
     actual = signature(source)
     if actual != expected:
         raise ValueError("source graph does not match the validated AX template topology")
+    if _io_signature(template) != _io_signature(template_source):
+        raise ValueError("compiled AX template IO does not match its source graph")
     if len(template.graph.node) != 1 or template.graph.node[0].op_type != "neu mode":
         raise ValueError("template must contain exactly one fused neu mode node")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

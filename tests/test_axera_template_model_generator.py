@@ -55,3 +55,20 @@ def test_topology_mismatch_is_refused(tmp_path):
         paths.append(str(path))
     with pytest.raises(ValueError, match="topology"):
         tmg.generate(paths[0], paths[1], paths[2], str(tmp_path / "out.axmodel"))
+
+
+def test_compiled_template_io_mismatch_is_refused(tmp_path):
+    model = _load_template()
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    template = tmp_path / "template.axmodel"
+    output = tmp_path / "out.axmodel"
+    broken = onnx.ModelProto()
+    broken.CopyFrom(model)
+    broken.graph.input[0].name = "wrong_input"
+    onnx.save(model, str(source))
+    onnx.save(model, str(template_source))
+    onnx.save(broken, str(template))
+
+    with pytest.raises(ValueError, match="IO"):
+        tmg.generate(str(source), str(template_source), str(template), str(output))
