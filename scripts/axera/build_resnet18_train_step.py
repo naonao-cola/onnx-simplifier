@@ -33,7 +33,6 @@ if HERE not in sys.path:
 
 import build_resident_train_step as brts  # noqa: E402
 
-
 TRAIN_PARAMS = [
     # resnet18d's downsample is AvgPool (index 0) followed by Conv (index 1).
     "layer4.0.downsample.1.weight",
@@ -142,7 +141,7 @@ def _prepare_forward(fwd_path: str, prepared_path: str) -> onnx.ModelProto:
     return fwd
 
 
-def build_step(out_dir: str, batch: int):
+def build_step(out_dir: str, batch: int, metric_scale: float | None = None):
     """Build and save one batch-specific ResNet-18 training step."""
     if batch < 1:
         raise ValueError("batch must be positive")
@@ -157,12 +156,16 @@ def build_step(out_dir: str, batch: int):
     init_names = {t.name for t in fwd.graph.initializer}
     missing = [p for p in TRAIN_PARAMS if p not in init_names]
     if missing:
-        raise RuntimeError(f"trainable params not found after export cleanup: {missing}")
+        raise RuntimeError(
+            f"trainable params not found after export cleanup: {missing}"
+        )
 
     fwd = brts.set_batch(fwd, batch)
     fwd = onnx.shape_inference.infer_shapes(fwd)
     with_loss = brts.add_mse_loss(fwd, "logits", num_classes=1000)
-    step_model, state = brts.build_resident_step(with_loss, params=TRAIN_PARAMS)
+    step_model, state = brts.build_resident_step(
+        with_loss, params=TRAIN_PARAMS, metric_scale=metric_scale
+    )
     onnx.checker.check_model(step_model)
 
     step_path = os.path.join(out_dir, f"resnet18_step_b{batch}.onnx")
@@ -174,8 +177,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir")
     parser.add_argument("batch", type=int)
+    parser.add_argument(
+        "--metric-scale",
+        type=float,
+        default=None,
+        help="append output-only loss_scaled = loss * SCALE",
+    )
     args = parser.parse_args(argv)
-    step_path, state = build_step(args.out_dir, args.batch)
+    step_path, state = build_step(args.out_dir, args.batch, args.metric_scale)
     model = onnx.load(step_path)
     print(f"batch={args.batch}: {len(model.graph.node)} nodes, wrote {step_path}")
     for param, output in state.items():

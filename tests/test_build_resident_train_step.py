@@ -120,6 +120,47 @@ def test_state_output_is_sgd_update_of_the_input():
     assert np.array_equal(outs[state["gw"]], gw0)
 
 
+def test_output_only_loss_metric_scale_does_not_change_backward_outputs():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    plain, plain_state = brts.build_resident_step(with_loss, params=["cw", "gw"])
+    scaled, scaled_state = brts.build_resident_step(
+        with_loss, params=["cw", "gw"], metric_scale=1000.0
+    )
+    assert [o.name for o in scaled.graph.output][-1] == "loss_scaled"
+    assert any(n.name == "loss_metric_scale_node" for n in scaled.graph.node)
+    assert plain_state == scaled_state
+
+    rng = np.random.default_rng(12)
+    feeds = {
+        "x": rng.standard_normal((1, 1, 4, 4)).astype(np.float32),
+        "y": rng.standard_normal((1, 10)).astype(np.float32),
+        "lr": np.array([0.0], np.float32),
+        "grad_seed": np.array([1.0], np.float32),
+        "cw": onnx.numpy_helper.to_array(
+            next(i for i in forward.graph.initializer if i.name == "cw")
+        ),
+        "gw": onnx.numpy_helper.to_array(
+            next(i for i in forward.graph.initializer if i.name == "gw")
+        ),
+    }
+    plain_out = dict(
+        zip(
+            (o.name for o in plain.graph.output),
+            _run(plain, feeds, [o.name for o in plain.graph.output]),
+        )
+    )
+    scaled_out = dict(
+        zip(
+            (o.name for o in scaled.graph.output),
+            _run(scaled, feeds, [o.name for o in scaled.graph.output]),
+        )
+    )
+    assert np.allclose(scaled_out["loss_scaled"], plain_out["loss"] * 1000.0)
+    for name in plain_state.values():
+        assert np.array_equal(scaled_out[name], plain_out[name])
+
+
 def test_rank1_state_update_is_reshaped_around_the_sub():
     """A rank-1 trainable tensor's in-graph SGD `Sub` crashes Pulsar2's own
     NPU backend tiler on real hardware (`TileFailException("AxQuantizedSub,

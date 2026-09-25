@@ -27,7 +27,10 @@ from run_resnet18_training_host import make_batch  # noqa: E402
 
 def _initial_state(forward_path: str) -> dict[str, np.ndarray]:
     forward = onnx.load(forward_path)
-    initializers = {item.name: onnx.numpy_helper.to_array(item) for item in forward.graph.initializer}
+    initializers = {
+        item.name: onnx.numpy_helper.to_array(item)
+        for item in forward.graph.initializer
+    }
     missing = [name for name in builder.TRAIN_PARAMS if name not in initializers]
     if missing:
         raise ValueError(f"forward graph is missing trainable state: {missing}")
@@ -41,9 +44,13 @@ def run(
     lr: float,
     seed: int,
     grad_seed: float,
+    metric: str,
+    metric_scale: float,
 ) -> None:
     model_onnx = onnx.load(model_path)
-    x_shape = next(i for i in model_onnx.graph.input if i.name == "x").type.tensor_type.shape
+    x_shape = next(
+        i for i in model_onnx.graph.input if i.name == "x"
+    ).type.tensor_type.shape
     batch = x_shape.dim[0].dim_value
     x, y = make_batch(batch, seed)
     state = _initial_state(forward_path)
@@ -54,7 +61,9 @@ def run(
         try:
             input_names = [item.name for item in model.inputs]
             output_names = [item.name for item in model.outputs]
-            state_outputs = [name for name in output_names if name != "loss"]
+            state_outputs = [
+                name for name in output_names if name not in {"loss", "loss_scaled"}
+            ]
             if len(state_outputs) != len(builder.TRAIN_PARAMS):
                 raise ValueError(
                     f"expected {len(builder.TRAIN_PARAMS)} state outputs, got {state_outputs}"
@@ -68,7 +77,9 @@ def run(
                     "grad_seed": np.array([grad_seed], dtype=np.float32),
                     **state,
                 }
-                return [np.asarray(values[name], dtype=np.float32) for name in input_names]
+                return [
+                    np.asarray(values[name], dtype=np.float32) for name in input_names
+                ]
 
             for _ in range(1):
                 values = dict(zip(output_names, session.run(model, feeds())))
@@ -82,13 +93,17 @@ def run(
             losses = []
             for _ in range(steps):
                 values = dict(zip(output_names, session.run(model, feeds())))
-                losses.append(float(np.asarray(values["loss"]).reshape(-1)[0]))
+                losses.append(
+                    float(np.asarray(values[metric]).reshape(-1)[0]) / metric_scale
+                )
                 state = {
                     name: np.asarray(values[out_name]).copy()
                     for name, out_name in zip(builder.TRAIN_PARAMS, state_outputs)
                 }
             elapsed = time.perf_counter() - start
-            print(f"batch={batch} steps={steps} total_s={elapsed:.6f} step_ms={elapsed * 1000 / steps:.3f}")
+            print(
+                f"batch={batch} steps={steps} total_s={elapsed:.6f} step_ms={elapsed * 1000 / steps:.3f}"
+            )
             print(f"loss_first={losses[0]:.10f} loss_last={losses[-1]:.10f}")
             state_delta = max(
                 float(np.max(np.abs(state[name] - initial_state[name])))
@@ -108,8 +123,19 @@ def main(argv=None) -> int:
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--grad-seed", type=float, default=1.0)
+    parser.add_argument("--metric", choices=("loss", "loss_scaled"), default="loss")
+    parser.add_argument("--metric-scale", type=float, default=1.0)
     args = parser.parse_args(argv)
-    run(args.model, args.forward, args.steps, args.lr, args.seed, args.grad_seed)
+    run(
+        args.model,
+        args.forward,
+        args.steps,
+        args.lr,
+        args.seed,
+        args.grad_seed,
+        args.metric,
+        args.metric_scale,
+    )
     return 0
 
 

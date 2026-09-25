@@ -76,6 +76,7 @@ bought on a real AX650N.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from typing import Dict, Sequence, Tuple
@@ -573,6 +574,7 @@ def build_resident_step(
     forward_and_loss: onnx.ModelProto,
     params: Sequence[str],
     loss_output: str = "loss",
+    metric_scale: float | None = None,
 ) -> Tuple[onnx.ModelProto, Dict[str, str]]:
     """The full pipeline (this module's docstring, steps 2-7) over a forward
     model that already has its loss appended (`add_mse_loss`, or your own).
@@ -585,6 +587,10 @@ def build_resident_step(
             exactly `qat_graph.StepGraph.state`, restricted to `params`
             (the optimizer's own extra state, if any, is not exposed here
             since plain SGD carries none).
+    :param metric_scale: optional positive scale for an output-only
+            ``loss_scaled`` metric. The backward path still differentiates
+            ``loss``; scaling is applied after graph construction so it only
+            improves visibility of sub-LSB losses on int8 output quantization.
     """
     model = onnx.ModelProto()
     model.CopyFrom(forward_and_loss)
@@ -724,6 +730,30 @@ def build_resident_step(
     )
     if not ok:
         raise RuntimeError("post-legalize simplify() failed its own correctness check")
+
+    if metric_scale is not None:
+        if not math.isfinite(metric_scale) or metric_scale <= 0:
+            raise ValueError("metric_scale must be a finite positive number")
+        if any(output.name == "loss_scaled" for output in step_model.graph.output):
+            raise ValueError("step graph already has a loss_scaled output")
+        scale_name = legalize._unique_name(step_model, "loss_metric_scale")
+        step_model.graph.initializer.append(
+            numpy_helper.from_array(
+                np.array(metric_scale, dtype=np.float32), scale_name
+            )
+        )
+        step_model.graph.node.append(
+            helper.make_node(
+                "Mul",
+                [loss_output, scale_name],
+                ["loss_scaled"],
+                name=legalize._unique_name(step_model, "loss_metric_scale_node"),
+            )
+        )
+        step_model.graph.output.append(
+            helper.make_tensor_value_info("loss_scaled", TensorProto.FLOAT, [1])
+        )
+        onnx.checker.check_model(step_model)
 
     return step_model, step_graph.state
 
