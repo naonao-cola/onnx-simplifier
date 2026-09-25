@@ -231,11 +231,18 @@ Every kernel of one realize is captured in order (source, buffers, outputs) inst
 
 | ResNet-18 backbone, 224x224, Xiaomi 12S (turbo) | vs ORT CPU (25088 outputs of layer4) | per inference |
 |---|---:|---:|
-| **tinygrad** (52 kernels: 20 HMX convs, 8 Adds, 24 copies/pool; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **35.9 ms** |
+| **tinygrad** (52 kernels: 20 HMX convs, 8 Adds, 24 copies/pool; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **32.7 ms** (first version 35.9) |
 | hand runner, `QC_EXACT` (`hmx_gemm/runner`) | 0 | 3.43 ms |
 | QNN HTP | 35.6% off by one or more | 0.43 ms |
 
 `make_tiny.py`'s net (every op kind): 18 kernels, 0/2048 off vs ORT on hexagon-sim and the phone, 541.6 us.
+
+Where the 10x to the hand runner goes (hexagon-sim, 37.7M pcycles, `G_PROF` per call in `sim_profile.txt`): the stem is
+13.8M (37%). It is a 7x8 window on 4 padded channels (K = 7 x 32; with channels padded to 32 it was 18M), but its output
+grid is 112 x 230 pixels (the stride-2 grid keeps the input's row stride: half the pixels garbage), and each of its 2821
+activation tiles packs 64 overlapping 32-byte rows at 8-byte steps. The 24 crop/re-pad copies are 21%; the other 19 convs
+~40%, the Adds 2%. Next: write the conv output straight into the next padded grid (no copies; the hand runner fixes only
+the pads), a phase-split stem, and the hand kernel's crouton layout so activations need no packing.
 
 Reproduce:
 
