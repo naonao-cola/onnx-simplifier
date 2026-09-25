@@ -241,7 +241,7 @@ The fork's tests therefore assert against the formulas (`qdq_emulate`) and only 
 
 | ResNet-18 backbone, 224x224, Xiaomi 12S (turbo) | vs ORT CPU (25088 outputs of layer4) | per inference |
 |---|---:|---:|
-| **tinygrad** (20 HMX convs, 8 Adds, pool, copies; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **24.1 ms** (35.9 -> 32.7 -> 29.9 -> 24.1) |
+| **tinygrad** (20 HMX convs, 8 Adds, pool, copies; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **22.7 ms** (35.9 -> 32.7 -> 29.9 -> 24.1 -> 22.7) |
 | hand runner, `QC_EXACT` (`hmx_gemm/runner`) | 0 | 3.43 ms |
 | QNN HTP | 35.6% off by one or more | 0.43 ms |
 
@@ -253,6 +253,10 @@ pixel 4 phases x 8 channels = one 32-byte K block per tap; no overlapping rows, 
 MaxPool's input grid: 29.9 -> 24.1 ms (hexagon-sim 33.7M -> 26.8M pcycles; the stem 13.8M -> 7.5M). That grid exposed a
 renderer bug fixed in the fork: vector accesses assumed natural alignment, and HVX drops the low address bits, so a
 misaligned 128-byte store wrote the aligned vector around it; unprovable indices now use an unaligned type.
+
+Then activations in 32-channel blocks, `(C/32, rows, 32)`, end to end: a stride-1 conv's activation tile (64 grid pixels x one
+channel block) is one contiguous 2 KB, which the renderer copies instead of gathering 64 rows (the phase-split stem's input
+too): 24.2 -> 22.7 ms, hexagon-sim 26.8M -> 23.9M pcycles; the fork's tiny QDQ ResNet 1.03x the hand runner.
 
 Where the (first version's) 10x to the hand runner went (hexagon-sim, 37.7M pcycles, `G_PROF` per call in `sim_profile.txt`): the stem is
 13.8M (37%). It is a 7x8 window on 4 padded channels (K = 7 x 32; with channels padded to 32 it was 18M), but its output
