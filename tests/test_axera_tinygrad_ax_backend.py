@@ -384,6 +384,18 @@ def test_lower_and_compile_tinygrad_maxpool_uop_with_explicit_calibration(tmp_pa
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "maxpool"
 
 
+def test_lower_and_compile_tinygrad_greatercast_uop_without_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(16, 64, 112, 112) > 0).cast("float32").uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Greater", "Cast"]
+    schedule = tmp_path / "greatercast.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "greatercast"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

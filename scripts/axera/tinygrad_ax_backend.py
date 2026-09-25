@@ -1576,6 +1576,53 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.CAST and len(root.src) == 1:
+        comparison = root.src[0]
+        if comparison.op is Ops.CMPLT and len(comparison.src) == 2:
+            left, right = comparison.src
+            if left.op is Ops.CONST and float(left.arg) == 0.0:
+                comparison_op, data = "Greater", right
+            elif right.op is Ops.CONST and float(right.arg) == 0.0:
+                comparison_op, data = "Less", left
+            else:
+                comparison_op = None
+                data = None
+            if comparison_op is not None:
+                shape = tuple(int(dim) for dim in root.shape)
+                if (
+                    data.op is not Ops.RESHAPE
+                    or not data.src
+                    or data.src[0].op is not Ops.ALLOC
+                    or shape != (16, 64, 112, 112)
+                ):
+                    raise ValueError(
+                        "AX UOp comparison lowering is measured only for "
+                        "[16,64,112,112] ALLOC-backed inputs"
+                    )
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp comparison lowering currently supports float32 casts only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            comparison_op, ["x", "zero"], ["comparison"]
+                        ),
+                        onnx.helper.make_node("Cast", ["comparison"], ["y"], to=1),
+                    ],
+                    f"tinygrad_uop_{comparison_op.lower()}cast_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, shape
+                        )
+                    ],
+                    [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+                    [onnx.numpy_helper.from_array(np.asarray(0.0, dtype=np.float32), "zero")],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
     if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and len(root.src) == 1:
         permuted = root.src[0]
         if (

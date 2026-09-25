@@ -158,6 +158,34 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
+    if (
+        len(nodes) == 2
+        and nodes[0].op_type in ("Greater", "Less")
+        and nodes[1].op_type == "Cast"
+    ):
+        comparison, cast = nodes
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone comparison cast requires one runtime input named x")
+        shape = values.get("x", ())
+        if (
+            shape != (16, 64, 112, 112)
+            or values.get(cast.output[0], ()) != shape
+            or comparison.input[0] != "x"
+            or comparison.input[1] not in _initializer_map(model)
+            or cast.input[0] != comparison.output[0]
+        ):
+            raise ValueError("standalone comparison cast requires the measured [16,64,112,112] form")
+        return GraphPlan(
+            (
+                GraphSegment(
+                    comparison.op_type.lower() + "cast",
+                    ("x",),
+                    model.graph.output[0].name,
+                    shape,
+                    shape,
+                ),
+            )
+        )
     if len(nodes) == 1 and nodes[0].op_type == "ReduceSum":
         reduce_sum = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
@@ -362,6 +390,11 @@ def generate(
             raise ValueError("MaxPool calibration requires scales and zero_points mappings")
         model = misc_op_record_emit.emit_model(
             "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1", scales, zero_points
+        )
+        onnx.save(model, output_path)
+    elif plan.chain in ("greatercast", "lesscast"):
+        model = misc_op_record_emit.emit_model(
+            f"{plan.chain.title().replace('cast', 'Cast')}:16x64x112x112"
         )
         onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
