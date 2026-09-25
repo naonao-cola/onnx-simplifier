@@ -133,6 +133,30 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         return GraphPlan(
             (GraphSegment(neg.op_type.lower(), ("x",), model.graph.output[0].name, shape, shape),)
         )
+    if len(nodes) == 1 and nodes[0].op_type == "ReduceSum":
+        reduce_sum = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone ReduceSum requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        attrs = _attrs(reduce_sum)
+        if (
+            shape != (16, 64, 112, 112)
+            or output_shape != (64,)
+            or tuple(attrs.get("axes", ())) != (0, 2, 3)
+            or attrs.get("keepdims") != 0
+        ):
+            raise ValueError(
+                "standalone ReduceSum requires the measured "
+                "[16,64,112,112] axes [0,2,3] form"
+            )
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
     if len(nodes) == 1 and nodes[0].op_type == "ReduceMean":
         reduce_mean = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
@@ -291,6 +315,17 @@ def generate(
             raise ValueError("ReduceMean calibration requires scales and zero_points mappings")
         model = misc_op_record_emit.emit_model(
             "ReduceMean:16x512x7x7:axes2,3:k1", scales, zero_points
+        )
+        onnx.save(model, output_path)
+    elif plan.chain == "reducesum":
+        if calibration is None:
+            raise ValueError("standalone ReduceSum generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError("ReduceSum calibration requires scales and zero_points mappings")
+        model = misc_op_record_emit.emit_model(
+            "ReduceSum:16x64x112x112:axes0,2,3:k0", scales, zero_points
         )
         onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
