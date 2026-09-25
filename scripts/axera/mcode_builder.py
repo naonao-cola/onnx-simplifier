@@ -103,3 +103,23 @@ class MCodeProgram:
             if not isinstance(record, dict) or "kind" not in record:
                 raise ValueError("every MCode record must be a dictionary with kind")
         return mcode.encode(self.records)
+
+
+def replace_template_segment(template: bytes, segment: int, program: MCodeProgram) -> bytes:
+    """Replace one compressed segment in an AX MCode image.
+
+    ``MCodeProgram`` produces the decoded instruction bytes.  The AX image
+    stores those bytes in the repository's short-unit codec, so this helper
+    compresses the new stream and delegates header/tail relocation to the
+    already validated relayout implementation.  The template's opaque
+    container metadata remains intact.
+    """
+    import short_unit_codec
+    import step_recalibrate
+
+    compressed = short_unit_codec.encode(program.encode())
+    result = step_recalibrate.relayout(template, segment, compressed)
+    violations = mcode.check(result)
+    if violations:
+        raise ValueError("generated MCode failed structural validation: " + violations[0])
+    return result

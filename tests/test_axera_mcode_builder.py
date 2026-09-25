@@ -8,6 +8,7 @@ if _AXERA not in sys.path:
     sys.path.insert(0, _AXERA)
 
 import mcode_builder  # noqa: E402
+import step_recalibrate  # noqa: E402
 
 
 def test_builder_emits_decoded_record_stream():
@@ -35,3 +36,17 @@ def test_builder_can_extend_a_decoded_stream():
         [{"kind": "raw", "byte": 0x42}, {"kind": "raw", "byte": 0x00}]
     )
     assert program.encode() == b"\x42\x00"
+
+
+def test_builder_can_relayout_an_existing_template_segment():
+    path = os.path.join(
+        _AXERA, "fixtures", "step_recalib", "toyf_A1.axmodel.gz"
+    )
+    template = step_recalibrate.get_mcode(step_recalibrate.load(path))
+    raw = step_recalibrate.codec.decode_segments(template)[1]
+    program = mcode_builder.MCodeProgram().extend(
+        step_recalibrate.mcode_mod.decode(
+            raw, start=0, end=len(raw), **step_recalibrate.mcode_mod.FULL_RULE
+        )
+    )
+    assert mcode_builder.replace_template_segment(template, 1, program) == template
