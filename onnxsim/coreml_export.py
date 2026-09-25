@@ -378,6 +378,67 @@ def _lower_not(lowerer, node, ins, attrs):
     return [lowerer.mb.logical_not(x=ins[0], name=lowerer.fresh_name(node))]
 
 
+def _resize_nearest_indices(
+    input_size: int,
+    output_size: int,
+    scale: float,
+    coordinate_mode: str,
+    nearest_mode: str,
+) -> np.ndarray:
+    """The source index each output position samples, for one spatial axis.
+
+    Shared by the gather expansion below and the ``resize_nearest_neighbor``
+    eligibility check, so both describe the same sampling rule.
+    """
+    output = np.arange(output_size, dtype=np.float64)
+    if coordinate_mode == "asymmetric":
+        source = output / scale
+    elif coordinate_mode == "half_pixel":
+        source = (output + 0.5) / scale - 0.5
+    else:
+        raise RuntimeError(
+            f"Resize nearest coordinate_transformation_mode {coordinate_mode!r} "
+            f"is not supported"
+        )
+    if nearest_mode == "floor":
+        indices = np.floor(source)
+    elif nearest_mode == "ceil":
+        indices = np.ceil(source)
+    elif nearest_mode == "round_prefer_floor":
+        indices = np.ceil(source - 0.5)
+    elif nearest_mode == "round_prefer_ceil":
+        indices = np.floor(source + 0.5)
+    else:
+        raise RuntimeError(f"Resize nearest_mode {nearest_mode!r} is not supported")
+    return np.clip(indices, 0, input_size - 1).astype(np.int32)
+
+
+def _resize_nearest_is_repeating(input_size: int, indices: np.ndarray) -> bool:
+    """Whether this nearest Resize is a pure integer replication of the input.
+
+    ``resize_nearest_neighbor`` is a real Core ML kernel rather than a pair of
+    index gathers materializing an intermediate feature map, but it implements
+    its own fixed sampling rule, and `scripts/apple/README.md`'s Resize note
+    records why these were gathers in the first place (a Core ML resize runtime
+    limitation). So rather than assume the two rules agree, this requires the
+    strongest case where agreement is provable and was measured on Core ML: every
+    input position repeated a whole number of times (``2x2 -> 4x4``,
+    ``3x4 -> 6x8``, ``4x4 -> 8x8`` all match ONNX Runtime exactly).
+
+    Non-integer factors are deliberately excluded rather than compared against an
+    assumed formula: measured on Core ML, a downscale (``4x4 -> 2x2``) or a
+    fractional upscale (``2x2 -> 3x3``) samples *different* rows than ONNX does.
+    Those keep the gather path, so the documented "preserves ONNX's sampling
+    rule" property cannot regress.
+    """
+    output_size = int(indices.size)
+    if output_size % input_size or output_size < input_size:
+        return False
+    repeats = output_size // input_size
+    expected = np.repeat(np.arange(input_size, dtype=np.int32), repeats)
+    return bool(np.array_equal(indices, expected))
+
+
 @_register("Resize")
 def _lower_resize(lowerer, node, ins, attrs):
     """Lower static 2-D ONNX Resize ops used by CNN feature pyramids."""
@@ -460,33 +521,23 @@ def _lower_resize(lowerer, node, ins, attrs):
         if isinstance(nearest_mode, bytes):
             nearest_mode = nearest_mode.decode()
 
-        def nearest_indices(input_size, output_size, scale):
-            output = np.arange(output_size, dtype=np.float64)
-            if coordinate_mode == "asymmetric":
-                source = output / scale
-            elif coordinate_mode == "half_pixel":
-                source = (output + 0.5) / scale - 0.5
-            else:
-                raise RuntimeError(
-                    f"Resize nearest coordinate_transformation_mode "
-                    f"{coordinate_mode!r} is not supported"
+        height_indices = _resize_nearest_indices(
+            int(height), target_height, scales[-2], coordinate_mode, nearest_mode
+        )
+        width_indices = _resize_nearest_indices(
+            int(width), target_width, scales[-1], coordinate_mode, nearest_mode
+        )
+        if _resize_nearest_is_repeating(
+            int(height), height_indices
+        ) and _resize_nearest_is_repeating(int(width), width_indices):
+            return [
+                lowerer.mb.resize_nearest_neighbor(
+                    x=ins[0],
+                    target_size_height=target_height,
+                    target_size_width=target_width,
+                    name=resize_name,
                 )
-            if nearest_mode == "floor":
-                indices = np.floor(source)
-            elif nearest_mode == "ceil":
-                indices = np.ceil(source)
-            elif nearest_mode == "round_prefer_floor":
-                indices = np.ceil(source - 0.5)
-            elif nearest_mode == "round_prefer_ceil":
-                indices = np.floor(source + 0.5)
-            else:
-                raise RuntimeError(
-                    f"Resize nearest_mode {nearest_mode!r} is not supported"
-                )
-            return np.clip(indices, 0, input_size - 1).astype(np.int32)
-
-        height_indices = nearest_indices(int(height), target_height, scales[-2])
-        width_indices = nearest_indices(int(width), target_width, scales[-1])
+            ]
         height_index_var = lowerer.make_const(
             resize_name + "_height_indices", height_indices
         )
@@ -1846,6 +1897,33 @@ def _resolve_gather_nd_target(ct, model: onnx.ModelProto, resolved_target):
     return resolved_target
 
 
+def _resolve_resize_target(ct, model: onnx.ModelProto, resolved_target):
+    """Bump the deployment floor to iOS15 when the graph has a nearest Resize.
+
+    The fast path emits MIL's `resize_nearest_neighbor` (iOS15), so a graph that
+    may take it must both build and convert at that target or newer. The check is
+    deliberately coarse -- a nearest Resize that ends up ineligible and lowered to
+    gathers still raises the floor -- same trade-off (and same reason: keeping the
+    predicate stateless) as `_resolve_gather_nd_target` above.
+    """
+    if not any(
+        node.op_type == "Resize"
+        and _node_attrs(node).get("mode", "nearest") == "nearest"
+        for node in model.graph.node
+    ):
+        return resolved_target
+    floor = ct.target.iOS15
+    if resolved_target is None:
+        return floor
+    if int(resolved_target) < int(floor):
+        raise RuntimeError(
+            f"nearest Resize needs minimum_deployment_target iOS15/macOS12 or "
+            f"newer (got {resolved_target.name}); Core ML's resize_nearest_neighbor "
+            f"op did not exist before then."
+        )
+    return resolved_target
+
+
 def _resolve_quantized_target(ct, model: onnx.ModelProto, resolved_target):
     """Bump the deployment floor to iOS17 when the graph holds QDQ nodes.
 
@@ -1906,6 +1984,10 @@ def convert_to_coreml(
     minimum_deployment_target:
         Minimum OS version the model must run on, e.g. ``"iOS16"``/``"macOS13"``, or a
         ``coremltools.target`` member. Left at coremltools' own default when ``None``.
+        Raised automatically when the graph needs a newer op: a nearest ``Resize``
+        (iOS15), a batched ``GatherND`` or fp16 I/O (iOS16), QDQ nodes (iOS17), or
+        ``state=`` (iOS18). An explicitly older target is refused rather than
+        producing a model ``coremlcompiler`` would reject.
     skip_model_load:
         Skip compiling/loading the produced model for prediction (default ``True``).
         Compiling requires Apple's Core ML toolchain and only succeeds on macOS; leave
@@ -2007,6 +2089,7 @@ def convert_to_coreml(
         ct, io_dtype, convert_to, resolved_target
     )
     resolved_target = _resolve_gather_nd_target(ct, model, resolved_target)
+    resolved_target = _resolve_resize_target(ct, model, resolved_target)
     resolved_target = _resolve_quantized_target(ct, model, resolved_target)
     resolved_target = _resolve_state_target(ct, state, resolved_target)
 
