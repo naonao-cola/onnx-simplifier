@@ -8,7 +8,7 @@ HEX_ARCH="${HEX_ARCH:-v69}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT:-$SRC/build}"
 mkdir -p "$OUT" && cd "$OUT"
-cp "$SRC"/hmx_gemm_rpc.idl "$SRC"/hmx_gemm_impl.c "$SRC"/hmx_gemm_client.c "$SRC"/hmx_gemm_llm_client.c "$SRC"/hmx_gemm_u8_client.c "$SRC"/hmx_gemm_layers_client.c "$SRC"/hmx_qconv_client.c "$SRC"/hmx_gemm.h "$SRC"/hmx_qconv.h "$SRC"/qc_case.h "$SRC"/hmx_gemm_u8.h "$SRC"/hmx_block.h "$SRC"/hmx_runtime.h .
+cp "$SRC"/hmx_gemm_rpc.idl "$SRC"/hmx_gemm_impl.c "$SRC"/hmx_gemm_client.c "$SRC"/hmx_gemm_llm_client.c "$SRC"/hmx_gemm_u8_client.c "$SRC"/hmx_gemm_layers_client.c "$SRC"/hmx_qconv_client.c "$SRC"/hmx_gemm.h "$SRC"/hmx_qconv.h "$SRC"/hmx_qconv3.h "$SRC"/qc_case.h "$SRC"/hmx_gemm_u8.h "$SRC"/hmx_block.h "$SRC"/hmx_runtime.h .
 "$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic" -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" hmx_gemm_rpc.idl
 INC=(-I . -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef")
 QURT_INC=(-I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/qurt" -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/posix")

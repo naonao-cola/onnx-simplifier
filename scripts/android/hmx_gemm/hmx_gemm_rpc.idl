@@ -35,6 +35,12 @@ interface hmx_gemm_rpc : remote_handle64 {
   long qconv(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint8> a,
              in sequence<int8> wp, in sequence<uint8> prm, rout sequence<uint8> y,
              rout sequence<uint64> times, rout sequence<long> codes);
+  // QDQ 3x3 conv, pad 1, stride 1/2 (hmx_qconv3.h): xf = qc_flat_pack of the [H, W, C] input, wp = qc_pack_w3,
+  // prm as qconv (K = 9C); yf = the output flat buffer (qc_geom(Ho, Wo), N channels). times: [0] us for iters
+  // (prep + conv), [1] us of prep (shift copies / phase split / stitching) over iters, [2] scalar-fixed groups.
+  long qconv3(in long mode, in long H, in long W, in long C, in long N, in long stride, in long iters,
+              in sequence<uint8> xf, in sequence<int8> wp, in sequence<uint8> prm, rout sequence<uint8> yf,
+              rout sequence<uint64> times, rout sequence<long> codes);
   // core / HMX clocks (Hz) as HAP_power_get reports them: [0] core, [1] hmx, [2] dcvs enabled
   long clocks(rout sequence<long> v);
 };

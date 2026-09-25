@@ -9,7 +9,7 @@
 #define HMX_NOW() qurt_get_core_pcycles()
 #include "hmx_gemm.h"
 #include "hmx_gemm_u8.h"
-#include "hmx_qconv.h"
+#include "hmx_qconv3.h"
 
 extern unsigned long long HAP_perf_get_time_us(void);
 
@@ -619,6 +619,137 @@ int hmx_gemm_rpc_qconv(remote_handle64 h, int mode, int M, int K, int N, int ite
     qurt_thread_t tid;
     int st;
     codes[5] = qurt_thread_create(&tid, &ta, qconv_worker, &j);
+    if (codes[5] == 0) qurt_thread_join(tid, &st);
+  } else
+    codes[6] = -1;
+  HAP_compute_res_release(ctx);
+  return 0;
+}
+
+/* ---- QDQ 3x3 conv (hmx_qconv3.h) ---- */
+typedef struct {
+  unsigned int ctx;
+  uint8_t* vtcm;
+  int mode, H, W, C, N, stride, iters;
+  const uint8_t* xf;
+  const int8_t* wp;
+  const uint8_t* prm;
+  uint8_t* yf;
+  uint64* t;
+  int* codes;
+} qconv3_job_t;
+
+#define QC_SIDE_CAP 256
+static size_t qconv3_layout(int H, int W, int C, int N, int stride, size_t* o) {
+  qc_geom_t gi = qc_geom(H, W), go = qc_geom((H - 1) / stride + 1, (W - 1) / stride + 1);
+  int kt = C / 32, nt = N / 32;
+  size_t off = 0;
+#define QA(i, n) (off = (off + 2047) & ~(size_t)2047, o[i] = off, off += (n))
+  QA(0, qc_geom_bytes(&gi, kt));                          /* X */
+  QA(1, qc_geom_bytes(&go, nt));                          /* Y */
+  QA(2, (size_t)9 * C * N);                               /* W */
+  QA(3, sizeof(qc_blk_t) * nt + sizeof(qc_hdr_t));        /* params */
+  QA(4, 4 * 2048);                                        /* scratch */
+  QA(5, qc_geom_bytes(stride == 1 ? &gi : &go, kt));      /* shifted copy 0 */
+  QA(6, qc_geom_bytes(stride == 1 ? &gi : &go, kt));      /* shifted copy 1 */
+  for (int i = 0; i < 4; i++) QA(7 + i, stride == 2 ? qc_geom_bytes(&go, kt) : 0); /* phases */
+  QA(11, stride == 2 ? qc_geom_bytes(&go, kt) : 0);       /* junk p1 copy */
+  QA(12, (size_t)QC_SIDE_CAP * 2048);                     /* stitched :single windows */
+#undef QA
+  return off;
+}
+
+static void qconv3_worker(void* p) {
+  qconv3_job_t* j = (qconv3_job_t*)p;
+  j->codes[1] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+  j->codes[2] = HAP_compute_res_hmx_lock(j->ctx);
+  if (j->codes[2] == 0) {
+    size_t o[13];
+    qconv3_layout(j->H, j->W, j->C, j->N, j->stride, o);
+    qc_geom_t gi = qc_geom(j->H, j->W), go = qc_geom((j->H - 1) / j->stride + 1, (j->W - 1) / j->stride + 1);
+    int kt = j->C / 32, nt = j->N / 32;
+    uint8_t *v = j->vtcm, *X = v + o[0], *Y = v + o[1], *W = v + o[2], *P = v + o[3], *S = v + o[4];
+    memcpy(X, j->xf, qc_geom_bytes(&gi, kt));
+    memcpy(W, j->wp, (size_t)9 * j->C * j->N);
+    memcpy(P, j->prm, sizeof(qc_blk_t) * nt + sizeof(qc_hdr_t));
+    memset(Y, 0, qc_geom_bytes(&go, nt));
+    const qc_blk_t* B = (const qc_blk_t*)P;
+    const qc_hdr_t* Hh = (const qc_hdr_t*)(P + sizeof(qc_blk_t) * nt);
+    int zx = 0;
+    { /* zx = the value of any padding byte of the packed input */
+      zx = X[0];
+    }
+    uint8_t* ph[4] = {v + o[7], v + o[8], v + o[9], v + o[10]};
+    uint32_t* atab = malloc(sizeof(uint32_t) * qc_geom_nob(&go) * 9 * kt);
+    qc_stitch_t* st = malloc(sizeof(qc_stitch_t) * QC_SIDE_CAP);
+    int ns = -1;
+    for (int it = -1; it < j->iters; it++) {
+      unsigned long long t0 = HAP_perf_get_time_us();
+      qc_taps_t tp;
+      if (j->stride == 1) {
+        qc_shift_copies(X, v + o[5], v + o[6], gi.nblk, kt, zx);
+        tp = qc_taps_s1(X, v + o[5], v + o[6]);
+      } else {
+        qc_phase_split(X, &gi, ph, &go, kt, zx);
+        qc_shift_copies(ph[1], v + o[5], v + o[11], go.nblk, kt, zx);
+        qc_shift_copies(ph[3], v + o[6], v + o[11], go.nblk, kt, zx);
+        tp = qc_taps_s2(ph, v + o[5], v + o[6]);
+      }
+      if (ns < 0) { /* the plan depends only on the buffer addresses: once */
+        ns = qc_conv3x3_plan(&tp, &go, kt, atab, st, v + o[12], QC_SIDE_CAP);
+        if (ns < 0) { j->codes[7] = -2; break; }
+        j->codes[3] = ns;
+      }
+      qc_conv3x3_stitch(st, ns, kt);
+      unsigned long long t1 = HAP_perf_get_time_us();
+      int nfix = qc_conv3x3(atab, &go, Y, W, B, Hh, kt, j->mode, S);
+      (void)*(volatile uint8_t*)(Y + qc_geom_bytes(&go, nt) - 1);
+      if (it < 0) {
+        j->t[2] = nfix;
+        memcpy(j->yf, Y, qc_geom_bytes(&go, nt));
+      } else
+        j->t[0] += HAP_perf_get_time_us() - t0, j->t[1] += t1 - t0;
+    }
+    free(atab);
+    free(st);
+    HAP_compute_res_hmx_unlock(j->ctx);
+  }
+  if (j->codes[1] == 0) qurt_hvx_unlock();
+  qurt_thread_exit(0);
+}
+
+int hmx_gemm_rpc_qconv3(remote_handle64 h, int mode, int H, int W, int C, int N, int stride, int iters, const uint8* xf,
+                        int xfLen, const int8* wp, int wpLen, const uint8* prm, int prmLen, uint8* yf, int yfLen, uint64* t,
+                        int tLen, int* codes, int codesLen) {
+  qc_geom_t gi = qc_geom(H, W), go = qc_geom((H - 1) / stride + 1, (W - 1) / stride + 1);
+  if (tLen < 4 || codesLen < 8 || C % 32 || N % 64 || (stride != 1 && stride != 2) ||
+      xfLen < (int)qc_geom_bytes(&gi, C / 32) || wpLen < 9 * C * N || yfLen < (int)qc_geom_bytes(&go, N / 32) ||
+      prmLen < (int)(sizeof(qc_blk_t) * (N / 32) + sizeof(qc_hdr_t)))
+    return AEE_EBADPARM;
+  memset(t, 0, tLen * sizeof(uint64));
+  memset(codes, 0, codesLen * sizeof(int));
+  size_t o[13], need = (qconv3_layout(H, W, C, N, stride, o) + 0xFFFF) & ~(size_t)0xFFFF;
+  compute_res_attr_t attr;
+  HAP_compute_res_attr_init(&attr);
+  HAP_compute_res_attr_set_vtcm_param_v2(&attr, need, 0, 0);
+  HAP_compute_res_attr_set_hmx_param(&attr, 1);
+  unsigned int ctx = HAP_compute_res_acquire(&attr, 100000);
+  codes[0] = (int)ctx;
+  if (!ctx) return 0;
+  void* vp = NULL;
+  unsigned int vs = 0;
+  HAP_compute_res_attr_get_vtcm_ptr_v2(&attr, &vp, &vs);
+  codes[4] = (int)vs;
+  if (vp && vs >= need) {
+    qconv3_job_t j = {ctx, (uint8_t*)vp, mode, H, W, C, N, stride, iters, xf, wp, prm, yf, t, codes};
+    qurt_thread_attr_t ta;
+    qurt_thread_attr_init(&ta);
+    qurt_thread_attr_set_stack_addr(&ta, g_stack);
+    qurt_thread_attr_set_stack_size(&ta, STACK_SIZE);
+    qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
+    qurt_thread_t tid;
+    int st;
+    codes[5] = qurt_thread_create(&tid, &ta, qconv3_worker, &j);
     if (codes[5] == 0) qurt_thread_join(tid, &st);
   } else
     codes[6] = -1;

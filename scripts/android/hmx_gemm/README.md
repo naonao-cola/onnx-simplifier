@@ -342,3 +342,59 @@ memory first). The fix path runs for 0.1-0.5% of 4-row groups.
 Reproduce: `qnn_parity/qdq_layer.py <dir> 1024 1024 32 64` (model + ORT reference), `qnn_parity/export_case.py
 <dir> <case>`, push the case, `./run.sh qconv <case> 20`; `sim/qconv_sim.c <case>` on hexagon-sim.
 `tests/test_hmx_gemm.py::test_hmx_qconv_qdq_exact_on_hexagon_sim` builds a small layer and checks both modes.
+
+## QDQ 3x3 convolution, stride 1 and 2 (`hmx_qconv3.h`)
+
+Same requantization as above (`QC_FAST` / `QC_EXACT`), for `Conv` 3x3 with pad 1.
+
+### The instruction form: `:single` row-offset windows (hexagon-sim one-hot map)
+
+`activation.ub = mxmem(Rs, Rt):single:cm` reads a 64-row window that starts `4 * Rs[10:7]` rows into the crouton at
+`Rs` (2 KB aligned) and continues into the crouton at `Rs + Rt[31:11]` (`Rt[10:0] = 0x7ff` as for `:cm`); `Rs[1]`
+had no effect, so window starts are multiples of 4 rows. It runs at the full `:cm` + weight `:deep` rate (11 200
+MAC/cycle in `hexagon-sim --timing`). `:above:cm` behaved the same in the plain probe, but hung the simulator in a
+loop with a guessed `Rt`: QNN's 3x3 kernels (`hmx_convbbb_stride1`) pair it with per-instruction offset fields
+from a table, which this directory has not mapped. `weight.b ... :dilate` ran at the same rate as the plain
+weight load; its layout is not mapped either.
+
+### Layout and taps
+
+Activations are stored *flat*: pixel (y, x) is flat pixel `M0 + (y+1)*Wp + x`, with row stride `Wp = roundup(W+1, 4)`
+(padding columns W..Wp-1), a padding row above and below, and a margin `M0` chosen so that the output region starts
+on a 64-pixel block (an output tile is directly a block of the next layer's input). Padding pixels hold the
+activation zero point, so padding is exact. Pixels go 64 per crouton (the `:cm` row dimension).
+
+- Tap (dy, dx) of an output block reads the 64 input pixels at flat offset `dy*Wp + dx`. `dy*Wp` is a multiple of
+  4, which is exactly a `:single` window (second crouton = next pixel block, `Rt[31:11] = kt * 2 KB`). `dx = -1/+1`
+  read two one-pixel-shifted copies of the input (HVX `vlalign`/`valign` by 32 bytes).
+- A 3x3 conv is then `9 * kt` `:single` instructions (with weight `:deep`, 64 output channels) per output tile
+  pair, accumulating like a longer K. No im2col.
+- Stride 2: HVX splits the input into its four row/column phases (`vdeal` by 32 bytes: even/odd pixels) in the
+  output's flat geometry. Tap (dy, dx) reads phase (dy != 0, dx != 0) with a row offset of -1 for dy = -1 and the
+  one-pixel-shifted odd-column phase for dx = -1. The stride-1 machinery then runs on quarter-size maps.
+- **The 256 KB VTCM rule bites `:single`**: its two croutons are kt * 2 KB apart, and a pair straddling a 256 KB
+  boundary faulted the PD (`Bad VA` just below the boundary; the simulator does not model it). About 1-3% of
+  windows straddle. `qc_conv3x3_plan` finds them once per layer and routes them through side croutons that
+  `qc_conv3x3_stitch` fills each run (16 vector moves each). `sim/qconv3_stitch_sim.c` forces every offset window
+  through that path.
+- The per-instruction addresses are a table built once per layer (building it per call cost more than the conv).
+
+### Phone (Xiaomi 12S, turbo; `qdq_layer.py` layers at 32x64, both modes vs ORT CPU)
+
+| layer | QNN vs ORT | `QC_FAST` vs ORT | `QC_EXACT` vs ORT | `QC_FAST` per layer (prep) | `QC_EXACT` per layer | QNN per layer |
+|---|---:|---:|---:|---:|---:|---:|
+| 3x3 128->128, s1 | 7.55% | 3.37% | **0** | 33.8 us (13.4) | 227 us | 14 us (L22 - L2 chain) |
+| 3x3 256->256, s1 | -- | 3.12% | **0** | 103.9 us (28.9) | 1070 us | 82 us |
+| 3x3 128->128, s2 | 7.74% | 3.40% | **0** | 29.1 us (23.9) | 81.5 us | not separable (whole 1-layer model 0.25 ms incl. ~0.2 ms launch/IO) |
+| 3x3 64->64, s1 8x12 / s2 9x11 (odd sizes) | | 3.2% / 3.7% | **0** / **0** | | | |
+
+- **Correctness: bit-exact against ORT CPU in `QC_EXACT` for stride 1 and 2, odd sizes, fused Relu**, on the
+  phone and on hexagon-sim (stitched and direct windows).
+- **Speed: QNN is still ahead on 3x3** (14 vs 34 us at 128 channels, 82 vs 104 us at 256). About 13-29 us of ours
+  is the HVX shifted copies (and the phase split at stride 2), which QNN avoids. Its 21.6 TMAC/s at 128 channels
+  is also above our `:cm` + `:deep` MAC-loop ceiling (17.2), so QNN's `:above`/`:dilate` pairing (2D spatial
+  croutons with X offsets, presumably) does something this form does not. Mapping those is the lever. Running
+  the copies on another HVX thread in parallel with the previous layer's HMX work would hide most of our prep.
+
+Reproduce: `qdq_layer.py <dir> 128 128 32 64 3 1` (or `... 3 2` for stride 2), `export_case.py`, `./run.sh qconv
+<case>`; `sim/qconv3_sim.c <case>`. QNN chains: `qnn_parity/gen_models.py <dir> 2 22 conv3x3` + `run_ceiling.sh`.

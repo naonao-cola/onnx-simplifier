@@ -120,3 +120,41 @@ def test_hmx_qconv_qdq_exact_on_hexagon_sim(tmp_path):
     fast = next(line for line in out.splitlines() if line.startswith("fast"))
     assert " 0 mismatches" in exact and "PASS" in exact, out[-2000:]
     assert int(fast.split(":")[1].split()[0]) < 0.1 * 128 * 64, fast
+
+
+@pytest.mark.parametrize(
+    "sim,shape",
+    [
+        (
+            "qconv3_sim.c",
+            [64, 64, 7, 13, 3, 1, 1, 12],
+        ),  # stride 1, odd sizes, fused Relu
+        (
+            "qconv3_sim.c",
+            [64, 64, 9, 11, 3, 2, 0, 14],
+        ),  # stride 2 (phase split), odd sizes
+        (
+            "qconv3_stitch_sim.c",
+            [64, 64, 8, 12, 3, 1, 0, 11],
+        ),  # every offset window through a side crouton
+    ],
+)
+def test_hmx_qconv3x3_qdq_exact_on_hexagon_sim(tmp_path, sim, shape):
+    # 3x3 QDQ conv (pad 1) via :single row-offset windows + one-pixel-shifted copies, vs ORT CPU's output
+    pytest.importorskip("onnxruntime")
+    if _harness().tools_dir() is None:
+        pytest.skip("HEXAGON_TOOLS does not point at a toolchain with hexagon-sim")
+    import sys
+
+    layer, case = tmp_path / "layer", tmp_path / "case"
+    for script, args in (
+        ("qdq_layer.py", [layer, *shape]),
+        ("export_case.py", [layer, case]),
+    ):
+        subprocess.run(
+            [sys.executable, str(GEMM / "qnn_parity" / script), *map(str, args)],
+            check=True,
+        )
+    out = _run_sim(tmp_path, GEMM / "sim" / sim, [str(case)])
+    exact = next(line for line in out.splitlines() if line.startswith("exact"))
+    assert " 0 mismatches" in exact and "PASS" in exact, out[-2000:]

@@ -65,6 +65,8 @@ def widen(m, w):
 # (kind, cin, cout, hw, variant): conv1x1 at hw=64 is a GEMM with M = 4096 rows (pixels), K = cin, N = cout;
 # hw "HxW" = a non-square conv input (M = H*W)
 SWEEP = [
+    ("conv3x3", 128, 128, "32x64", "u8"),
+    ("conv3x3", 256, 256, "32x64", "u8"),
     ("conv1x1", 1024, 1024, "32x64", "u8"),
     ("conv1x1", 512, 512, "32x64", "u8"),
     ("conv1x1", 256, 256, 64, "u8"),
@@ -79,11 +81,17 @@ SWEEP = [
 
 
 def main():
+    """usage: gen_models.py <outdir> [lo hi [tag-filter]]: chain lengths (default the ceiling study's 2 and 6) and a
+    substring filter on the tags"""
     out = Path(sys.argv[1])
+    lo, hi = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) > 3 else (LO, HI)
+    filt = sys.argv[4] if len(sys.argv) > 4 else ""
     out.mkdir(parents=True, exist_ok=True)
     manifest = []
     for kind, cin, cout, hw, variant in SWEEP:
         tag = f"{kind}_{cin}x{cout}_{hw}_{variant}"
+        if filt not in tag:
+            continue
         h, w = (int(x) for x in hw.split("x")) if isinstance(hw, str) else (hw, hw)
         e = {
             "tag": tag,
@@ -92,10 +100,10 @@ def main():
             "cout": cout,
             "hw": hw,
             "variant": variant,
-            "lo": LO,
-            "hi": HI,
+            "lo": lo,
+            "hi": hi,
         }
-        for L in (LO, HI):
+        for L in (lo, hi):
             m, macs = (
                 build_f16(kind, cin, cout, h, L)
                 if variant == "f16"
