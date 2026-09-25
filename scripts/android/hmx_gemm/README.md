@@ -169,14 +169,118 @@ Targets measured on the phone (one HMX context, turbo):
 | same, int8 (`hmx_probe` issue-rate loop) | ~3.7 TMAC/s |
 | full GEMM from DDR, fp16 (512x576x1536) | 1.20 TMAC/s (weights ~22 GB/s in, C ~7 GB/s out) |
 | SmolLM2-135M prefill projections, 120 GEMMs | 20.9 ms (HTP whole prefill: 24.5 ms) |
-| QNN / HTP practical int8 ceiling on this phone | ~16 TMAC/s |
+| QNN / HTP practical int8 ceiling on this phone | ~16 TMAC/s (14.2 per 1x1 conv layer, re-measured below) |
+| int8 `:cm` chained 1x1 layers, weights streamed (`hmx_gemm_u8.h`, next section) | **17.0 TMAC/s** |
 
-What the remaining gap to QNN looks like (not implemented here): the MACs are 5-12% of a DDR-fed GEMM,
-so the win is keeping HMX fed -- (a) stream weight tiles DDR -> VTCM asynchronously while HMX works on
-the previous block (user DMA, or other HVX threads doing the copies/l2fetch while the HMX thread only
-issues MACs; the copy is ~80 us per 1.77 MB against ~13 us of MACs), double-buffered in two VTCM
-windows; (b) keep activations and outputs in VTCM across ops (fusion) instead of packing from and
-unpacking to DDR; (c) int8 weights to halve the bytes; (d) a second HMX unit: a second HMX compute_res
-acquire in the same PD is refused, so either QNN's ceiling comes from scheduling a single unit better
-or the second unit is not reachable from one unsigned PD (untested: `HAP_compute_res_hmx_lock2` with
-`HAP_COMPUTE_RES_HMX_SHARED`, as MNN's v73 code uses).
+What the remaining gap to QNN looked like: see the next section -- the int8 gap was the instruction mode,
+not the number of HMX units, and it is closed for chained 1x1 layers.
+
+## Matching QNN's int8 throughput: the "cm" instruction mode (`hmx_gemm_u8.h`)
+
+QNN's HTP reached ~16 TMAC/s int8 on this phone (`../htp_exploration/ceiling_findings.md`) against ~3-4
+TMAC/s from the kernels above, and fp16 was never compared. This section measures both sides on the same
+shapes, finds where the difference comes from, and closes it.
+
+### 1. The QNN side, reproduced (`qnn_parity/gen_models.py`)
+
+Chains of L identical layers (int8: uint8 activations / int8 weights QDQ, as the ceiling study; fp16: a plain
+fp32 graph, which the QNN EP runs in fp16), run with `../htp_exploration/ceiling/run_ceiling.sh` (ORT 1.26 +
+QNN EP 2.6.0 + QNN 2.50, strict HTP, EP-context cache, burst) and differenced L=6 minus L=2 by
+`summarize_ceiling.py`, so the per-layer time excludes graph launch and I/O. A 1x1 conv over an HxW map is a
+GEMM with M = H*W rows.
+
+| layer | QNN per layer | QNN TMAC/s |
+|---|---:|---:|
+| int8 1x1 conv 1024->1024, 64x64 (M = 4096) | 302 us | 14.20 |
+| int8 1x1 conv 1024->1024, 32x64 (M = 2048) | 155 us | 13.85 |
+| int8 1x1 conv 512->512, 64x64 | 80 us | 13.42 |
+| int8 1x1 conv 512->512, 32x64 | 65 us | 8.26 |
+| int8 MatMul 4096 x 1024 x 1024 | 3081 us | 1.39 |
+| fp16 1x1 conv 256 / 512 / 1024, 64x64 | 95 / 415 / 1533 us | 2.83 / 2.59 / 2.80 |
+| fp16 MatMul 4096 x 1024 x 1024 | 1446 us | 2.97 |
+
+**fp16 is already at parity**: QNN's whole fp16 layer runs at 2.6-3.0 TMAC/s, the same as this directory's
+fp16 MAC loop (3.07 TMAC/s). Only int8 was behind. (int8 MatMul through QNN is 10x slower than the same GEMM
+as a 1x1 conv, so convs are the fair reference.)
+
+### 2. Where QNN's int8 speed comes from
+
+QNN's V69 skel (`libQnnHtpV69Skel.so` from the `qnn-runtime` 2.50.0 AAR) keeps its symbols, so
+`hexagon-llvm-objdump -d --mattr=+hmxv69` shows which HMX instructions it issues. Its int8 1x1 conv
+(`hmx_convbbb1x1_stride1`) is a loop of `{ activation.ub = mxmem(A, Rt):cm; weight.b = mxmem(W, 0x3ff) }`,
+one 2 KB activation crouton per instruction, then one `mxmem(C, Rt):after:cm:sat.ub = acc` per output tile.
+The `:cm` form was never tried here. Mapped on hexagon-sim with one-hot operands (`sim/gemm_u8_sim.c` is the
+bit-exact check):
+
+- `:cm` reads the 2 KB crouton as **64 rows x 32 channels, one byte each** (`A(s, k)` at byte `32*s + k`),
+  where the non-cm int8 form uses only the odd bytes of 2 KB for 32 rows. One instruction is 64 x 32 x 32 =
+  65536 MACs instead of 32768, for the same bytes read.
+- `:after:cm:sat.ub` writes 64 rows x 32 columns (`C(s, c)` at byte `32*s + c`) -- exactly the next layer's
+  activation crouton, so layers chain with no repacking.
+- `weight.b = mxmem(W, 0x7ff):deep` (2 KB = two 32-column weight blocks) fills both accumulators: 64 x 32 x 64
+  per instruction, one activation read for twice the MACs. QNN's 1x1 kernel does not use it.
+- Output conversion is `min(255, floor(max(acc, 0) * s_c / 512))` with `s_c` the fp16 in the low half of
+  table word `c`. It is exact for power-of-two scales; with arbitrary fp16 scales about 5% of outputs come out
+  1 LSB low (the multiply is not done at full precision).
+
+The hypotheses from the handoff above, one at a time:
+
+| hypothesis | result |
+|---|---|
+| QNN drives two HMX units | **No.** Its skel imports only `compute_resource_hmx_lock`/`_unlock` (no `lock2`/`lock3`, one context), and one context here already beats it (below). |
+| a faster HMX clock | V69 has no separate HMX clock: `HAP_power_set_HMX_v2` with a turbo corner is refused (rc -3). The core clock matters: without the DCVS turbo vote the MAC loop runs at 9.66 TMAC/s instead of 17.2 (the DSP runs at ~0.79 vs 1.40 GHz). `HAP_power_get` is refused in the unsigned PD; clocks come from pcycles / us. |
+| better HMX scheduling | Not the main cause. Per-store column-table reloads, the K loop and the stores cost nothing measurable (below: chained layers vs the bare MAC loop). |
+| DMA instead of HVX copies | Not needed for this: an HVX copy on a second thread streams the next layer's weights (1 MB) while the HMX runs the current layer (below). QNN does ship a DMA manager. |
+| **the instruction mode** | **Yes.** int8 `:cm` does 2x the MACs per instruction of the non-cm int8 form and needs a quarter of the VTCM bytes per MAC of fp16. |
+
+### 3. Our side (`hmx_gemm_u8.h`)
+
+`hmx_blk_mac_u8cm_deep` / `hmx_blk_store_u8cm` (in `hmx_block.h`), `hmx_pack_w_u8cm` (host weight packing),
+`hmx_layer_u8cm` (one layer, crouton activations on both sides), `hmx_gemm_u8_prof` (row-major DDR GEMM with
+HVX 4x4 32-byte transposes for packing/unpacking). Every configuration below is **bit-exact** against an
+exact host reference (power-of-two scales), on hexagon-sim and on the phone (turbo, under the phone lock,
+health check clean after each run). Clocks from pcycles / us: 1.40 GHz.
+
+| what (phone, one HMX context) | per layer | TMAC/s |
+|---|---:|---:|
+| int8 `:cm` MAC loop, A and W resident, weight `:deep` (`gemm_u8` mode 2), 1024^3 .. 7168 x 1024 x 512 | | **17.2** (12250 MAC/pcycle) |
+| same without weight `:deep` (QNN's 1x1 choice; mode 3) | | 14.15 |
+| **chained layers, 1024->1024, M = 2048, next layer's weights streamed DDR -> VTCM on a second HVX thread** (`layers` flag 1) | **126 us** (QNN: 155 us) | **17.03** (QNN: 13.85) |
+| same, 512->512, M = 2048 / 4096 | 31.8 / 63.0 us (QNN: 65 / 80 us) | 16.90 / 17.03 (QNN: 8.26 / 13.42) |
+| same, 256->256, M = 2048 / 4096 | 8.3 / 16.1 us | 16.11 / 16.62 |
+| same, weights copied just before each layer on the HMX thread (flag 0) | 172 us | 12.46 |
+| same, no weight copies at all (compute-only reference, flag 2) | 124.7 us | 17.22 |
+| row-major GEMM from DDR (pack A, stream W, unpack C on one thread; `gemm_u8` mode 0), 2048 x 1024 x 1024 | 450 us | 4.78 (MAC phase 25% of the time, pack/unpack 62%; fp16 equivalent: 1.20) |
+| earlier int8 (non-cm) MAC loop, `../hmx_probe` | | ~3.7 |
+| fp16 MAC loop (above) | | 3.07 (QNN fp16 layer: 2.6-3.0) |
+
+So a chain of int8 1x1 layers now runs **~1.2x faster than QNN's on the same shapes** (2x for 512->512 at
+M = 2048, where QNN's per-layer overhead shows), at 99% of the bare MAC-loop rate, from one HMX context in
+an unsigned PD. M = 4096 at 1024 channels does not fit two activation buffers + two weight buffers in the
+8 MB VTCM (7.75 MB is the most one acquire got), so that row is only measured as the bare MAC loop (17.2).
+
+`hexagon-sim --timing` (`sim/rate_sim.c`) predicted the ranking before any phone run: ~12000 MAC/pcycle for
+`:cm` + weight `:deep` (phone: 12250), ~8000 without `:deep` (phone: 10074), ~2500 for fp16 (phone: ~2200).
+
+### What this is not yet
+
+- **Not a drop-in QNN conv.** The output is `sat_u8(floor(max(acc, 0) * s / 512))`: no per-column bias, no
+  activation zero point (QNN's QDQ models use uint8 zero point 128, which it folds into a bias), and
+  arbitrary fp16 scales round 1 LSB low about 5% of the time. The table's other fields (V81's HMX manual
+  documents input/output bias fields in the 64-bit bias registers, loaded by `bias = mxmem2`) are the next
+  thing to map for int8.
+- Only 1x1 convs / GEMMs. QNN's 3x3 kernels use `:dilate` weights and `:above` activations for spatial
+  taps; those forms are unexplored here.
+- The row-major DDR GEMM is bound by its single-thread HVX pack/unpack (62% of its time); a pipeline that keeps
+  activations in crouton form between ops (as `layers` does) is the fast path.
+
+Reproduce (host builds; phone steps under `PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run`):
+
+```
+./build.sh && D=/data/local/tmp/<dir> ./run.sh setup
+./run.sh gemm_u8 2 2048 1024 1024 5              # bare MAC loop (mode 3: without weight :deep)
+./run.sh layers 1 2048 1024 6 5                  # chained layers, weights streamed on a second thread
+./run.sh health
+python qnn_parity/gen_models.py $M && REMOTE_DIR=/data/local/tmp/<dir>/qnn \
+  ../htp_exploration/ceiling/run_ceiling.sh $M 25 burst && ../htp_exploration/ceiling/summarize_ceiling.py $M burst
+```

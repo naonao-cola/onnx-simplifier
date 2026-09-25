@@ -63,6 +63,33 @@ static inline void hmx_blk_mac_u8s8(const void* a, const void* w, int ktiles) {
   }
 }
 
+/* int8 "cm" (channel-major) path -- what QNN's own int8 convs use (hmx_convbbb1x1_stride1 in its V69 skel):
+ * one instruction = 64 spatial rows x 32 input channels x 32 (or 64 with weight :deep) output channels, i.e.
+ * 2x the rows of the fp16 / non-cm int8 path for the same 2 KB activation crouton, and the dense layout
+ * (no wasted bytes). Layouts (hexagon-sim one-hot maps, bit-exact vs a reference, see sim/gemm_u8_sim.c):
+ *   A(s, k): byte 32*s + k of a 2 KB crouton (s < 64, k < 32) -- plain row-major [64][32];
+ *   W(k, c): byte 128*(k/4) + 4*c + k%4 of a 1 KB block (same as the non-cm int8 weight);
+ *            weight :deep = two such blocks back to back (columns 0..31, then 32..63) -> both accumulators;
+ *   C(s, c): byte 32*s + c of a 2 KB tile, = min(255, floor(max(acc, 0) * s_c / 512)) with s_c the fp16 low
+ *            half of table word c (exact for power-of-two s_c; other scales can come out 1 LSB low).
+ * K accumulates over consecutive instructions (one per 32-channel crouton) until the store. */
+static inline void hmx_blk_mac_u8cm(const uint8_t* a, const uint8_t* w, int ktiles) {
+  for (int k = 0; k < ktiles; k++)
+    __asm__ volatile("{ activation.ub = mxmem(%0,%1):cm\n weight.b = mxmem(%2,%3) }" ::"r"(a + (size_t)k * 2048), "r"(0x7ff),
+                     "r"(w + (size_t)k * 1024), "r"(0x3ff)
+                     : "memory");
+}
+/* 64 output columns: w = ktiles x 2 KB (per K block: columns 0..31, then 32..63); store twice (hmx_blk_store_u8cm) */
+static inline void hmx_blk_mac_u8cm_deep(const uint8_t* a, const uint8_t* w, int ktiles) {
+  for (int k = 0; k < ktiles; k++)
+    __asm__ volatile("{ activation.ub = mxmem(%0,%1):cm\n weight.b = mxmem(%2,%3):deep }" ::"r"(a + (size_t)k * 2048),
+                     "r"(0x7ff), "r"(w + (size_t)k * 2048), "r"(0x7ff)
+                     : "memory");
+}
+static inline void hmx_blk_store_u8cm(void* c) {
+  __asm__ volatile("mxmem(%0,%1):after:cm:sat.ub = acc" ::"r"(c), "r"(0) : "memory");
+}
+
 static inline void hmx_blk_store_f16(void* c) { __asm__ volatile("mxmem(%0,%1):after.hf = acc" ::"r"(c), "r"(0) : "memory"); }
 static inline void hmx_blk_store_u16(void* c) {
   __asm__ volatile("mxmem(%0,%1):after:sat.uh = acc:2x1" ::"r"(c), "r"(0) : "memory");

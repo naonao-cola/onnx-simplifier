@@ -80,3 +80,18 @@ def test_hmx_block_bit_exact_on_hexagon_sim(tmp_path, ktiles):
     # exercise the split of an int8 K into two load pairs (8 + 1)
     out = _run_sim(tmp_path, GEMM / "sim" / "block_ref.c", [ktiles])
     assert "\nPASS" in out, out[-2000:]
+
+
+@pytest.mark.parametrize("shape", ["64 128 128", "130 192 64"])
+def test_hmx_gemm_u8_cm_on_hexagon_sim(tmp_path, shape):
+    # int8 "cm" path (64 rows x 32 K x 64 columns per instruction, what QNN's int8 convs use): power-of-two
+    # scales, exact vs the reference; 130x192x64 takes the scalar pack/unpack paths and a partial row block
+    out = _run_sim(tmp_path, GEMM / "sim" / "gemm_u8_sim.c", [*shape.split(), "1"])
+    assert " 0 mismatches" in out and "PASS" in out, out[-2000:]
+
+
+def test_hmx_layers_u8_on_hexagon_sim(tmp_path):
+    # three chained int8 layers with activations kept in crouton form (an output tile is the next layer's
+    # activation crouton), exact vs the reference
+    out = _run_sim(tmp_path, GEMM / "sim" / "layers_u8_sim.c", ["100", "128", "3"])
+    assert " 0 mismatches" in out and "PASS" in out, out[-2000:]
