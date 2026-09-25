@@ -1722,23 +1722,57 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                 _, _, kernel_h, kernel_w = weight_shape
                 stride = None
                 pad_h = pad_w = None
-                for candidate_stride in range(1, max(input_shape[2:]) + 1):
-                    valid_h = [
-                        p
-                        for p in range(input_shape[2] + kernel_h)
-                        if (input_shape[2] + 2 * p - kernel_h) // candidate_stride + 1
-                        == output_shape[2]
-                    ]
-                    valid_w = [
-                        p
-                        for p in range(input_shape[3] + kernel_w)
-                        if (input_shape[3] + 2 * p - kernel_w) // candidate_stride + 1
-                        == output_shape[3]
-                    ]
-                    if valid_h and valid_w:
-                        stride = candidate_stride
-                        pad_h = min(valid_h, key=lambda p: abs(2 * p - kernel_h))
-                        pad_w = min(valid_w, key=lambda p: abs(2 * p - kernel_w))
+                dilation = None
+                pad_shapes = [
+                    tuple(int(dim) for dim in node.shape)
+                    for node in walk(reduction)
+                    if node.op is Ops.PAD and len(node.shape) == 4
+                ]
+                fixed_pads = None
+                for shape in pad_shapes:
+                    if shape[:2] == input_shape[:2] and shape[2] >= input_shape[2] and shape[3] >= input_shape[3]:
+                        fixed_pads = (
+                            (shape[2] - input_shape[2]) // 2,
+                            (shape[3] - input_shape[3]) // 2,
+                        )
+                        break
+                for candidate_dilation in range(1, max(weight_shape[2:]) + 1):
+                    candidate_pads = [fixed_pads] if fixed_pads is not None else [None]
+                    if fixed_pads is None:
+                        candidate_pads = [
+                            (ph, pw)
+                            for ph in range(input_shape[2] + kernel_h)
+                            for pw in range(input_shape[3] + kernel_w)
+                        ]
+                    for candidate_pad in candidate_pads:
+                        ph, pw = candidate_pad or (0, 0)
+                        if fixed_pads is None:
+                            if (
+                                (input_shape[2] + 2 * ph - candidate_dilation * (kernel_h - 1) - 1)
+                                < 0
+                                or (input_shape[3] + 2 * pw - candidate_dilation * (kernel_w - 1) - 1)
+                                < 0
+                            ):
+                                continue
+                        for candidate_stride in range(1, max(input_shape[2:]) + 1):
+                            if (
+                                (input_shape[2] + 2 * ph - candidate_dilation * (kernel_h - 1) - 1)
+                                // candidate_stride + 1
+                                == output_shape[2]
+                                and (input_shape[3] + 2 * pw - candidate_dilation * (kernel_w - 1) - 1)
+                                // candidate_stride + 1
+                                == output_shape[3]
+                            ):
+                                stride, pad_h, pad_w, dilation = (
+                                    candidate_stride,
+                                    ph,
+                                    pw,
+                                    candidate_dilation,
+                                )
+                                break
+                        if stride is not None:
+                            break
+                    if stride is not None:
                         break
                 if stride is not None and str(root.dtype).split(".")[-1] == "float":
                     graph = onnx.helper.make_graph(
@@ -1749,6 +1783,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                                 ["y"],
                                 strides=[stride, stride],
                                 pads=[pad_h, pad_w, pad_h, pad_w],
+                                **({"dilations": [dilation, dilation]} if dilation != 1 else {}),
                                 **({"group": groups} if groups != 1 else {}),
                             )
                         ],

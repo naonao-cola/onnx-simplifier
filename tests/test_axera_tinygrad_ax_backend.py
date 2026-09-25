@@ -657,6 +657,21 @@ def test_lower_tinygrad_grouped_conv_uop_to_onnx(groups):
     assert attrs["pads"] == [1, 1, 1, 1]
 
 
+def test_lower_tinygrad_dilated_conv_uop_to_onnx():
+    from tinygrad import Tensor
+
+    root = Tensor.empty(1, 3, 15, 15).conv2d(
+        Tensor.empty(4, 3, 3, 3), padding=2, dilation=2
+    ).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    attrs = {
+        attr.name: onnx.helper.get_attribute_value(attr)
+        for attr in lowered.graph.node[0].attribute
+    }
+    assert attrs["dilations"] == [2, 2]
+    assert attrs["pads"] == [2, 2, 2, 2]
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 
