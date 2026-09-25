@@ -1565,6 +1565,72 @@ def build_generated_graph_request(
     return json.dumps(req, sort_keys=True)
 
 
+def lower_uop_to_onnx(root) -> onnx.ModelProto:
+    """Lower one statically shaped tinygrad UOp pattern to ordinary ONNX.
+
+    The first supported pattern is tinygrad's canonical ``reshape(...).relu``
+    lowering: ``WHERE(CMPLT(0, reshaped), reshaped, 0)``.  Its source reshape
+    is retained as a graph boundary so the result can use the validated
+    Pulsar-free ``Reshape -> Relu`` generator.  This is intentionally a narrow
+    lowering boundary; arbitrary pre-schedule movement/reduction UOps still
+    need dedicated AX templates or MCode semantics.
+    """
+    from tinygrad.uop.ops import Ops
+
+    if root.op is not Ops.WHERE or len(root.src) != 3:
+        raise ValueError("AX UOp lowering currently requires a Relu-shaped WHERE root")
+    condition, true_value, false_value = root.src
+    if condition.op is not Ops.CMPLT or len(condition.src) != 2:
+        raise ValueError("AX UOp lowering requires CMPLT(0, x) as the Relu condition")
+    zero, data = condition.src
+    if zero.op is not Ops.CONST or float(zero.val) != 0.0:
+        raise ValueError("AX UOp Relu condition must compare against zero")
+    if true_value is not data or false_value.op is not Ops.CONST or float(false_value.val) != 0.0:
+        raise ValueError("AX UOp Relu branches are not in the supported canonical form")
+    if data.op is not Ops.RESHAPE or len(data.src) < 1 or data.src[0].op is not Ops.RESHAPE:
+        raise ValueError("AX UOp lowering requires one source reshape before Relu")
+    source = data.src[0]
+    source_shape = tuple(int(dim) for dim in source.shape)
+    target_shape = tuple(int(dim) for dim in data.shape)
+    if not source_shape or not target_shape or any(dim <= 0 for dim in (*source_shape, *target_shape)):
+        raise ValueError("AX UOp lowering requires positive static shapes")
+    if source.src[0].op is not Ops.ALLOC:
+        raise ValueError("AX UOp lowering requires an ALLOC-backed input")
+    if root.dtype != data.dtype:
+        raise ValueError("AX UOp Relu output dtype differs from its data input")
+    if str(root.dtype).split(".")[-1] not in {"float", "half"}:
+        raise ValueError("AX UOp lowering currently supports floating-point data only")
+
+    shape_name = "uop_reshape_shape"
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node("Reshape", ["x", shape_name], ["reshaped"]),
+            onnx.helper.make_node("Relu", ["reshaped"], ["y"]),
+        ],
+        "tinygrad_uop_ax",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, source_shape)],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, target_shape)],
+        [onnx.numpy_helper.from_array(np.asarray(target_shape, dtype=np.int64), shape_name)],
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+
+
+def compile_uop(root, schedule_path: str | None = None) -> bytes:
+    """Lower a supported tinygrad UOp and emit an AX model without Pulsar2."""
+    import graph_generator
+
+    model = lower_uop_to_onnx(root)
+    with tempfile.TemporaryDirectory() as directory:
+        source = os.path.join(directory, "uop.onnx")
+        output = os.path.join(directory, "uop.axmodel")
+        onnx.save(model, source)
+        graph_generator.generate(source, output, schedule_path=schedule_path)
+        with open(output, "rb") as stream:
+            return stream.read()
+
+
 def apply_policy(
     key: TemplateKey, policy: QuantPolicy, node: str | None = None
 ) -> TemplateKey:

@@ -175,6 +175,25 @@ def test_compiler_request_runs_measured_generator_without_pulsar2(tmp_path):
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
 
+def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(1, 8, 4, 4).reshape(1, 1, 8, 16).relu().uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Reshape", "Relu"]
+    schedule = tmp_path / "uop.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_lower_uop_rejects_unvalidated_pattern():
+    from tinygrad import Tensor
+
+    with pytest.raises(ValueError, match="Relu-shaped WHERE"):
+        axb.lower_uop_to_onnx((Tensor.empty(4) + Tensor.empty(4)).uop)
+
+
 def test_cache_graph_template_bytes_avoids_output_file(tmp_path):
     template_path = os.path.join(
         _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
