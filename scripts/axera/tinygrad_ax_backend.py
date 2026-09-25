@@ -614,6 +614,21 @@ class TemplateCache:
         )
         return output_path
 
+    def generate_graph_template_bytes(
+        self,
+        source_path: str,
+        template_source_path: str,
+        template_axmodel_path: str,
+    ) -> bytes:
+        """Return a validated same-topology AX model without disk IO."""
+        from template_model_generator import generate_model
+
+        return generate_model(
+            source_path,
+            template_source_path,
+            template_axmodel_path,
+        ).SerializeToString()
+
     def get_or_build(self, key: TemplateKey, onnx_bytes: bytes | None = None):
         """Plan section 6: build on a miss. Builds are Pulsar2 runs, out of scope
         for this skeleton, so a miss is reported instead of built."""
@@ -1569,25 +1584,20 @@ def compile_request(
             raise ValueError(f"graph_template request missing paths: {missing}")
         cache = cache or TemplateCache()
         output = req.get("output")
-        temporary = output is None
-        if temporary:
-            with tempfile.NamedTemporaryFile(suffix=".axmodel", delete=False) as f:
-                output = f.name
-        try:
-            cache.generate_graph_template(
+        if output is None:
+            return cache.generate_graph_template_bytes(
                 req["source"],
                 req["template_source"],
                 req["template_axmodel"],
-                output,
             )
-            with open(output, "rb") as f:
-                return f.read()
-        finally:
-            if temporary:
-                try:
-                    os.unlink(output)
-                except FileNotFoundError:
-                    pass
+        cache.generate_graph_template(
+            req["source"],
+            req["template_source"],
+            req["template_axmodel"],
+            output,
+        )
+        with open(output, "rb") as f:
+            return f.read()
     key = TemplateKey.from_json(req["key"])
     if policy is not None:
         key = apply_policy(key, policy, req.get("node"))

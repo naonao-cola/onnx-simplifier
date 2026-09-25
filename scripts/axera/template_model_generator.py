@@ -86,13 +86,12 @@ def _save(model: onnx.ModelProto, path: str) -> None:
         onnx.save(model, path)
 
 
-def generate(
+def generate_model(
     source_path: str,
     template_source_path: str,
     template_axmodel_path: str,
-    output_path: str,
-) -> GraphSignature:
-    """Emit ``output_path`` from a validated template without Pulsar2."""
+) -> onnx.ModelProto:
+    """Return a validated AX template without invoking Pulsar2 or writing it."""
     source = _load(source_path)
     template_source = _load(template_source_path)
     template = _load(template_axmodel_path)
@@ -104,9 +103,24 @@ def generate(
         raise ValueError("compiled AX template IO does not match its source graph")
     if len(template.graph.node) != 1 or template.graph.node[0].op_type != "neu mode":
         raise ValueError("template must contain exactly one fused neu mode node")
+    return template
+
+
+def generate(
+    source_path: str,
+    template_source_path: str,
+    template_axmodel_path: str,
+    output_path: str,
+) -> GraphSignature:
+    """Emit ``output_path`` from a validated template without Pulsar2."""
+    template = generate_model(
+        source_path,
+        template_source_path,
+        template_axmodel_path,
+    )
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     _save(template, output_path)
-    return actual
+    return signature(_load(source_path))
 
 
 def main(argv=None) -> int:

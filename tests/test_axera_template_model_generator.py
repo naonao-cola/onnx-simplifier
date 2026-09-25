@@ -39,6 +39,12 @@ def test_same_topology_is_generated_without_compiler(tmp_path):
     )
 
 
+def test_same_topology_can_be_loaded_in_memory_without_compiler():
+    model = _load_template()
+    got = tmg.generate_model(_TEMPLATE, _TEMPLATE, _TEMPLATE)
+    assert got.SerializeToString() == model.SerializeToString()
+
+
 def test_gz_template_can_be_reused_directly(tmp_path):
     model = _load_template()
     source = tmp_path / "source.onnx"
