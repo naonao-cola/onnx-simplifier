@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -50,14 +51,19 @@ def test_schedule_fuses_measured_chain():
 def test_generate_uses_one_fused_template(tmp_path):
     source = tmp_path / "source.onnx"
     output = tmp_path / "generated.axmodel"
+    schedule = tmp_path / "generated.schedule.json"
     onnx.save(_full_model(), source)
     plan = graph_generator.generate(
-        str(source), str(output), indices=[15, 0, 7, 7, 3, 12, 1, 14]
+        str(source),
+        str(output),
+        indices=[15, 0, 7, 7, 3, 12, 1, 14],
+        schedule_path=str(schedule),
     )
     assert plan.chain == "gather_reshape_matmul_transpose_add"
     generated = onnx.load(str(output), load_external_data=False)
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert [item.name for item in generated.graph.input] == ["x", "w", "b"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == plan.chain
 
 
 def test_schedule_and_generate_fused_reshape_relu(tmp_path):

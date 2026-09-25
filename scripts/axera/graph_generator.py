@@ -10,16 +10,15 @@ fused MCode and memory schedule.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import os
-import argparse
 from collections.abc import Sequence
 
-import onnx
-from onnx import numpy_helper
-
 import compose_emit
+import onnx
 import reshape_emit
+from onnx import numpy_helper
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,16 +73,26 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         v.name: _shape(v)
         for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
     }
-    if len(nodes) == 2 and [node.op_type for node in nodes] in (["Reshape", "Relu"], ["Relu", "Reshape"]):
+    if len(nodes) == 2 and [node.op_type for node in nodes] in (
+        ["Reshape", "Relu"],
+        ["Relu", "Reshape"],
+    ):
         reshape = nodes[0] if nodes[0].op_type == "Reshape" else nodes[1]
         if len(reshape.input) != 2 or reshape.input[1] not in _initializer_map(model):
             raise ValueError("fused Reshape must use a constant shape initializer")
         source = values.get(reshape.input[0], ())
-        target = tuple(int(v) for v in numpy_helper.to_array(_initializer_map(model)[reshape.input[1]]).reshape(-1))
+        target = tuple(
+            int(v)
+            for v in numpy_helper.to_array(
+                _initializer_map(model)[reshape.input[1]]
+            ).reshape(-1)
+        )
         position = "before" if nodes[0].op_type == "Reshape" else "after"
         if not source or not target:
             raise ValueError("fused Reshape shapes must be statically known")
-        if (source, target) not in (reshape_emit.FUSED_BEFORE | reshape_emit.FUSED_AFTER):
+        if (source, target) not in (
+            reshape_emit.FUSED_BEFORE | reshape_emit.FUSED_AFTER
+        ):
             # Let the emitter provide the more specific measured/not-fused
             # refusal when generation is attempted, but do not schedule an
             # unrelated shape as if it were a known fused segment.
@@ -93,11 +102,21 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         if position == "after" and (source, target) not in reshape_emit.FUSED_AFTER:
             raise ValueError("Relu -> Reshape pair is not measured as fused")
         if [v.name for v in model.graph.input] != ["x"]:
-            raise ValueError("fused Reshape generator requires one runtime input named x")
-        return GraphPlan((GraphSegment(
-            "reshape_relu", ("x",), model.graph.output[0].name,
-            source, target, position,
-        ),))
+            raise ValueError(
+                "fused Reshape generator requires one runtime input named x"
+            )
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "reshape_relu",
+                    ("x",),
+                    model.graph.output[0].name,
+                    source,
+                    target,
+                    position,
+                ),
+            )
+        )
     if not nodes or nodes[0].op_type != "Gather":
         raise ValueError("graph must start with the measured Gather family")
     init = _initializer_map(model)
@@ -110,7 +129,10 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     indices = numpy_helper.to_array(init[gather.input[1]])
     if indices.size != 8:
         raise ValueError("the measured composed family requires eight indices")
-    values = {v.name: _shape(v) for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)}
+    values = {
+        v.name: _shape(v)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
     if values.get(gather.input[0]) != (1, 1, 4, 16):
         raise ValueError("Gather input must have shape [1,1,4,16]")
 
@@ -129,9 +151,15 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     if len(nodes) >= 5 and nodes[4].op_type == "Add":
         chain = "gather_reshape_matmul_transpose_add"
 
-    if len(nodes) != {"gather_reshape": 2, "gather_reshape_matmul": 3,
-                      "gather_reshape_matmul_transpose": 4,
-                      "gather_reshape_matmul_transpose_add": 5}[chain]:
+    if (
+        len(nodes)
+        != {
+            "gather_reshape": 2,
+            "gather_reshape_matmul": 3,
+            "gather_reshape_matmul_transpose": 4,
+            "gather_reshape_matmul_transpose_add": 5,
+        }[chain]
+    ):
         raise ValueError("graph has unsupported nodes after the measured chain")
     input_names = tuple(item.name for item in model.graph.input)
     expected_inputs = {
@@ -151,6 +179,7 @@ def generate(
     output_path: str,
     *,
     indices: Sequence[int] | None = None,
+    schedule_path: str | None = None,
 ) -> GraphPlan:
     """Generate an AX model from a supported ONNX graph without Pulsar2.
 
@@ -161,9 +190,24 @@ def generate(
     """
     model = onnx.load(source_path, load_external_data=False)
     plan = schedule_graph(model)
+    if schedule_path is not None:
+        # Keep schedule generation on the same validated source model and
+        # avoid making the schedule a second, independently maintained plan.
+        import json
+
+        import schedule_ir
+
+        schedule = schedule_ir.build(model)
+        with open(schedule_path, "w", encoding="utf-8") as stream:
+            json.dump(schedule.to_json(), stream, indent=2, sort_keys=True)
+            stream.write("\n")
     if indices is None:
         init = _initializer_map(model)
-        indices = numpy_helper.to_array(init[model.graph.node[0].input[1]]).reshape(-1).tolist()
+        indices = (
+            numpy_helper.to_array(init[model.graph.node[0].input[1]])
+            .reshape(-1)
+            .tolist()
+        )
     if plan.chain == "reshape_relu":
         segment = plan.segments[0]
         reshape_emit.emit_fused_reshape_axmodel(
@@ -183,9 +227,15 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source")
     parser.add_argument("output")
+    parser.add_argument("--schedule", dest="schedule_path")
     parser.add_argument("--indices", nargs=8, type=int)
     args = parser.parse_args(argv)
-    plan = generate(args.source, args.output, indices=args.indices)
+    plan = generate(
+        args.source,
+        args.output,
+        indices=args.indices,
+        schedule_path=args.schedule_path,
+    )
     print(f"chain={plan.chain} segments={len(plan.segments)} output={args.output}")
     return 0
 
