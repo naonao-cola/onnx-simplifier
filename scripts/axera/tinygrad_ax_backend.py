@@ -1576,6 +1576,72 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.MUL and len(root.src) == 2:
+        exp2_node, reciprocal = root.src
+        if (
+            exp2_node.op is Ops.EXP2
+            and len(exp2_node.src) == 1
+            and reciprocal.op is Ops.RECIPROCAL
+            and len(reciprocal.src) == 1
+        ):
+            exp2_mul = exp2_node.src[0]
+            if exp2_mul.op is Ops.MUL and len(exp2_mul.src) == 2:
+                centered, log2e = exp2_mul.src
+                if (
+                    log2e.op is Ops.CONST
+                    and float(log2e.arg) == 1.4426950408889634
+                    and centered.op is Ops.ADD
+                    and len(centered.src) == 2
+                ):
+                    data, max_term = centered.src
+                    if (
+                        data.op is Ops.RESHAPE
+                        and data.src
+                        and data.src[0].op is Ops.ALLOC
+                        and max_term.op is Ops.MUL
+                        and len(max_term.src) == 2
+                        and max_term.src[1].op is Ops.CONST
+                        and float(max_term.src[1].arg) == -1.0
+                    ):
+                        max_detach = max_term.src[0]
+                        if max_detach.op is Ops.DETACH and len(max_detach.src) == 1:
+                            max_reshape = max_detach.src[0]
+                            if max_reshape.op is Ops.RESHAPE and max_reshape.src:
+                                max_reduce = max_reshape.src[0]
+                                sum_reshape = reciprocal.src[0]
+                                if sum_reshape.op is Ops.RESHAPE and sum_reshape.src:
+                                    sum_reduce = sum_reshape.src[0]
+                                    if (
+                                        max_reduce.op is Ops.REDUCE
+                                        and max_reduce.arg[0] is Ops.MAX
+                                        and max_reduce.src
+                                        and max_reduce.src[0].op is Ops.PERMUTE
+                                        and max_reduce.src[0].src[0] is data
+                                        and sum_reduce.op is Ops.REDUCE
+                                        and sum_reduce.arg[0] is Ops.ADD
+                                        and sum_reduce.src
+                                        and sum_reduce.src[0].op is Ops.PERMUTE
+                                        and sum_reduce.src[0].src[0] is exp2_node
+                                    ):
+                                        shape = tuple(int(dim) for dim in root.shape)
+                                        if shape != (16, 1000):
+                                            raise ValueError(
+                                                "AX UOp Softmax lowering is measured only for shape (16, 1000)"
+                                            )
+                                        if str(root.dtype).split(".")[-1] != "float":
+                                            raise ValueError(
+                                                "AX UOp Softmax lowering currently supports float32 data only"
+                                            )
+                                        graph = onnx.helper.make_graph(
+                                            [onnx.helper.make_node("Softmax", ["x"], ["y"], axis=1)],
+                                            "tinygrad_uop_softmax_ax",
+                                            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+                                            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+                                        )
+                                        return onnx.helper.make_model(
+                                            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                                        )
+
     misc_op = None
     misc_data = None
     if root.op is Ops.SQRT and len(root.src) == 1:

@@ -119,7 +119,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
-    if len(nodes) == 1 and nodes[0].op_type in ("Neg", "Sqrt", "Log"):
+    if len(nodes) == 1 and nodes[0].op_type in ("Neg", "Sqrt", "Log", "Softmax"):
         neg = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
             raise ValueError(
@@ -261,7 +261,7 @@ def generate(
             output_path,
             position=segment.position,
         )
-    elif plan.chain in ("neg", "sqrt", "log"):
+    elif plan.chain in ("neg", "sqrt", "log", "softmax"):
         if calibration is None:
             raise ValueError(
                 f"standalone {plan.chain.title()} generation requires explicit calibration"
@@ -273,8 +273,12 @@ def generate(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
         model = misc_op_record_emit.emit_model(
-            misc_op_record_emit.template_key(
-                plan.chain.title(), plan.segments[0].input_shape
+            (
+                f"Softmax:{'x'.join(map(str, plan.segments[0].input_shape))}:axis1"
+                if plan.chain == "softmax"
+                else misc_op_record_emit.template_key(
+                    plan.chain.title(), plan.segments[0].input_shape
+                )
             ),
             scales,
             zero_points,
