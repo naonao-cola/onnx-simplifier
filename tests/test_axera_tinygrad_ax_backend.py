@@ -29,6 +29,7 @@ import elementwise_scale_emit as ew  # noqa: E402
 import emitter  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
 import misc_op_record_emit as misc  # noqa: E402
+import matmul_record_emit as mre  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
 _FIX = os.path.join(_AXERA_DIR, "fixtures")
@@ -534,6 +535,23 @@ def test_lower_tinygrad_rank2_matmul_uop_to_onnx():
         16,
         1000,
     )
+
+
+def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(16, 1000) @ Tensor.empty(1000, 512)).uop
+    _, quant = mre.STANDALONE_MATMUL_TEMPLATES[((16, 1000), (1000, 512))]
+    old = mre.load_scales(os.path.join(mre.STEP_TEMPLATE_DIR, quant))
+    names = list(old)
+    scales = {"x": old[names[0]][0], "z": old[names[1]][0], "y": old[names[2]][0]}
+    zero_points = {"x": old[names[0]][1], "z": old[names[1]][1], "y": old[names[2]][1]}
+    schedule = tmp_path / "matmul.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(root, str(schedule), {"scales": scales, "zero_points": zero_points})
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
 
 
 def test_lower_tinygrad_rank2_gemm_uop_to_onnx():

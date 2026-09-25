@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 import binary_op_scale_emit
 import compose_emit
 import misc_op_record_emit
+import matmul_record_emit
 import onnx
 import reshape_emit
 import transpose_real_shapes
@@ -133,6 +134,22 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             (
                 GraphSegment(
                     "transpose", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
+    if len(nodes) == 1 and nodes[0].op_type == "MatMul":
+        matmul = nodes[0]
+        if [item.name for item in model.graph.input] != ["x", "z"]:
+            raise ValueError("standalone MatMul requires runtime inputs named x and z")
+        input_shapes = tuple(values.get(name, ()) for name in matmul.input)
+        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        if input_shapes != ((16, 1000), (1000, 512)) or output_shape != (16, 512):
+            raise ValueError("standalone MatMul requires the measured FC dX form")
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "matmul", ("x", "z"), model.graph.output[0].name,
+                    input_shapes[0], output_shape, "fc_dX_MatMul_36"
                 ),
             )
         )
@@ -399,6 +416,21 @@ def generate(
                     plan.segments[0].input_shape, (1, 0)
                 )
             )
+    elif plan.chain == "matmul":
+        if calibration is None:
+            raise ValueError("standalone MatMul generation requires explicit calibration")
+        scales = calibration.get("scales")
+        zero_points = calibration.get("zero_points")
+        if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
+            raise ValueError("MatMul calibration requires scales and zero_points mappings")
+        segment = plan.segments[0]
+        model = matmul_record_emit.emit_standalone_matmul(
+            segment.input_shape,
+            (1000, 512),
+            scales,
+            zero_points,
+        )
+        onnx.save(model, output_path)
     elif plan.chain == "reducemean":
         if calibration is None:
             raise ValueError("standalone ReduceMean generation requires explicit calibration")
