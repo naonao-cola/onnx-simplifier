@@ -448,11 +448,7 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     root = Tensor.empty(16, 1000).sum(axis=axis, keepdim=True).uop
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
-    key = (
-        "ReduceSum:16x1000:axes0:k1"
-        if axis == 0
-        else "ReduceSum:16x1000:axes1:k1"
-    )
+    key = "ReduceSum:16x1000:axes0:k1" if axis == 0 else "ReduceSum:16x1000:axes1:k1"
     _, meta = misc.load_template(key)
     schedule = tmp_path / f"reducesum_axis{axis}.schedule.json"
     generated = onnx.load_from_string(
@@ -464,7 +460,13 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
-    assert tuple(generated.graph.output[0].type.tensor_type.shape.dim[i].dim_value for i in range(2)) == output_shape
+    assert (
+        tuple(
+            generated.graph.output[0].type.tensor_type.shape.dim[i].dim_value
+            for i in range(2)
+        )
+        == output_shape
+    )
 
 
 def test_lower_and_compile_tinygrad_transpose_uop_without_pulsar2(tmp_path):
