@@ -70,6 +70,7 @@ class IOSpec:
     nbytes: int
     dtype: type
     shape: tuple[int, ...]
+    elem_type: int = 0
 
 
 @dataclass
@@ -78,6 +79,33 @@ class Model:
     path: str
     inputs: list[IOSpec] = field(default_factory=list)
     outputs: list[IOSpec] = field(default_factory=list)
+
+
+def _validate_schedule(model: Model, schedule: dict) -> None:
+    """Check that a Pulsar-free schedule matches the loaded AX model IO."""
+    for kind, specs in (("inputs", model.inputs), ("outputs", model.outputs)):
+        entries = schedule.get(kind)
+        if not isinstance(entries, list) or len(entries) != len(specs):
+            raise DeviceError(
+                f"schedule {kind} count does not match model ({len(entries or [])} != {len(specs)})"
+            )
+        for index, (spec, entry) in enumerate(zip(specs, entries)):
+            expected = (
+                entry.get("name"),
+                tuple(entry.get("shape", ())),
+                int(entry.get("elem_type", -1)),
+                int(entry.get("nbytes", -1)),
+            )
+            actual = (spec.name, spec.shape, spec.elem_type, spec.nbytes)
+            if expected != actual:
+                raise DeviceError(
+                    f"schedule {kind}[{index}] does not match model: "
+                    f"scheduled={expected}, loaded={actual}"
+                )
+    if not isinstance(schedule.get("kernels"), list) or not schedule["kernels"]:
+        raise DeviceError("schedule has no executable kernels")
+    if int(schedule.get("memory_size", 0)) <= 0:
+        raise DeviceError("schedule has no positive memory plan")
 
 
 def _vm_share(vm: str, device: str = "share") -> tuple[str, str]:
@@ -194,7 +222,8 @@ class AXSession:
         return line
 
     # -- models ------------------------------------------------------------
-    def load(self, model: bytes | str) -> Model:
+    def load(self, model: bytes | str, schedule_path: str | None = None) -> Model:
+        """Load an AX model, optionally enforcing its Pulsar-free schedule."""
         n = next(self._seq)
         name = f"m{n}.axmodel"
         dst = os.path.join(self.host_dir, name)
@@ -209,9 +238,20 @@ class AXSession:
             kind, _, tname, nbytes, dt, *dims = line.split()
             spec = IOSpec(
                 tname, int(nbytes), _DTYPES.get(int(dt), np.uint8),
-                tuple(int(d) for d in dims),
+                tuple(int(d) for d in dims), int(dt),
             )  # fmt: skip
             (m.inputs if kind == "IN" else m.outputs).append(spec)
+        if schedule_path is not None:
+            try:
+                with open(schedule_path, encoding="utf-8") as stream:
+                    _validate_schedule(m, json.load(stream))
+            except Exception:
+                self._cmd(f"UNLOAD {m.id}")
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
         return m
 
     def unload(self, m: Model) -> None:
