@@ -520,6 +520,31 @@ def test_emit_spec_selects_reducesum_mcode_by_shape_and_axes():
     assert [node.op_type for node in model.graph.node] == ["neu mode"]
 
 
+def test_lower_tinygrad_rank2_matmul_uop_to_onnx():
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(16, 512) @ Tensor.empty(512, 1000)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
+    assert [tuple(d.dim_value for d in value.type.tensor_type.shape.dim) for value in lowered.graph.input] == [
+        (16, 512),
+        (512, 1000),
+    ]
+    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == (
+        16,
+        1000,
+    )
+
+
+def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(16, 512) @ Tensor.empty(512, 1000) + Tensor.empty(1000)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Gemm"]
+    assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

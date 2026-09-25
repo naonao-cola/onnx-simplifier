@@ -1576,6 +1576,81 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    def lower_matmul(node):
+        bias = None
+        if node.op is Ops.ADD and len(node.src) == 2:
+            candidate, other = node.src
+            if candidate.op is Ops.REDUCE and other.op is Ops.ALLOC:
+                node, bias = candidate, other
+            elif other.op is Ops.REDUCE and candidate.op is Ops.ALLOC:
+                node, bias = other, candidate
+        if node.op is not Ops.REDUCE or node.arg[0] is not Ops.ADD or node.arg[1] != 1:
+            return None
+        if not node.src or node.src[0].op is not Ops.PERMUTE:
+            return None
+        output_permute = node.src[0]
+        if tuple(int(axis) for axis in output_permute.arg) != (2, 0, 1) or not output_permute.src:
+            return None
+        product = output_permute.src[0]
+        if product.op is not Ops.MUL or len(product.src) != 2:
+            return None
+        left, right = product.src
+        if (
+            left.op is not Ops.RESHAPE
+            or tuple(int(dim) for dim in left.shape)[1] != 1
+            or not left.src
+            or left.src[0].op is not Ops.RESHAPE
+            or not left.src[0].src
+            or left.src[0].src[0].op is not Ops.ALLOC
+        ):
+            return None
+        if (
+            right.op is not Ops.PERMUTE
+            or tuple(int(axis) for axis in right.arg) != (0, 2, 1)
+            or not right.src
+            or right.src[0].op is not Ops.RESHAPE
+            or not right.src[0].src
+            or right.src[0].src[0].op is not Ops.RESHAPE
+            or not right.src[0].src[0].src
+            or right.src[0].src[0].src[0].op is not Ops.ALLOC
+        ):
+            return None
+        a_shape = tuple(int(dim) for dim in left.src[0].shape)
+        b_shape = tuple(int(dim) for dim in right.src[0].src[0].shape)
+        output_shape = tuple(int(dim) for dim in node.shape)
+        if len(a_shape) != 2 or len(b_shape) != 2 or output_shape != (a_shape[0], b_shape[1]):
+            return None
+        if a_shape[1] != b_shape[0] or str(node.dtype).split(".")[-1] != "float":
+            return None
+        op_type = "Gemm" if bias is not None else "MatMul"
+        graph_inputs = [
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, a_shape),
+            onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, b_shape),
+        ]
+        inputs = ["x", "z"]
+        if bias is not None:
+            if tuple(int(dim) for dim in bias.shape) != (b_shape[1],):
+                return None
+            graph_inputs.append(
+                onnx.helper.make_tensor_value_info(
+                    "b", onnx.TensorProto.FLOAT, (b_shape[1],)
+                )
+            )
+            inputs.append("b")
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node(op_type, inputs, ["y"])],
+            "tinygrad_uop_matmul_ax",
+            graph_inputs,
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, output_shape)],
+        )
+        return onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        )
+
+    matmul_model = lower_matmul(root)
+    if matmul_model is not None:
+        return matmul_model
+
     if root.op is Ops.PERMUTE and tuple(int(axis) for axis in root.arg) == (1, 0):
         source = root.src[0] if root.src else None
         shape = tuple(int(dim) for dim in root.shape)
