@@ -1576,6 +1576,34 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.ADD:
+        if len(root.src) != 2:
+            raise ValueError("AX UOp Add lowering requires two operands")
+        left, right = root.src
+        if left.shape != right.shape or not left.shape:
+            raise ValueError("AX UOp Add lowering requires equal static operand shapes")
+        if left.op is not Ops.RESHAPE or right.op is not Ops.RESHAPE:
+            raise ValueError("AX UOp Add lowering requires reshape-backed inputs")
+        if not left.src or not right.src or left.src[0].op is not Ops.ALLOC or right.src[0].op is not Ops.ALLOC:
+            raise ValueError("AX UOp Add lowering requires ALLOC-backed inputs")
+        if str(root.dtype).split(".")[-1] != "float":
+            raise ValueError("AX UOp Add lowering currently supports float32 data only")
+        shape = tuple(int(dim) for dim in root.shape)
+        if any(dim <= 0 for dim in shape):
+            raise ValueError("AX UOp Add lowering requires positive static shapes")
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node("Add", ["x", "z"], ["y"])],
+            "tinygrad_uop_add_ax",
+            [
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+            ],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+        )
+        return onnx.helper.make_model(
+            graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        )
+
     position = "before"
     relu = root
     if root.op is Ops.RESHAPE:
@@ -1640,8 +1668,17 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     )
 
 
-def compile_uop(root, schedule_path: str | None = None) -> bytes:
-    """Lower a supported tinygrad UOp and emit an AX model without Pulsar2."""
+def compile_uop(
+    root,
+    schedule_path: str | None = None,
+    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+) -> bytes:
+    """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
+
+    Standalone Add requires explicit ``calibration={"scales": {"x", "z",
+    "y"}, "zero_points": {"x", "z", "y"}}`` because its measured AX
+    program depends on quantization, not just the UOp shape.
+    """
     import graph_generator
 
     model = lower_uop_to_onnx(root)
@@ -1649,7 +1686,9 @@ def compile_uop(root, schedule_path: str | None = None) -> bytes:
         source = os.path.join(directory, "uop.onnx")
         output = os.path.join(directory, "uop.axmodel")
         onnx.save(model, source)
-        graph_generator.generate(source, output, schedule_path=schedule_path)
+        graph_generator.generate(
+            source, output, schedule_path=schedule_path, calibration=calibration
+        )
         with open(output, "rb") as stream:
             return stream.read()
 
