@@ -234,6 +234,11 @@ The graph generator now lives in the tinygrad fork; `qdq_net.py` is a thin drive
 - **Fork test:** `test/external/dsp/test_qdq_onnx_dsp.py` runs a tiny QDQ ResNet through this on hexagon-sim, bit-exact
   against `qdq_emulate` and onnxruntime.
 
+"ORT CPU" here is onnxruntime on the reference x86 host (AVX512-VNNI), where its output equals ORT's formulas exactly. On
+hosts without VNNI (e.g. the GitHub runners) onnxruntime's u8 x s8 convolution kernels differ from the exact formulas for
+full-range int8 weights (710 of 2048 outputs of the fork's tiny test model), most likely int16 saturation in the AVX2 path.
+The fork's tests therefore assert against the formulas (`qdq_emulate`) and only report onnxruntime.
+
 | ResNet-18 backbone, 224x224, Xiaomi 12S (turbo) | vs ORT CPU (25088 outputs of layer4) | per inference |
 |---|---:|---:|
 | **tinygrad** (20 HMX convs, 8 Adds, pool, copies; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **24.1 ms** (35.9 -> 32.7 -> 29.9 -> 24.1) |
