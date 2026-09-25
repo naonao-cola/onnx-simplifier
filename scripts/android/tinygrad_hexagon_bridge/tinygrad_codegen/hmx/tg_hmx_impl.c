@@ -39,7 +39,11 @@ static void worker(void* p) {
 #define SA (TG_M * TG_K * (int)sizeof(tg_a_t))
 #endif
 #define SB (TG_K * TG_N * (int)sizeof(tg_b_t) + TG_B_EXTRA)
+#ifdef TG_SC_BYTES
+#define SC TG_SC_BYTES
+#else
 #define SC (TG_M * TG_N * (int)sizeof(tg_c_t))
+#endif
 int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const uint8* b, int bLen, uint8* c, int cLen,
                    uint64* t, int tLen, int* codes, int codesLen) {
   if (tLen < 1 || codesLen < 6 || aLen < SA || bLen < SB || cLen < SC) return AEE_EBADPARM;

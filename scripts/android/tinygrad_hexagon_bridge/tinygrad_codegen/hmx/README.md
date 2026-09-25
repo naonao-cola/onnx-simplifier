@@ -193,6 +193,28 @@ activations are already 2 KB croutons, and a 3x3 conv is `:single` windows over 
 graph-level choice (next: the ONNX path), and so would the host-built tables that its `QC_FAST` mode (QNN-class, ~3% off
 by one) needs.
 
+## QLinearAdd and MaxPool
+
+**QLinearAdd** (ORT/MLAS: `clamp(rne(rb*b + (ra*a + fixed)), 0, 255)` in separate fp32 operations in that order;
+`fixed = zy - (ra*za + rb*zb)`) can't be spelled as tinygrad float ops and stay exact on *any* backend. tinygrad's symbolic
+rewrites reassociate the adds to `(a*ra + b*rb) + fixed` and fold `round()`'s +-0.5 into the constant, and which input the
+constant pairs with is lost. One LSB anywhere compounds through a ReLU network (in the hand runner, 2 LSBs in the first Add
+grew into 20% of the final output). So `ops_dsp.hmx_qlinear_add(a, b, ra, rb, fixed)` is a `Tensor.custom_kernel`: one C
+helper call per 2 KB chunk. It is the hand runner's `rn_add`:
+- HVX fixed point from the exact products `a * mantissa(ra)` in 12-bit halves, round half up.
+- Lanes inside the window of ORT's four fp32 roundings are redone with ORT's sequence on the scalar core (IEEE `sfmpy` /
+  `sfadd` builtins, so nothing contracts to an FMA).
+- One vector -> scalar check per chunk.
+- The constants are derived at render time from the fp32 scales and passed as immediates.
+
+Bit-exact against numpy's fp32 in ORT's order on hexagon-sim, MOCKDSP and the phone (200704 lanes; with `--ties`, 50k of
+them exact .5 ties). Phone: **89.7 us** for 56x56x64 (0.45 ns/byte); all-ties 1.7 ms (a quarter of the lanes take the
+scalar path; real per-tensor scales essentially never tie). The first version ran at 1.7 pcycles/byte: a two-iteration
+loop over the word halves compiled to one serial chain through the stack. Straight-line halves run at 0.59.
+
+**MaxPool** needs nothing new: on the grid (as the stride-2 conv) it is `v.max(axis=(dx, dy))` over the same windowed view,
+exact by construction. tinygrad vectorizes it as 64-lane `__builtin_elementwise_max` (MOCKDSP: 0 mismatches).
+
 ## Files
 
 | file | what |
@@ -200,8 +222,9 @@ by one) needs.
 | `hmxsim_i8.py` | the same for the int8 TC (uint8 x int8 -> int32, exact against numpy) |
 | `hmxsim_rq.py` | a QDQ int8 layer with the requantization fused (`--relu`, `--nobias`, `--noties`), exact against ORT's formula |
 | `hmxsim_conv.py` | a QDQ 3x3 conv in grid form (`--stride 2`, `--relu`, `--int32`, `--noties`), exact against ORT's formula |
+| `hmxsim_add.py` | ORT's QLinearAdd through `hmx_qlinear_add` (`--ties`), exact against numpy fp32 in ORT's order |
 | `hmxsim.py` | capture the MOCKDSP kernel + real buffers, rebuild with `-mv69 -mhmx`, run on `hexagon-sim --mhmx 1`, compare bit for bit (`--ref` also runs the qemu reference; `--prepack` tries tile-layout operands) |
-| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul, `--rq`: + requant, `--conv H W C N S`: a 3x3 conv plus a phone case dir; `HMX_VTCM_KB` goes into the header for the skel) |
+| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul, `--rq`: + requant, `--conv H W C N S`: a 3x3 conv plus a phone case dir; `--qadd N`: QLinearAdd plus a case dir; `HMX_VTCM_KB` goes into the header for the skel) |
 | `tg_hmx_rpc.idl`, `tg_hmx_impl.c`, `tg_hmx_client.c` | FastRPC skel around the generated kernel (runtime from `hmx_gemm/hmx_runtime.h`) and a checking/timing client |
 | `build.sh`, `run.sh` | build (Hexagon SDK qaic/headers + a `-mhmx` toolchain) and push/run under the phone lock |
 

@@ -371,6 +371,34 @@ def test_codegen_hmx_int8_conv3x3_exact(shape):
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
 )
+@pytest.mark.parametrize("flags", [[], ["--ties"]])
+def test_codegen_qlinear_add_exact(flags):
+    """ORT's QLinearAdd (rne(rb*b + (ra*a + fixed)) in separate fp32 ops) through tinygrad's hmx_qlinear_add custom kernel:
+    exact against numpy's fp32 in that order on hexagon-sim and MOCKDSP, also when many lanes are exact .5 ties."""
+    env = dict(tinygrad_env())
+    env.update(
+        CC=clang() or "clang",
+        HEXAGON_TOOLS=str(hexagon_tools()),
+        DEV="DSP",
+        MOCKDSP="1",
+        HVX_ARCH="v69",
+    )
+    hmx = CI_DIR.parent / "tinygrad_codegen" / "hmx"
+    out = _ok(
+        _run(
+            [sys.executable, hmx / "hmxsim_add.py", "25088", *flags, "--ref"], env=env
+        ),
+        "hmxsim_add.py",
+    )
+    assert "hexagon-sim 0/25088 mismatches" in out and "(PASS)" in out, out
+    assert "MOCKDSP scalar reference: 0 mismatches" in out, out
+
+
+@needs_tinygrad
+@pytest.mark.skipif(
+    hexagon_tools() is None,
+    reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
+)
 def test_codegen_hexsim_vectorized_add_beats_scalar():
     """hexagon-sim --timing cycles: the default (HVX) codegen vs NOOPT=1 (scalar). Measured ~50x on toolchain
     19.0.04; only a generous ratio is asserted so simulator versions can't make this flaky."""
