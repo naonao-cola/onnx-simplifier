@@ -141,7 +141,12 @@ def _prepare_forward(fwd_path: str, prepared_path: str) -> onnx.ModelProto:
     return fwd
 
 
-def build_step(out_dir: str, batch: int, metric_scale: float | None = None):
+def build_step(
+    out_dir: str,
+    batch: int,
+    metric_scale: float | None = None,
+    metric_output_only: bool = False,
+):
     """Build and save one batch-specific ResNet-18 training step."""
     if batch < 1:
         raise ValueError("batch must be positive")
@@ -164,7 +169,10 @@ def build_step(out_dir: str, batch: int, metric_scale: float | None = None):
     fwd = onnx.shape_inference.infer_shapes(fwd)
     with_loss = brts.add_mse_loss(fwd, "logits", num_classes=1000)
     step_model, state = brts.build_resident_step(
-        with_loss, params=TRAIN_PARAMS, metric_scale=metric_scale
+        with_loss,
+        params=TRAIN_PARAMS,
+        metric_scale=metric_scale,
+        metric_output_only=metric_output_only,
     )
     onnx.checker.check_model(step_model)
 
@@ -183,8 +191,18 @@ def main(argv=None) -> int:
         default=None,
         help="append output-only loss_scaled = loss * SCALE",
     )
+    parser.add_argument(
+        "--metric-output-only",
+        action="store_true",
+        help="export loss_scaled instead of also exporting raw loss",
+    )
     args = parser.parse_args(argv)
-    step_path, state = build_step(args.out_dir, args.batch, args.metric_scale)
+    step_path, state = build_step(
+        args.out_dir,
+        args.batch,
+        args.metric_scale,
+        args.metric_output_only,
+    )
     model = onnx.load(step_path)
     print(f"batch={args.batch}: {len(model.graph.node)} nodes, wrote {step_path}")
     for param, output in state.items():

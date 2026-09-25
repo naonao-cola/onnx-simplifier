@@ -126,7 +126,10 @@ def test_cache_graph_template_refuses_topology_change(tmp_path):
 
     with pytest.raises(ValueError, match="topology"):
         axb.TemplateCache().generate_graph_template(
-            str(source_path), str(template_source), str(axmodel), str(tmp_path / "out.axmodel")
+            str(source_path),
+            str(template_source),
+            str(axmodel),
+            str(tmp_path / "out.axmodel"),
         )
 
 

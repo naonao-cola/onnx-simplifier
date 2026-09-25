@@ -575,6 +575,7 @@ def build_resident_step(
     params: Sequence[str],
     loss_output: str = "loss",
     metric_scale: float | None = None,
+    metric_output_only: bool = False,
 ) -> Tuple[onnx.ModelProto, Dict[str, str]]:
     """The full pipeline (this module's docstring, steps 2-7) over a forward
     model that already has its loss appended (`add_mse_loss`, or your own).
@@ -591,6 +592,9 @@ def build_resident_step(
             ``loss_scaled`` metric. The backward path still differentiates
             ``loss``; scaling is applied after graph construction so it only
             improves visibility of sub-LSB losses on int8 output quantization.
+    :param metric_output_only: when true, export only ``loss_scaled`` instead
+            of both metrics. The raw ``loss`` remains an internal tensor used
+            by the backward graph, so this changes output traffic only.
     """
     model = onnx.ModelProto()
     model.CopyFrom(forward_and_loss)
@@ -753,7 +757,23 @@ def build_resident_step(
         step_model.graph.output.append(
             helper.make_tensor_value_info("loss_scaled", TensorProto.FLOAT, [1])
         )
+        if metric_output_only:
+            state_names = set(step_graph.state.values())
+            state_outputs = [
+                output
+                for output in step_model.graph.output
+                if output.name in state_names
+            ]
+            del step_model.graph.output[:]
+            step_model.graph.output.append(
+                helper.make_tensor_value_info("loss_scaled", TensorProto.FLOAT, [1])
+            )
+            # State outputs are appended by make_step_graph and must stay
+            # visible for the resident runner's device-side update.
+            step_model.graph.output.extend(state_outputs)
         onnx.checker.check_model(step_model)
+    elif metric_output_only:
+        raise ValueError("metric_output_only requires metric_scale")
 
     return step_model, step_graph.state
 

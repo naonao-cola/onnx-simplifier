@@ -161,6 +161,36 @@ def test_output_only_loss_metric_scale_does_not_change_backward_outputs():
         assert np.array_equal(scaled_out[name], plain_out[name])
 
 
+def test_metric_output_only_keeps_state_and_removes_raw_loss_output():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    scaled, state = brts.build_resident_step(
+        with_loss,
+        params=["cw", "gw"],
+        metric_scale=1000.0,
+        metric_output_only=True,
+    )
+    assert [output.name for output in scaled.graph.output] == [
+        "loss_scaled",
+        state["cw"],
+        state["gw"],
+    ]
+    assert any(
+        node.input[0] == "loss" for node in scaled.graph.node if node.op_type == "Mul"
+    )
+
+
+def test_metric_output_only_requires_a_metric_scale():
+    forward = _forward_model()
+    with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
+    with pytest.raises(ValueError, match="requires metric_scale"):
+        brts.build_resident_step(
+            with_loss,
+            params=["cw"],
+            metric_output_only=True,
+        )
+
+
 def test_rank1_state_update_is_reshaped_around_the_sub():
     """A rank-1 trainable tensor's in-graph SGD `Sub` crashes Pulsar2's own
     NPU backend tiler on real hardware (`TileFailException("AxQuantizedSub,
