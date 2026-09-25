@@ -41,6 +41,9 @@
 
 #ifdef __hexagon__
 static inline void hmx_blk_set_table(const void* t) { __asm__ volatile("bias = mxmem(%0)" ::"r"(t) : "memory"); }
+/* 64-bit column table (256 B: words 0..31 = low words, 32..63 = high words). For int8 outputs the high word is an
+ * int32 added exactly to the accumulator and low-word bit 22 adds 0.5 before the floor (hexagon-sim). */
+static inline void hmx_blk_set_table2(const void* t) { __asm__ volatile("bias = mxmem2(%0)" ::"r"(t) : "memory"); }
 
 static inline void hmx_blk_mac_f16(const void* a, const void* w, int ktiles) {
   const uint8_t *pa = (const uint8_t*)a, *pw = (const uint8_t*)w;

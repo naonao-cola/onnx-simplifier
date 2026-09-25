@@ -284,3 +284,61 @@ Reproduce (host builds; phone steps under `PHONE_LOCK_OWNER=<branch> ~/.cache/an
 python qnn_parity/gen_models.py $M && REMOTE_DIR=/data/local/tmp/<dir>/qnn \
   ../htp_exploration/ceiling/run_ceiling.sh $M 25 burst && ../htp_exploration/ceiling/summarize_ceiling.py $M burst
 ```
+
+## QDQ-exact 1x1 convolution (`hmx_qconv.h`)
+
+The `:cm` GEMM above as a drop-in for a QDQ `Conv` in the form onnxsim's `full_qdq` / QNN use: uint8
+activations with a zero point (128), per-channel symmetric int8 weights, int32 bias, uint8 output with its own
+scale and zero point, optional fused Relu. The reference is ORT CPU itself (it fuses `DQ -> Conv -> Q` into
+QLinearConv): `y = clamp(rne(fp32(fp32(acc) * M[c])) + zy)`, `M[c] = fp32(fp32(sx * sw[c]) / sy)`, where
+`acc = sum (xq - zx) * wq + bq`. `qnn_parity/qdq_ref.py` is that formula in numpy and matches ORT's output
+exactly (0 mismatches over 1.4 M outputs of four layers).
+
+### What the HMX conversion can and cannot do (hexagon-sim, `bias = mxmem2`)
+
+The 64-bit column table (`bias = mxmem2`, 256 B, **256-byte aligned** -- a 128-aligned table loads garbage)
+in int8 mode:
+
+- **high word: an int32 added exactly to the accumulator.** The activation zero point therefore folds into
+  it (`bq - zx * sum_k wq`), and the HMX consumes the raw uint8 activations.
+- low word bits 15:0: the fp16 scale `s`; **bit 22: +0.5 before the floor** (round half up). No other low-word
+  bits had an effect.
+- conversion: `floor(trunc(acc + B) * s / 512 [+ 0.5])`, where **the accumulator is truncated to a multiple of
+  `2^(5 - E)`** (`E` = the exponent of `s`): only ~4 fractional output bits survive, and the scale has 11 bits.
+  So a QDQ conv cannot be bit-exact through this path.
+- **`mxmem(C, 0):after:cm.ub = acc` (no `:sat`) wraps**, and `:retain` keeps the accumulator: four stores at
+  scales 1, 2^-8, 2^-16, 2^-24 (`0x6000 0x4000 0x2000 0x0800`) give the four bytes of the exact int32 accumulator,
+  two's complement (0 mismatches, |acc| up to 1.3 M, both halves of a weight `:deep` op). The 16-bit stores
+  (`:uh acc:2x1 / 2x2`) are no use after `:cm`: they expose only the odd rows.
+- An HMX tile store drops the low 11 address bits (2 KB alignment) -- a misaligned scratch tile silently
+  overwrote its neighbour.
+
+### Two requantization modes
+
+| mode | how | vs ORT |
+|---|---|---|
+| `QC_FAST` | one `:cm:sat.ub` store; table = fp16(512 M), round bit, int32 `B = bq - zx sum w + round(zy / M) + 2^(4-E)` (the last term centres the truncation) | off by one on ~1-3% of outputs |
+| `QC_EXACT` | 4 byte-plane stores -> exact acc; HVX integer requant `r = round(acc 2^L bm / 2^31) ~ v 2^F` (per-column `L`, `F`, `bm` so nothing overflows and `F` <= 21), `y = round-half-up(r / 2^F) + zy`; outputs whose `r` is within a per-column window of a .5 boundary (our error + fp32's own rounding in ORT's formula) are recomputed on the scalar core with ORT's fp32 formula (`convert_w2sf`, `sfmpy`, `convert_sf2w`) | **bit-exact** |
+
+Scalar loads from VTCM are slow (a tile needing the fix took 38 k cycles until HVX copied the group into stack
+memory first). The fix path runs for 0.1-0.5% of 4-row groups.
+
+### Phone (Xiaomi 12S, turbo, one HMX context; `qnn_parity/qdq_layer.py` layers, M = 2048 = 32x64 pixels)
+
+| layer | QNN HTP vs ORT | ours `QC_FAST` vs ORT | ours `QC_EXACT` vs ORT | `QC_FAST` time | `QC_EXACT` time | QNN per layer |
+|---|---:|---:|---:|---:|---:|---:|
+| 256->256 | 7.46% off by one | 3.14% | **0** | 8.1 us (16.6 TMAC/s) | 304 us | -- |
+| 256->256 + Relu (zy = 0) | 5.57% | 1.34% | **0** | 8.1 us | 347 us | -- |
+| 512->512 | 7.07% | 3.02% | **0** | 31.4 us (17.1) | 721 us | 65 us (per-tensor chain above) |
+| 1024->1024 | 7.39% | 3.23% | **0** | 125 us (17.2) | 1478 us | 155 us |
+| 3x3 128->128, stride 1 / 2 (QNN only, for chunk 2) | 7.55% / 7.74% | | | | | |
+
+- **QNN's HTP is not bit-exact against ORT either**: ~7% of outputs are off by one on every layer here
+  (`qdq_layer.py` model through `qnn_run`, strict HTP; mostly -1). "QNN-class accuracy" is therefore a 7%
+  off-by-one rate, and `QC_FAST` halves it at full HMX speed.
+- `QC_EXACT` is bit-exact on all 4.2 M outputs, but its HVX requant (~0.6 ns per output on one thread) is
+  10-40x slower than the HMX. Spreading it over the other HVX threads is the obvious next step.
+
+Reproduce: `qnn_parity/qdq_layer.py <dir> 1024 1024 32 64` (model + ORT reference), `qnn_parity/export_case.py
+<dir> <case>`, push the case, `./run.sh qconv <case> 20`; `sim/qconv_sim.c <case>` on hexagon-sim.
+`tests/test_hmx_gemm.py::test_hmx_qconv_qdq_exact_on_hexagon_sim` builds a small layer and checks both modes.

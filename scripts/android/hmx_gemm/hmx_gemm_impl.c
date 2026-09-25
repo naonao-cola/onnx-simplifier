@@ -9,6 +9,7 @@
 #define HMX_NOW() qurt_get_core_pcycles()
 #include "hmx_gemm.h"
 #include "hmx_gemm_u8.h"
+#include "hmx_qconv.h"
 
 extern unsigned long long HAP_perf_get_time_us(void);
 
@@ -530,6 +531,97 @@ int hmx_gemm_rpc_layers_u8(remote_handle64 h, int flags, int M, int C, int L, in
     qurt_signal_destroy(&c.sigd);
   } else
     codes[7] = -1;
+  HAP_compute_res_release(ctx);
+  return 0;
+}
+
+/* ---- QDQ 1x1 conv (hmx_qconv.h) ---- */
+typedef struct {
+  unsigned int ctx;
+  uint8_t* vtcm;
+  int mode, M, K, N, iters;
+  const uint8_t* a;
+  const int8_t* wp;
+  const uint8_t* prm;
+  uint8_t* y;
+  uint64* t;
+  int* codes;
+} qconv_job_t;
+
+static size_t qconv_layout(int M, int K, int N, size_t* o) {
+  size_t mt = (M + 63) / 64, off = 0;
+  o[0] = off, off += mt * (K / 32) * 2048;                                  /* X */
+  o[1] = off, off += mt * (N / 32) * 2048;                                  /* Y */
+  o[2] = off, off += (size_t)K * N;                                         /* W */
+  off = (off + 255) & ~(size_t)255;
+  o[3] = off, off += sizeof(qc_blk_t) * (N / 32) + sizeof(qc_hdr_t);       /* params */
+  off = (off + 2047) & ~(size_t)2047;
+  o[4] = off, off += 4 * 2048;                                   /* exact-mode scratch */
+  return off;
+}
+
+static void qconv_worker(void* p) {
+  qconv_job_t* j = (qconv_job_t*)p;
+  j->codes[1] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+  j->codes[2] = HAP_compute_res_hmx_lock(j->ctx);
+  if (j->codes[2] == 0) {
+    size_t o[5];
+    qconv_layout(j->M, j->K, j->N, o);
+    int mt = (j->M + 63) / 64, kt = j->K / 32;
+    uint8_t *X = j->vtcm + o[0], *Y = j->vtcm + o[1], *W = j->vtcm + o[2], *P = j->vtcm + o[3], *S = j->vtcm + o[4];
+    memcpy(W, j->wp, (size_t)j->K * j->N);
+    memcpy(P, j->prm, sizeof(qc_blk_t) * (j->N / 32) + sizeof(qc_hdr_t));
+    const qc_blk_t* B = (const qc_blk_t*)P;
+    const qc_hdr_t* H = (const qc_hdr_t*)(P + sizeof(qc_blk_t) * (j->N / 32));
+    unsigned long long t0 = HAP_perf_get_time_us();
+    for (int mb = 0; mb < mt; mb++) hmx_pack_a_u8cm(j->a, j->M, j->K, mb * 64, X + (size_t)mb * kt * 2048);
+    j->t[1] = HAP_perf_get_time_us() - t0;
+    j->t[2] = qc_conv1x1(X, Y, W, B, H, mt, kt, j->mode, S); /* warm-up + the checked output */
+    (void)*(volatile uint8_t*)(Y + (size_t)mt * (j->N / 32) * 2048 - 1);
+    hmx_unpack_rows_u8cm(Y, j->y, j->M, j->N);
+    t0 = HAP_perf_get_time_us();
+    for (int it = 0; it < j->iters; it++) qc_conv1x1(X, Y, W, B, H, mt, kt, j->mode, S);
+    (void)*(volatile uint8_t*)(Y + (size_t)mt * (j->N / 32) * 2048 - 1);
+    j->t[0] = HAP_perf_get_time_us() - t0;
+    HAP_compute_res_hmx_unlock(j->ctx);
+  }
+  if (j->codes[1] == 0) qurt_hvx_unlock();
+  qurt_thread_exit(0);
+}
+
+int hmx_gemm_rpc_qconv(remote_handle64 h, int mode, int M, int K, int N, int iters, const uint8* a, int aLen,
+                       const int8* wp, int wpLen, const uint8* prm, int prmLen, uint8* y, int yLen, uint64* t, int tLen,
+                       int* codes, int codesLen) {
+  if (tLen < 4 || codesLen < 8 || K % 64 || N % 64 || aLen < M * K || wpLen < K * N || yLen < M * N ||
+      prmLen < (int)(sizeof(qc_blk_t) * (N / 32) + sizeof(qc_hdr_t)))
+    return AEE_EBADPARM;
+  memset(t, 0, tLen * sizeof(uint64));
+  memset(codes, 0, codesLen * sizeof(int));
+  size_t o[5], need = (qconv_layout(M, K, N, o) + 0xFFFF) & ~(size_t)0xFFFF;
+  compute_res_attr_t attr;
+  HAP_compute_res_attr_init(&attr);
+  HAP_compute_res_attr_set_vtcm_param_v2(&attr, need, 0, 0);
+  HAP_compute_res_attr_set_hmx_param(&attr, 1);
+  unsigned int ctx = HAP_compute_res_acquire(&attr, 100000);
+  codes[0] = (int)ctx;
+  if (!ctx) return 0;
+  void* vp = NULL;
+  unsigned int vs = 0;
+  HAP_compute_res_attr_get_vtcm_ptr_v2(&attr, &vp, &vs);
+  codes[4] = (int)vs;
+  if (vp && vs >= need) {
+    qconv_job_t j = {ctx, (uint8_t*)vp, mode, M, K, N, iters, a, wp, prm, y, t, codes};
+    qurt_thread_attr_t ta;
+    qurt_thread_attr_init(&ta);
+    qurt_thread_attr_set_stack_addr(&ta, g_stack);
+    qurt_thread_attr_set_stack_size(&ta, STACK_SIZE);
+    qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
+    qurt_thread_t tid;
+    int st;
+    codes[5] = qurt_thread_create(&tid, &ta, qconv_worker, &j);
+    if (codes[5] == 0) qurt_thread_join(tid, &st);
+  } else
+    codes[6] = -1;
   HAP_compute_res_release(ctx);
   return 0;
 }

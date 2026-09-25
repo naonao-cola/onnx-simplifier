@@ -95,3 +95,28 @@ def test_hmx_layers_u8_on_hexagon_sim(tmp_path):
     # activation crouton), exact vs the reference
     out = _run_sim(tmp_path, GEMM / "sim" / "layers_u8_sim.c", ["100", "128", "3"])
     assert " 0 mismatches" in out and "PASS" in out, out[-2000:]
+
+
+def test_hmx_qconv_qdq_exact_on_hexagon_sim(tmp_path):
+    # QDQ 1x1 conv (uint8 zp 128, per-channel int8 weights, int32 bias) vs ORT CPU's own output: QC_EXACT must be
+    # bit-exact; QC_FAST (HMX-native requant) must stay in the off-by-one class (QNN's HTP: ~7% on such layers)
+    pytest.importorskip("onnxruntime")
+    tools = _harness().tools_dir()
+    if tools is None:
+        pytest.skip("HEXAGON_TOOLS does not point at a toolchain with hexagon-sim")
+    import sys
+
+    layer, case = tmp_path / "layer", tmp_path / "case"
+    for script, args in (
+        ("qdq_layer.py", [layer, 64, 64, 8, 16, 1, 1, 0, 7]),
+        ("export_case.py", [layer, case]),
+    ):
+        subprocess.run(
+            [sys.executable, str(GEMM / "qnn_parity" / script), *map(str, args)],
+            check=True,
+        )
+    out = _run_sim(tmp_path, GEMM / "sim" / "qconv_sim.c", [str(case)])
+    exact = next(line for line in out.splitlines() if line.startswith("exact"))
+    fast = next(line for line in out.splitlines() if line.startswith("fast"))
+    assert " 0 mismatches" in exact and "PASS" in exact, out[-2000:]
+    assert int(fast.split(":")[1].split()[0]) < 0.1 * 128 * 64, fast

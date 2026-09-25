@@ -28,6 +28,13 @@ interface hmx_gemm_rpc : remote_handle64 {
   long layers_u8(in long flags, in long M, in long C, in long L, in long iters, in sequence<uint8> a,
                  in sequence<int8> wp, in sequence<uint16> scale, rout sequence<uint8> o,
                  rout sequence<uint64> times, rout sequence<long> codes);
+  // QDQ 1x1 conv (hmx_qconv.h): a = uint8 [M, K] NHWC rows, wp = hmx_pack_w_u8cm(k-major weights),
+  // prm = N/32 qc_blk_t + qc_hdr_t (qc_pack_params), mode QC_FAST 0 / QC_EXACT 1. Runs iters times on
+  // crouton-form activations resident in VTCM; y = uint8 [M, N]. times: [0] us for iters convs, [1] us to
+  // pack A, [2] scalar-fixed 4-row groups (one conv).
+  long qconv(in long mode, in long M, in long K, in long N, in long iters, in sequence<uint8> a,
+             in sequence<int8> wp, in sequence<uint8> prm, rout sequence<uint8> y,
+             rout sequence<uint64> times, rout sequence<long> codes);
   // core / HMX clocks (Hz) as HAP_power_get reports them: [0] core, [1] hmx, [2] dcvs enabled
   long clocks(rout sequence<long> v);
 };
