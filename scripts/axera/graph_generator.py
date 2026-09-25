@@ -118,7 +118,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
-    if len(nodes) == 1 and nodes[0].op_type in ("Add", "Mul"):
+    if len(nodes) == 1 and nodes[0].op_type in ("Add", "Sub", "Mul", "Div"):
         add = nodes[0]
         if len(model.graph.input) != 2 or [item.name for item in model.graph.input] != [
             "x",
@@ -246,7 +246,7 @@ def generate(
             output_path,
             position=segment.position,
         )
-    elif plan.chain in ("add", "mul"):
+    elif plan.chain in ("add", "sub", "mul", "div"):
         if calibration is None:
             raise ValueError(
                 f"standalone {plan.chain.title()} generation requires explicit calibration"

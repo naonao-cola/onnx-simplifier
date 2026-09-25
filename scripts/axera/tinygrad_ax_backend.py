@@ -1576,11 +1576,31 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
-    binary_op = {Ops.ADD: "Add", Ops.MUL: "Mul"}.get(root.op)
+    binary_op = None
+    left = right = None
+    if root.op is Ops.ADD and len(root.src) == 2:
+        left, right = root.src
+        if (
+            right.op is Ops.MUL
+            and len(right.src) == 2
+            and right.src[1].op is Ops.CONST
+            and float(right.src[1].arg) == -1.0
+        ):
+            binary_op = "Sub"
+            right = right.src[0]
+        else:
+            binary_op = "Add"
+    elif root.op is Ops.MUL and len(root.src) == 2:
+        left, right = root.src
+        if right.op is Ops.RECIPROCAL and len(right.src) == 1:
+            binary_op = "Div"
+            right = right.src[0]
+        else:
+            binary_op = "Mul"
     if binary_op is not None:
         if len(root.src) != 2:
             raise ValueError(f"AX UOp {binary_op} lowering requires two operands")
-        left, right = root.src
+        assert left is not None and right is not None
         if left.shape != right.shape or not left.shape:
             raise ValueError(
                 f"AX UOp {binary_op} lowering requires equal static operand shapes"
@@ -1689,9 +1709,10 @@ def compile_uop(
 ) -> bytes:
     """Lower a supported tinygrad UOp and emit an AX model without Pulsar2.
 
-    Standalone Add and Mul require explicit ``calibration={"scales": {"x",
-    "z", "y"}, "zero_points": {"x", "z", "y"}}`` because their measured
-    AX programs depend on quantization, not just the UOp shape.
+    Standalone binary operations require explicit
+    ``calibration={"scales": {"x", "z", "y"}, "zero_points": {"x", "z",
+    "y"}}`` because their measured AX programs depend on quantization, not
+    just the UOp shape.
     """
     import graph_generator
 
