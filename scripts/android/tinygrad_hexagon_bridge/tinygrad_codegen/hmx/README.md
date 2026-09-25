@@ -215,6 +215,38 @@ loop over the word halves compiled to one serial chain through the stack. Straig
 **MaxPool** needs nothing new: on the grid (as the stride-2 conv) it is `v.max(axis=(dx, dy))` over the same windowed view,
 exact by construction. tinygrad vectorizes it as 64-lane `__builtin_elementwise_max` (MOCKDSP: 0 mismatches).
 
+## A whole QDQ ONNX graph through tinygrad: ResNet-18 in one FastRPC call (`qdq_net.py`)
+
+`qdq_net.py` takes the hand runner's model, a static QDQ ONNX in onnxsim's `full_qdq` + `quantized_io` form, parsed by
+`hmx_gemm/runner/qdq_graph.py`, and builds it as tinygrad ops:
+- **Activations:** padded flat NHWC grids (a zero-point ring, a tail sized for the consumers' windows).
+- **Convs:** grid form with the fused exact requant, then a crop/re-pad copy into the next grid. The stem's 3 channels are
+  padded to 32 with zero weights.
+- **Adds:** `hmx_qlinear_add` over whole padded buffers (the pads come out as zy, checked per Add).
+- **MaxPool:** the windowed max.
+
+Every kernel of one realize is captured in order (source, buffers, outputs) instead of run, then emitted as
+`k<n>.c` + `graph.h` (buffer table, constants blob, call sequence) + `blob.bin`. `build_graph.sh` links them into one skel
+(`tg_graph_impl.c`): one call runs all kernels on one HVX + HMX worker thread.
+
+| ResNet-18 backbone, 224x224, Xiaomi 12S (turbo) | vs ORT CPU (25088 outputs of layer4) | per inference |
+|---|---:|---:|
+| **tinygrad** (52 kernels: 20 HMX convs, 8 Adds, 24 copies/pool; `HMX_VTCM_KB=4096`) | **0 (bit-exact)**, also on hexagon-sim | **35.9 ms** |
+| hand runner, `QC_EXACT` (`hmx_gemm/runner`) | 0 | 3.43 ms |
+| QNN HTP | 35.6% off by one or more | 0.43 ms |
+
+`make_tiny.py`'s net (every op kind): 18 kernels, 0/2048 off vs ORT on hexagon-sim and the phone, 541.6 us.
+
+Reproduce:
+
+```
+HMX=1 DEV=DSP MOCKDSP=1 TC=1 TC_OPT=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLS=... HMX_VTCM_KB=4096 PYTHONPATH=$TINYGRAD \
+  python qdq_net.py backbone_qdq.onnx out [--sim input.bin ort_ref.bin]   # --sim: the whole graph on hexagon-sim
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... ./build_graph.sh out
+mkdir out/case; cp input.bin out/case/a.bin; cp out/blob.bin out/case/b.bin; cp ort_ref.bin out/case/ref.bin
+OUT=out D=<phone dir> ./run.sh setup; CASE=case OUT=out D=<phone dir> ./run.sh run 0 0 0 10   # under the phone lock
+```
+
 ## Files
 
 | file | what |
@@ -222,6 +254,7 @@ exact by construction. tinygrad vectorizes it as 64-lane `__builtin_elementwise_
 | `hmxsim_i8.py` | the same for the int8 TC (uint8 x int8 -> int32, exact against numpy) |
 | `hmxsim_rq.py` | a QDQ int8 layer with the requantization fused (`--relu`, `--nobias`, `--noties`), exact against ORT's formula |
 | `hmxsim_conv.py` | a QDQ 3x3 conv in grid form (`--stride 2`, `--relu`, `--int32`, `--noties`), exact against ORT's formula |
+| `qdq_net.py`, `tg_graph_impl.c`, `build_graph.sh` | a QDQ ONNX graph through tinygrad as one program (capture, emit, hexagon-sim run; the skel and its build) |
 | `hmxsim_add.py` | ORT's QLinearAdd through `hmx_qlinear_add` (`--ties`), exact against numpy fp32 in ORT's order |
 | `hmxsim.py` | capture the MOCKDSP kernel + real buffers, rebuild with `-mv69 -mhmx`, run on `hexagon-sim --mhmx 1`, compare bit for bit (`--ref` also runs the qemu reference; `--prepack` tries tile-layout operands) |
 | `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul, `--rq`: + requant, `--conv H W C N S`: a 3x3 conv plus a phone case dir; `--qadd N`: QLinearAdd plus a case dir; `HMX_VTCM_KB` goes into the header for the skel) |
