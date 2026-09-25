@@ -1576,6 +1576,26 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.MUL and len(root.src) == 2:
+        data, constant = root.src
+        if constant.op is Ops.CONST and float(constant.arg) == -1.0:
+            if data.op is not Ops.RESHAPE or not data.src or data.src[0].op is not Ops.ALLOC:
+                raise ValueError("AX UOp Neg lowering requires an ALLOC-backed input")
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError("AX UOp Neg lowering currently supports float32 data only")
+            shape = tuple(int(dim) for dim in root.shape)
+            if shape != (1, 1):
+                raise ValueError("AX UOp Neg lowering is measured only for shape [1,1]")
+            graph = onnx.helper.make_graph(
+                [onnx.helper.make_node("Neg", ["x"], ["y"])],
+                "tinygrad_uop_neg_ax",
+                [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape)],
+                [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
     binary_op = None
     left = right = None
     if root.op is Ops.ADD and len(root.src) == 2:

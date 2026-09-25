@@ -28,6 +28,7 @@ import binary_op_scale_validate as bsv  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import emitter  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
+import misc_op_record_emit as misc  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
 _FIX = os.path.join(_AXERA_DIR, "fixtures")
@@ -258,6 +259,25 @@ def test_lower_and_compile_tinygrad_compound_binary_uop_with_explicit_calibratio
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == op
+
+
+def test_lower_and_compile_tinygrad_neg_uop_with_explicit_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (-Tensor.empty(1, 1)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Neg"]
+    _, meta = misc.load_template("Neg:1x1")
+    schedule = tmp_path / "neg.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "neg"
 
 
 def test_lower_uop_rejects_unvalidated_pattern():
