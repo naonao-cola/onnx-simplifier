@@ -338,6 +338,39 @@ def test_codegen_hmx_int8_requant_exact(flags):
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
 )
+@pytest.mark.parametrize(
+    "shape",
+    [["16", "16", "64", "64"], ["8", "16", "128", "128", "--stride", "2", "--relu"]],
+)
+def test_codegen_hmx_int8_conv3x3_exact(shape):
+    """A QDQ 3x3 conv (stride 1 and 2) in grid form -- the padded NHWC image flattened, taps as flat offsets, two reduce
+    loops (dy, dx*C + c) under TC_OPT=1 -- with the requantization fused, exact against ORT's formula on hexagon-sim and
+    MOCKDSP. The 128-channel case goes through the four-block activation pack."""
+    env = dict(tinygrad_env())
+    env.update(
+        CC=clang() or "clang",
+        HEXAGON_TOOLS=str(hexagon_tools()),
+        HMX="1",
+        DEV="DSP",
+        MOCKDSP="1",
+        TC="1",
+        TC_OPT="1",
+        HVX_ARCH="v69",
+    )
+    hmx = CI_DIR.parent / "tinygrad_codegen" / "hmx"
+    out = _ok(
+        _run([sys.executable, hmx / "hmxsim_conv.py", *shape, "--ref"], env=env),
+        "hmxsim_conv.py",
+    )
+    assert "mismatches vs ORT's formula" in out and "(PASS)" in out, out
+    assert "MOCKDSP scalar reference: 0 mismatches" in out, out
+
+
+@needs_tinygrad
+@pytest.mark.skipif(
+    hexagon_tools() is None,
+    reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
+)
 def test_codegen_hexsim_vectorized_add_beats_scalar():
     """hexagon-sim --timing cycles: the default (HVX) codegen vs NOOPT=1 (scalar). Measured ~50x on toolchain
     19.0.04; only a generous ratio is asserted so simulator versions can't make this flaky."""

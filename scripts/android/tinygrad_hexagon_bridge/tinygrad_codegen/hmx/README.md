@@ -149,14 +149,59 @@ lowered yet. Its table (`fp16(512 m)`, `b + lrint(zy / m)`) is per-layer constan
 host, and HMX's conversion has no bit-exact model to check a MOCKDSP reference against. It belongs with the ONNX loader
 (next chunks), which can build the table once at load time.
 
+## Convolution: 3x3 (stride 1 and 2) on the int8 TensorCore (`hmxsim_conv.py`)
+
+A QDQ conv reaches the TensorCore once its pixel axis is one axis. With the padded image NHWC and flattened, the output is
+computed on the same grid (row stride Wp = W + 2; the 2 garbage columns per row are cropped by the consumer), so output and
+input pixel strides match and the taps are flat offsets. The im2col view is movement ops only (two dilated 1-D windows,
+tinygrad's `_pool`), then the ordinary `(A * W).sum()`:
+
+    A(p, dy, dx, c) = x[s*p + dy*Wp + dx, c]
+
+Stride 2 keeps the output grid's row stride at Wp, so `s*p` stays affine: about half of each output row is garbage (2x the
+MACs on those layers), but there is no phase-split copy. tinygrad merges dx and c into one reduce axis (dx*C + c) and keeps
+dy as a second one; the TensorCore then needs `TC_OPT=1`. The renderer changes this needed, in the fork:
+- **The tile op inside several reduce loops.** The accumulator is begun before the outermost enclosing reduce loop and
+  stored after it, and cached tiles are keyed by the index over all of them. Keyed by the innermost loop alone, dy = 1 and 2
+  reused dy = 0's tiles (16447/20480 wrong, identically on hexagon-sim and MOCKDSP).
+- **One VTCM tile pool, planned per loop order.** A, the quad path's spare byte planes and B share one pool of 2 KB slots.
+  Both output-tile loop orders are planned (quad `:deep` > both cached > one cached), and the better one is used. With
+  `HMX_VTCM_KB=4096` (the phone grants 4 MB), whole weight sets and activation panels stay packed.
+- **Activation tiles four at a time.** With NHWC and 128 | C, K blocks 4j .. 4j+3 are the four 32-channel quarters of the
+  same 128-byte pixel lines: each line is loaded once for four tiles (a 4x4 transpose of 32-byte blocks). This also covers a
+  row-major matmul's A (hexagon-sim 128x256x256 int8: 17.5k -> 13.7k pcycles).
+- **Requantization as fixed point with a window.** `r = floor(|acc| 2^L * mm 2^7 / 2^32)`, rounded half up. Lanes within a
+  unit of r or ORT's double rounding (`|v| 2^-24 <= 2^-16`) of a .5 are flagged, and so are |acc| > 2^24; flagged row groups
+  redo through the exact emulation. Flags are checked once per output tile, and the tile's 16 row groups are one C loop.
+  Checking per group (a vector -> scalar move stalls ~250 cycles) and 16 unrolled copies each cost more than the arithmetic.
+
+Bit-exact against ORT's formula on hexagon-sim, MOCKDSP and the phone (stride 1 and 2, Relu, 64/128/256 channels). Phone
+(turbo, 20 iterations, `HMX_VTCM_KB=4096`, `qdq_layer.py`-sized layers at 32x64, health check clean):
+
+| layer | tinygrad (first version) | tinygrad now | hand `QC_EXACT` | hand `QC_FAST` | QNN |
+|---|---:|---:|---:|---:|---:|
+| 3x3 128->128, s1 | 1971 us | **654 us** | 227 us | 33.8 us | 14 us |
+| 3x3 128->128, s2 | 1024 us | **338 us** | 81.5 us | 29.1 us | -- |
+| 3x3 256->256, s1 | 6813 us | **1631 us** | 1070 us | 103.9 us | 82 us |
+
+The matmul + requant layers moved too: 128x576x1536 548 -> 478 us, 128x256x256 75 -> 66 us.
+
+Where the rest goes (hexagon-sim, 3x3 128->128 s1, 682k pcycles; parts stubbed out one at a time): the requantization
+~330k (1.2 cycles/output vs the hand kernel's ~0.84), activation packing ~150k after the four-block pack, the
+byte-plane -> accumulator-array adds ~55k, the HMX MACs ~20k. The hand kernel avoids activation packing altogether: its
+activations are already 2 KB croutons, and a 3x3 conv is `:single` windows over shifted copies. That layout would be a
+graph-level choice (next: the ONNX path), and so would the host-built tables that its `QC_FAST` mode (QNN-class, ~3% off
+by one) needs.
+
 ## Files
 
 | file | what |
 |---|---|
 | `hmxsim_i8.py` | the same for the int8 TC (uint8 x int8 -> int32, exact against numpy) |
-| `hmxsim_rq.py` | a QDQ int8 layer with the requantization fused (`--relu`, `--nobias`), exact against ORT's formula |
+| `hmxsim_rq.py` | a QDQ int8 layer with the requantization fused (`--relu`, `--nobias`, `--noties`), exact against ORT's formula |
+| `hmxsim_conv.py` | a QDQ 3x3 conv in grid form (`--stride 2`, `--relu`, `--int32`, `--noties`), exact against ORT's formula |
 | `hmxsim.py` | capture the MOCKDSP kernel + real buffers, rebuild with `-mv69 -mhmx`, run on `hexagon-sim --mhmx 1`, compare bit for bit (`--ref` also runs the qemu reference; `--prepack` tries tile-layout operands) |
-| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul) |
+| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul, `--rq`: + requant, `--conv H W C N S`: a 3x3 conv plus a phone case dir; `HMX_VTCM_KB` goes into the header for the skel) |
 | `tg_hmx_rpc.idl`, `tg_hmx_impl.c`, `tg_hmx_client.c` | FastRPC skel around the generated kernel (runtime from `hmx_gemm/hmx_runtime.h`) and a checking/timing client |
 | `build.sh`, `run.sh` | build (Hexagon SDK qaic/headers + a `-mhmx` toolchain) and push/run under the phone lock |
 
@@ -179,4 +224,7 @@ I8=1 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128
 # int8 + fused requantization (zy 131; --relu for lo = zy): bias and scale ride in the B buffer
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 128 576 1536 --rq
 RQ=1 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 1536 5
+# a 3x3 conv (H W C N stride) with a 4 MB tile pool; the case dir (input, weights | bias | scale, ORT reference) is pushed too
+HMX_VTCM_KB=4096 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 0 0 0 --conv 32 64 128 128 1
+CASE=case PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 0 0 0 20
 ```

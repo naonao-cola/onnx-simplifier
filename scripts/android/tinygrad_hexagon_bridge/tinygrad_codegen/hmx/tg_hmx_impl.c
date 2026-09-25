@@ -33,7 +33,11 @@ static void worker(void* p) {
   qurt_thread_exit(0);
 }
 
+#ifdef TG_SA
+#define SA TG_SA  /* a conv's input: the flat padded image grid, not M x K */
+#else
 #define SA (TG_M * TG_K * (int)sizeof(tg_a_t))
+#endif
 #define SB (TG_K * TG_N * (int)sizeof(tg_b_t) + TG_B_EXTRA)
 #define SC (TG_M * TG_N * (int)sizeof(tg_c_t))
 int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const uint8* b, int bLen, uint8* c, int cLen,
@@ -43,7 +47,7 @@ int tg_hmx_rpc_run(remote_handle64 h, int iters, const uint8* a, int aLen, const
   codes[0] = hmx_rt_power((void*)tg_hmx_rpc_run, 1);
   if (codes[0]) return 0;
   hmx_rt_t rt;
-  if (hmx_rt_acquire(&rt, 256 * 1024)) { codes[1] = -1; return 0; }  /* the tile caches' HMX_VTCM_KB=256 layout */
+  if (hmx_rt_acquire(&rt, TG_VTCM_KB * 1024)) { codes[1] = -1; return 0; }  /* the tile pool layout the kernel was built for (HMX_VTCM_KB) */
   codes[1] = (int)rt.ctx; codes[4] = (int)rt.vtcm_bytes;
   /* generated kernels take 128-byte aligned buffers (no memalign in the DSP runtime's libc: align by hand) */
   char *raw = malloc(SA + SB + SC + 3 * 128);

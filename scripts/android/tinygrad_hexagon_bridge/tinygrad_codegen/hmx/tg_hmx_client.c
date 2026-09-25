@@ -19,6 +19,23 @@ int main(int argc, char** argv) {
   remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &um, sizeof(um));
   remote_handle64 h; int rc = tg_hmx_rpc_open(argv[1], &h);
   if (rc) { printf("open failed %d\n", rc); return 1; }
+  if (getenv("CASE")) {  /* a case dir from gen_kernel.py --conv: a.bin, b.bin (weights | bias | scale), ref.bin */
+    char path[512]; long na, nb, nr; unsigned char *a, *b, *ref;
+    FILE* f;
+#define RD(nm, buf, n) snprintf(path, sizeof path, "%s/" nm, getenv("CASE")); f = fopen(path, "rb"); if (!f) { printf("no %s\n", path); return 1; } \
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET); buf = malloc(n); fread(buf, 1, n, f); fclose(f);
+    RD("a.bin", a, na) RD("b.bin", b, nb) RD("ref.bin", ref, nr)
+    unsigned char* c = malloc(nr);
+    unsigned long long t[4]; int codes[8];
+    rc = tg_hmx_rpc_run(h, 1, a, na, b, nb, c, nr, t, 4, codes, 8);
+    int bad = 0; for (long i = 0; i < nr; i++) bad += c[i] != ref[i];
+    printf("case %s: rc %d codes power %d ctx %d hvx %d hmx %d vtcm %d thread %d; %d/%ld mismatches vs ORT's formula\n", getenv("CASE"), rc,
+           codes[0], codes[1], codes[2], codes[3], codes[4], codes[5], bad, nr);
+    rc = tg_hmx_rpc_run(h, iters, a, na, b, nb, c, nr, t, 4, codes, 8);
+    printf("%s: %.1f us/call (%d iters) %s\n", getenv("CASE"), (double)t[0] / iters, iters, bad ? "FAIL" : "PASS");
+    tg_hmx_rpc_close(h);
+    return bad != 0;
+  }
   if (getenv("RQ") && atoi(getenv("RQ"))) {
     int zy = getenv("ZY") ? atoi(getenv("ZY")) : 131, lo = getenv("LO") ? atoi(getenv("LO")) : 0;
     int SB = K * N + 8 * N;

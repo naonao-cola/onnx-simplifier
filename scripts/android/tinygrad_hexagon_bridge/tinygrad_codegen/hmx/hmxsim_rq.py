@@ -4,7 +4,7 @@ TensorCore, then ORT's QLinearConv/QLinearMatMul output formula per column,
 which tinygrad spells ((acc + b).float() * m).round() + zy).clip(lo, 255).cast(uint8) and the DSP renderer lowers to HVX (__hmx_rq4:
 four output rows per accumulator load, one predicated store per row). Checked exactly against numpy's IEEE fp32 on hexagon-sim --mhmx 1 and MOCKDSP.
 
-  HMX=1 DEV=DSP MOCKDSP=1 TC=1 CC=clang-19 PYTHONPATH=<tinygrad> python hmxsim_rq.py M K N [--relu] [--nobias] [--ref]
+  HMX=1 DEV=DSP MOCKDSP=1 TC=1 CC=clang-19 PYTHONPATH=<tinygrad> python hmxsim_rq.py M K N [--relu] [--nobias] [--noties] [--ref]
 """
 import sys, os, tempfile, pathlib
 import numpy as np
@@ -32,7 +32,7 @@ if __name__ == "__main__":
   # and some saturating; every 8th column a power of two, where exact .5 ties happen
   acc0 = A.astype(np.int64) @ W.astype(np.int64) + (0 if b is None else b)
   m = (rng.uniform(0.5, 2.0, N) * 50 / (np.abs(acc0).max(axis=0) + 1)).astype(np.float32)
-  m[::8] = np.float32(2.0 ** -8)
+  if "--noties" not in sys.argv: m[::8] = np.float32(2.0 ** -8)  # --noties: arbitrary scales only, as ORT QDQ gives
   layer(A, W, b, m, zy, lo).realize()
   assert len(hmxsim._calls) == 1, f"expected one HMX kernel, got {len(hmxsim._calls)}"
   src, bufs = hmxsim._calls[0]
