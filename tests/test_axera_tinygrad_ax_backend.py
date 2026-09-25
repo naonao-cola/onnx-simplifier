@@ -578,6 +578,28 @@ def test_lower_tinygrad_transposed_matmul_views(
     assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
 
 
+@pytest.mark.parametrize("op", ["add", "mul", "sub", "div"])
+def test_lower_tinygrad_broadcast_binary_uop_to_onnx(op):
+    from tinygrad import Tensor
+
+    left = Tensor.empty(2, 3, 4)
+    right = Tensor.empty(1, 4) if op == "mul" else Tensor.empty(4)
+    root = {
+        "add": left + right,
+        "mul": left * right,
+        "sub": left - Tensor.empty(2, 1, 4),
+        "div": left / Tensor.empty(1),
+    }[op].uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == [op.title()]
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in lowered.graph.input
+    ] == [(2, 3, 4), (1, 4) if op == "mul" else (4,)] if op in ("add", "mul") else [
+        (2, 3, 4), (2, 1, 4) if op == "sub" else (1,)
+    ]
+
+
 def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     from tinygrad import Tensor
 
@@ -675,8 +697,8 @@ def test_lower_tinygrad_dilated_conv_uop_to_onnx():
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 
-    with pytest.raises(ValueError, match="reshape-backed"):
-        axb.lower_uop_to_onnx((Tensor.empty(4) + Tensor.empty(4)).uop)
+    with pytest.raises(IndexError, match="shape mismatch"):
+        axb.lower_uop_to_onnx((Tensor.empty(4) + Tensor.empty(5)).uop)
 
 
 def test_cache_graph_template_bytes_avoids_output_file(tmp_path):

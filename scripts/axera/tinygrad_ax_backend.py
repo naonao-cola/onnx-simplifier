@@ -2327,26 +2327,29 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         if len(root.src) != 2:
             raise ValueError(f"AX UOp {binary_op} lowering requires two operands")
         assert left is not None and right is not None
-        if left.shape != right.shape or not left.shape:
+        left_shape = tuple(int(dim) for dim in left.shape)
+        right_shape = tuple(int(dim) for dim in right.shape)
+        shape = tuple(int(dim) for dim in root.shape)
+        if not left_shape or not right_shape:
             raise ValueError(
-                f"AX UOp {binary_op} lowering requires equal static operand shapes"
+                f"AX UOp {binary_op} lowering requires non-empty static operand shapes"
             )
-        if left.op is not Ops.RESHAPE or right.op is not Ops.RESHAPE:
+        try:
+            broadcast_shape = tuple(np.broadcast_shapes(left_shape, right_shape))
+        except ValueError as exc:
             raise ValueError(
-                f"AX UOp {binary_op} lowering requires reshape-backed inputs"
+                f"AX UOp {binary_op} lowering requires broadcast-compatible shapes"
+            ) from exc
+        if broadcast_shape != shape:
+            raise ValueError(
+                f"AX UOp {binary_op} output shape {shape} does not match broadcast shape {broadcast_shape}"
             )
-        if (
-            not left.src
-            or not right.src
-            or left.src[0].op is not Ops.ALLOC
-            or right.src[0].op is not Ops.ALLOC
-        ):
+        if not alloc_backed_view(left) or not alloc_backed_view(right):
             raise ValueError(f"AX UOp {binary_op} lowering requires ALLOC-backed inputs")
         if str(root.dtype).split(".")[-1] != "float":
             raise ValueError(
                 f"AX UOp {binary_op} lowering currently supports float32 data only"
             )
-        shape = tuple(int(dim) for dim in root.shape)
         if any(dim <= 0 for dim in shape):
             raise ValueError(
                 f"AX UOp {binary_op} lowering requires positive static shapes"
@@ -2355,8 +2358,8 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             [onnx.helper.make_node(binary_op, ["x", "z"], ["y"])],
             f"tinygrad_uop_{binary_op.lower()}_ax",
             [
-                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, shape),
-                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, shape),
+                onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, left_shape),
+                onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, right_shape),
             ],
             [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
         )
