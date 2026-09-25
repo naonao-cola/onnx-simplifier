@@ -1,7 +1,7 @@
 # tinygrad-generated HMX (V69 matrix unit) kernels
 
 The tinygrad fork's DSP backend gets HMX as a `TensorCore` (onnxsim/tinygrad#6, branch `hvx-hmx`, `HMX=1`), fp16 x fp16 ->
-fp16 over whole 32x32 tiles, built on the hand-written reference in [`../../../hmx_gemm`](../../../hmx_gemm) (#1909, #1917,
+fp16 over whole 32x32 tiles (and, `tc.hexagon_hmx_i8` below, uint8 x int8 -> int32 over 32x64x32), built on the hand-written reference in [`../../../hmx_gemm`](../../../hmx_gemm) (#1909, #1917,
 #1921). This directory runs what tinygrad generates on hexagon-sim and on the phone and compares it with the hand kernel.
 
 ## What is generated and what isn't
@@ -42,11 +42,15 @@ three rows), each step bit-exact on qemu `HMX_REF`, hexagon-sim and the phone, `
 | 8f786b268 | output-tile loop interchange (longer loop outermost) + K-indexed set-associative cache | 541 | 0.209 | 3.2x |
 | 6df798fa8 | output tile stored straight to the output rows; cache sets resolved at render time | 516 | 0.220 | 3.1x |
 | 6c177be94 | exact loop-indexed cache slots, one spanning load pair, byte-predicated row stores | 403 | 0.281 | 2.4x |
-| **d70b1cbe5** | **B tiles n, n+1 packed together from full 128-byte row lines** | **355** | **0.319** | **2.1x** |
-| hand `hmx_gemm`, DDR-fed (mode 0) | | 168.8 | 0.671 | 1x |
+| d70b1cbe5 | B tiles n, n+1 packed together from full 128-byte row lines | 355 | 0.319 | 2.1x |
+| f7b5b6cdd, `HMX_PF_AHEAD=0` | the output paired too (tiles n, n+1 computed on even n, full 64-column rows stored), batched pair packing | 338 | 0.335 | 1.9x |
+| **f7b5b6cdd** (hvx-hmx-qdq, onnxsim/tinygrad#8) | **the next B pair's 128-byte panel l2fetch'ed while this one packs** | **284.5** | **0.398** | **1.6x** |
+| hand `hmx_gemm`, DDR-fed (mode 0) | | 168.8 (178.3 in f7b5b6cdd's session) | 0.671 | 1x |
 | hand `hmx_gemm`, VTCM-resident (mode 1) | | 36.9 | 3.073 | |
 
-hexagon-sim (d70b1cbe5): 64^3 4398 Pcycles, 32x2048x32 18284, 128x576x256 50052 (377 MAC/cycle).
+hexagon-sim (d70b1cbe5): 64^3 4398 Pcycles, 32x2048x32 18284, 128x576x256 50052 (377 MAC/cycle). 128x576x1536:
+d70b1cbe5 367k pcycles, f7b5b6cdd 263k (the lookahead prefetch is off there: it costs cycles on the simulator, which has no
+DDR latency to hide), hand kernel 193k.
 
 **What the renderer does now** (`_hmx_acc_rewrite` in tinygrad's `ops_dsp.py`, on the linearized kernel; `HMX_ACC=0` keeps the
 plain tile op, `HMX_INTERCHANGE=0` the loop order):
@@ -63,25 +67,60 @@ plain tile op, `HMX_INTERCHANGE=0` the loop order):
    their first fill. Otherwise: a tagged K-indexed cache, or plain staging with a load pair per K block.
 4. **Output.** When tinygrad only copies the accumulator array (lane permutations) to the output after the loop, the tile is
    written straight to the output rows instead: per row pair one `vdealh` and two byte-predicated `vmem` stores (predicate
-   set in asm -- the clang q-register builtins assert in this toolchain), no read of the destination.
+   set in asm -- the clang q-register builtins assert in this toolchain), no read of the destination. With paired B the
+   output is paired too: even n runs a spanning load pair for tile n and one for n+1, stores both accumulators, and writes
+   full 64-column rows (`__hmx_outp`); odd n does nothing.
+5. **Lookahead prefetch** (`HMX_PF_AHEAD`, default on): the first fill of a B pair also l2fetches the next pair's
+   128-byte panel, which streams in while this one packs (338 -> 284.5 us on the phone).
 
-**What's left** (2.1x to the hand kernel): the hand kernel streams weights prepacked on the host (contiguous 2 KB tiles,
+**What's left** (1.6x to the hand kernel): the hand kernel streams weights prepacked on the host (contiguous 2 KB tiles,
 120k pcycles for W) where tinygrad still packs B from row-major rows; prepacked operands through a tinygrad view still split
 the matmul into three kernels (`hmxsim.py --prepack`). Then the hand kernel's DMA double-buffering.
+
+## int8: the `:cm` TensorCore (`tc.hexagon_hmx_i8`)
+
+uint8 activations x int8 weights -> int32, the layer shape of a QDQ network (`hmx_gemm/hmx_gemm_u8.h`, `hmx_qconv.h`),
+32x64x32 per TC op. Same renderer machinery as fp16 (accumulator in HMX across K, operand tiles in loop-indexed VTCM slots,
+loop interchange), with the int8 layouts:
+
+- **A** into `:cm` activation tiles (64 rows x 32 bytes, `A(s,k)` at byte `32s+k`): four rows per 128-byte vector,
+  two `vshuff`s (-32, -64).
+- **B** into weight tiles, four K rows interleaved per 32-bit column group (`W(k,c)` at `128*(k/4)+4c+k%4`): one byte and
+  one halfword `vshuff` per four rows. **Four adjacent N tiles** share each 128-byte weight row line: packed together on
+  `n%4==0` into two pair slots `[n | n+1]`, and on even n **one `:deep` weight load pair per K block** (Rt 0x7ff, 64
+  columns) drives both accumulators, tiles n and n+1.
+- **Output: the exact int32 accumulator** via four non-saturating `:cm.ub` byte-plane stores with `:retain` against a
+  64-bit column table (bias 0, scale words 0x6000 / 0x4000 / 0x2000 / 0x0800 = x1, /2^8, /2^16, /2^24 relative to the
+  first: bytes 0..3 of the accumulator out of the wrapping store), reassembled into int32 with HVX (`__hmx_i8_addq`).
+  Tile n+1's planes wait in 8 KB of spare A slots until odd n adds them. This is the exact-mode building block; fused requantization is the next step.
+
+Phone (turbo, 50 iterations, bit-exact against numpy's int64 matmul, health check clean), 128x576x1536:
+
+| kernel | us/call | TMAC/s |
+|---|---:|---:|
+| tinygrad int8 (f7b5b6cdd, `HMX_PF_AHEAD=0`) | 181.0 | 0.626 |
+| **tinygrad int8 (f7b5b6cdd), exact int32 out** | **161.1** | **0.703** |
+| hand `hmx_gemm_u8` DDR-fed (mode 0: pack A, stream prepacked W, u8 out via the fast requant table) | 188.5 | 0.601 |
+| hand `hmx_gemm_u8`, W resident in VTCM (mode 1) | 88.8 | 1.275 |
+
+hexagon-sim: 128x576x1536 193k pcycles (a naive VTCM-cached version: 325k; quad + `:deep`: 258k), hand fast-requant 167k;
+128x256x256 17.5k (480 MAC/cycle). `hmxsim_i8.py M K N [--ref]` checks it on hexagon-sim and the qemu `HMX_REF` reference.
 
 ## Files
 
 | file | what |
 |---|---|
+| `hmxsim_i8.py` | the same for the int8 TC (uint8 x int8 -> int32, exact against numpy) |
 | `hmxsim.py` | capture the MOCKDSP kernel + real buffers, rebuild with `-mv69 -mhmx`, run on `hexagon-sim --mhmx 1`, compare bit for bit (`--ref` also runs the qemu reference; `--prepack` tries tile-layout operands) |
-| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` |
+| `gen_kernel.py` | render the generated kernel for one shape into `tg_kernel.c` / `tg_kernel.h` (`--i8`: the int8 matmul) |
 | `tg_hmx_rpc.idl`, `tg_hmx_impl.c`, `tg_hmx_client.c` | FastRPC skel around the generated kernel (runtime from `hmx_gemm/hmx_runtime.h`) and a checking/timing client |
 | `build.sh`, `run.sh` | build (Hexagon SDK qaic/headers + a `-mhmx` toolchain) and push/run under the phone lock |
 
-`tests/test_hexagon_tinygrad.py::test_codegen_hmx_fp16_matmul_bit_exact` runs `hmxsim.py 64 64 64 --ref` in the Hexagon
-tinygrad CI job (pinned to the fork's `hvx-hmx` head).
+`tests/test_hexagon_tinygrad.py::test_codegen_hmx_fp16_matmul_bit_exact` runs `hmxsim.py 64 64 64 --ref`,
+`test_codegen_hmx_int8_matmul_exact` runs `hmxsim_i8.py 128 256 256 --ref` in the Hexagon tinygrad CI job (pinned to the
+fork's `hvx-hmx-qdq` head).
 
-Reproduce (tinygrad = a checkout of `onnxsim/tinygrad` `hvx-hmx`):
+Reproduce (tinygrad = a checkout of `onnxsim/tinygrad` `hvx-hmx-qdq`):
 
 ```
 HMX=1 DEV=DSP MOCKDSP=1 TC=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLS=~/.cache/hexagon-oa-19/Tools PYTHONPATH=$TINYGRAD \
@@ -89,4 +128,7 @@ HMX=1 DEV=DSP MOCKDSP=1 TC=1 HVX_ARCH=v69 CC=clang-19 HEXAGON_TOOLS=~/.cache/hex
 HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 128 576 1536
 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh setup
 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 1536 5
+# int8: build with --i8 (4th argument), run with I8=1
+HEXAGON_SDK_ROOT=... HEXAGON_TOOLCHAIN=... TINYGRAD=$TINYGRAD ./build.sh 128 576 1536 --i8
+I8=1 PHONE_LOCK_OWNER=<branch> ~/.cache/android-phone/phone-run ./run.sh run 128 576 1536 5
 ```

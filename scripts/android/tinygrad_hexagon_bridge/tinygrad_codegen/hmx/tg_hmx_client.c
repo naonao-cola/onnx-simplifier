@@ -1,6 +1,7 @@
 /* Phone client for tg_hmx_rpc: random fp16 A (MxK), B (KxN), runs the tinygrad-generated HMX kernel and checks it bit
  * for bit against the rounding model of the accumulator-resident codegen: exact accumulation over all of K, rounded once.
- *   tg_hmx_client <uri> M K N [iters] */
+ * With I8=1 (the skel built with gen_kernel.py --i8): A uint8, B int8, C int32, checked exactly.
+ *   [I8=1] tg_hmx_client <uri> M K N [iters] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,24 @@ int main(int argc, char** argv) {
   remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &um, sizeof(um));
   remote_handle64 h; int rc = tg_hmx_rpc_open(argv[1], &h);
   if (rc) { printf("open failed %d\n", rc); return 1; }
+  if (getenv("I8") && atoi(getenv("I8"))) {
+    unsigned char* a = malloc(M * K); signed char* b = malloc(K * N); int *c = malloc(M * N * 4), *r = malloc(M * N * 4);
+    srand(1);
+    for (int i = 0; i < M * K; i++) a[i] = rand() & 255;
+    for (int i = 0; i < K * N; i++) b[i] = (signed char)(rand() & 255);
+    for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) { long s = 0; for (int k = 0; k < K; k++) s += (long)a[m * K + k] * b[k * N + n]; r[m * N + n] = (int)s; }
+    unsigned long long t[4]; int codes[8];
+    rc = tg_hmx_rpc_run(h, 1, a, M * K, (const unsigned char*)b, K * N, (unsigned char*)c, M * N * 4, t, 4, codes, 8);
+    int bad = 0; for (int i = 0; i < M * N; i++) bad += c[i] != r[i];
+    printf("int8: rc %d codes power %d ctx %d hvx %d hmx %d vtcm %d thread %d; %d/%d mismatches vs exact int32\n", rc, codes[0], codes[1],
+           codes[2], codes[3], codes[4], codes[5], bad, M * N);
+    rc = tg_hmx_rpc_run(h, iters, a, M * K, (const unsigned char*)b, K * N, (unsigned char*)c, M * N * 4, t, 4, codes, 8);
+    double us = (double)t[0] / iters;
+    printf("%dx%dx%d int8: %.1f us/call, %.3f TMAC/s (tinygrad-generated HMX :cm, %d iters) %s\n", M, K, N, us, (double)M * K * N / us / 1e6,
+           iters, bad ? "FAIL" : "PASS");
+    tg_hmx_rpc_close(h);
+    return bad != 0;
+  }
   unsigned short *a = malloc(M * K * 2), *b = malloc(K * N * 2), *c = malloc(M * N * 2), *r = malloc(M * N * 2);
   srand(1);
   for (int i = 0; i < M * K; i++) a[i] = f2h((rand() % 2001 - 1000) / 2000.0);
@@ -24,11 +43,11 @@ int main(int argc, char** argv) {
     r[m * N + n] = f2h(s);
   }
   unsigned long long t[4]; int codes[8];
-  rc = tg_hmx_rpc_run(h, 1, a, M * K, b, K * N, c, M * N, t, 4, codes, 8);  /* warm-up + correctness */
+  rc = tg_hmx_rpc_run(h, 1, (const unsigned char*)a, M * K * 2, (const unsigned char*)b, K * N * 2, (unsigned char*)c, M * N * 2, t, 4, codes, 8);  /* warm-up + correctness */
   int bad = 0; for (int i = 0; i < M * N; i++) bad += c[i] != r[i];
   printf("rc %d codes power %d ctx %d hvx %d hmx %d vtcm %d thread %d; %d/%d bit mismatches vs model\n", rc, codes[0], codes[1],
          codes[2], codes[3], codes[4], codes[5], bad, M * N);
-  rc = tg_hmx_rpc_run(h, iters, a, M * K, b, K * N, c, M * N, t, 4, codes, 8);
+  rc = tg_hmx_rpc_run(h, iters, (const unsigned char*)a, M * K * 2, (const unsigned char*)b, K * N * 2, (unsigned char*)c, M * N * 2, t, 4, codes, 8);
   double us = (double)t[0] / iters;
   printf("%dx%dx%d: %.1f us/call, %.3f TMAC/s (tinygrad-generated HMX, %d iters) %s\n", M, K, N, us, (double)M * K * N / us / 1e6,
          iters, bad ? "FAIL" : "PASS");
