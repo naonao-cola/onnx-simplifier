@@ -31,10 +31,13 @@ INC=(-I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" -I "$HEXAGON
   "$B/e2e/rpn_glue.o" "$B/e2e/rpn_stub.o" "$B/e2e/roi_stub.o" "$B/e2e/roiu8_stub.o" \
   -L "$QS/libs" -lonnxruntime -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc \
   -ljnigraphics -llog -Wl,--no-undefined
-# YOLO, SAM and super-resolution modes: one engine library each (ORT + QNN EP only, no DSP skels)
+# YOLO, SAM and super-resolution modes: one engine library each (ORT + QNN EP only, no DSP skels; the YOLO engine
+# also runs tinygrad AOT OpenCL bundles, engine=tinygrad: ../tinygrad_aot/tg_cl_runner.h, vendor libOpenCL.so dlopen'ed)
+mkdir -p "$B/clinc" && ln -sfn "${CL_HEADERS:-/usr/include}/CL" "$B/clinc/CL"
 for e in yolo sam sr; do
   "$NDK/aarch64-linux-android29-clang++" -O2 -std=c++17 -shared -fPIC -static-libstdc++ -I "$QS/headers" \
-    -o "$J/lib${e}_demo.so" "$HERE/native/${e}_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog \
+    -I "$HERE/../tinygrad_aot" -I "$B/clinc" \
+    -o "$J/lib${e}_demo.so" "$HERE/native/${e}_engine.cpp" -L "$QS/libs" -lonnxruntime -ljnigraphics -llog -ldl \
     -Wl,--no-undefined
 done
 # MCC 3D mode's DSP decoder (../mcc_hmx): its skel + stub, relinked into libmcc_demo.so (the loop above

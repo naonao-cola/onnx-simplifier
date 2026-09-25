@@ -24,7 +24,9 @@ This directory asks whether that can be done again without SNPE, with our own in
 | Best integer config (§6) | **W16A16**: plan 5.7 / 4.5 mm, lead p95 0.009 / 7e-5 (6-12x fp16's error) | **W16A16**: worst head 5.9e-4 / 4.2e-4 (~2.5x fp16), blink agreement ≥ 99.8% |
 | Cheaper config (§6) | W8 AdaRound + 10 convs W16, A16: plan 1.4 / 1.7 cm, lead p95 0.017 | W8 AdaRound, A16: worst head 0.006, blink ≥ 99.7% |
 | Plain int8 PTQ (§3) | W8A8: **broken** (plan 4.3 m) | W8A8: blink agreement 86-95% |
-| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed), after §7 | W16A16 31.3 ms, cheaper config 19.2 ms, W8A16 17.7 ms, W8A8 10.8 ms; heads extra | W16A16 18.5 ms, W8A16 10.2 ms, W8A8 5.8 ms |
+| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed), after §7 | W16A16 31.3 ms, cheaper config 19.2 ms, W8A16 17.7 ms, W8A8 10.8 ms | W16A16 18.5 ms, W8A16 10.2 ms, W8A8 5.8 ms |
+| Heads, simulated int8/int16 GEMVs streamed from DDR (§8), 1 thread | 2.4 ms (int8 weights, u8) to 8.7 ms (int16, u16); mixed-precision heads 4.9 ms | 0.2-0.3 ms |
+| Per frame, both models (§8), 20 Hz budget 50 ms | best-accuracy config 55 ms (over budget); cheaper config 34.6 ms | |
 | Upstream tinygrad `DEV=DSP` on these models | fp16 graph: fails to link (`__extendhfsf2`/`__truncsfhf2` undefined). fp32 graph: not tried (see the DM column) | fp32 graph: compiles (730 kernels) and matches ORT to 1.4e-5 under qemu. It is scalar float code: V65 HVX has no float |
 
 **Accuracy sets the cost.** No integer config reaches fp16's own error against fp32: not even with every
@@ -357,6 +359,73 @@ Depthwise is now 12-14% of driving's cycles, and **pointwise is 64-75%**. `pw` s
 against a 2-`vrmpy`-per-packet ceiling of 256. So pointwise is where the next speedup is, especially
 for W16A16's 4-pass (estimated) pointwise.
 
+## 8. Heads: simulated GEMVs and their weight precision (`project_heads.py`, `head_bits.py`, `hvx65` `gemv`)
+
+Round 1 estimated the driving heads at ~3 ms from weight bytes and an assumed 8 GB/s. They are now
+simulated. The weights (23.5 MB for driving, 1.1 MB for DM) are **88 + 53 Gemm/MatMul with constant
+weights**: batch-1 GEMVs, plus the attention block's 9-token GEMMs.
+
+**Kernel** (`gemv M K N [a16]`, bit-exact):
+- int8 weights prepacked `[N/32][K/4][32][4]`; each 4-byte activation group is splatted, and
+  `vrmpy(Vub = splat(x), Vb = W)` produces 32 outputs x 4 k per instruction.
+- The next 32-output block is prefetched with `l2fetch` while the current one computes.
+- The harness evicts L2 before the call, so every weight comes from DDR, as it would every frame.
+- The 9-token GEMMs use all 9 rows per weight vector, and 2 output blocks per splat
+  (`gemv9x2_u8`, u8 activations).
+
+**Memory in the sim.**
+- Beyond L2 (~1 MB here), an unprefetched HVX load stream sustains 12.9 cycles/vector (10 B/cycle).
+- With the prefetch, a K=1024, N=2048 GEMV reaches **19.4 B/cycle** (5.7x the unprefetched 3.4 B/cycle).
+- These are hexagon-sim's DDR model numbers, not the 845's LPDDR4X.
+
+| head | activations | weights | Mcycles (1 thread) | ms @ 1 GHz |
+|---|---|---|---:|---:|
+| driving | u8 | int8 (23.5 MB) | 2.42 | 2.4 (sim) |
+| driving | u16 | int8 | 4.36 | 4.4 (sim) |
+| driving | u8 / u16 | mixed int8/int16 (29.3 MB, below) | 2.84 / 4.89 | 2.8 / 4.9 (int16 part: 2x est.) |
+| driving | u8 / u16 | int16 (46.9 MB) | 4.84 / 8.72 | 4.8 / 8.7 (2x est.) |
+| DM | u8 / u16 | int8 | 0.24 / 0.31 | 0.2 / 0.3 (sim) |
+
+- **The 9-token GEMMs dominate** (the attention block's 512→2048→512 MLP and 512→1536 QKV): 1.2 of
+  2.4 Mcycles at u8. They are splat-bound, not bandwidth-bound; the batch-1 GEMVs run at 16-19 B/cycle.
+- **Not simulated:** the two activation-by-activation attention MatMuls (8 heads x 9x64x9, ~0.1 MMAC),
+  and the heads' float epilogues (LayerNorm, Softmax, Sigmoid, GELU, output scaling).
+
+**Weight precision (`head_bits.py`, results in `results/headsweep_driving*.json`).** The heads so far
+were float in §6. Fake-quantized per output channel on top of the W16A16 backbone, with the heads'
+activations still float:
+
+| heads' weights | plan lat s8 / s5 | lead prob p95 s8 / s5 |
+|---|---:|---:|
+| float (§6's W16A16) | 0.0057 / 0.0045 m | 0.0088 / 7e-5 |
+| int16 | 0.0057 / 0.0045 m | 0.0088 / 7e-5 |
+| int8 | 0.042 / 0.036 m | 0.026 / 2e-4 |
+| **mixed: int16 for 5 groups (5.8 M params), int8 for the rest (17.7 M)** | **0.0080 / 0.0071 m** | **0.018 / 7e-5** |
+
+- **Int8 head weights alone cost 7x W16A16's whole-backbone plan error.**
+- A per-group sweep (only that group int8, rest int16) on segment 12 finds the plan error almost
+  entirely in `temporal_hydra.final_layer` (0.25 MB). A lead-probability sweep points at
+  `vision_model.policy.hydra`.
+- Keeping those two, plus `temporal_hydra.in_layer`, `.resblock` and `summarizer.resblock.block_a`, in
+  int16 recovers the plan (0.80 vs 0.57 cm). Lead p95 is halfway (0.018 vs 0.009).
+- **Open:** the heads' *activations* on the DSP. There is no float on V65 HVX, and the heads contain
+  LayerNorm/Softmax/Sigmoid/GELU. Quantizing the heads' output (`outputs`, one tensor mixing metres
+  and logits) was already ruled out in §3. They could run in 16-bit fixed point on the DSP, or on the
+  CPU. This was not tested.
+
+**Per-frame DSP time.** Projection: backbone on 2 HVX threads plus heads on 1 thread, at an assumed
+1 GHz. The 20 Hz budget for both models together is 50 ms.
+
+| config | driving | DM | total | accuracy vs fp32 (s8) |
+|---|---:|---:|---:|---|
+| best: W16A16 backbones, mixed heads (u16) | 31.3 + 4.9 = 36.2 ms | 18.5 + 0.3 = 18.8 ms | **55 ms: over budget** | plan 0.8 cm, lead p95 0.018; DM worst head 6e-4 (heads float in eval) |
+| cheaper: W8 AdaRound + top-10 W16 A16 backbone, mixed heads; DM W8 AdaRound A16 | 19.2 + 4.9 = 24.1 ms | 10.2 + 0.3 = 10.5 ms | **34.6 ms** | plan 1.4 cm, lead p95 0.021; DM worst head 0.006 |
+| GPU today (route logs, older model, fp16) | 29.5 ms | 14.5 ms | | |
+
+Only the cheaper config fits the 20 Hz budget on one cDSP at the assumed clock. That is before the
+unmodeled dw↔pw layout conversions (§7, ~5%) and head epilogues. Its error is 15x fp16's on plan and
+40x on lead.
+
 ## Going on device (plan)
 
 1. **Access.** comma devices run AGNOS (Linux, root).
@@ -391,6 +460,7 @@ for W16A16's 4-pass (estimated) pointwise.
 | `evaluate.py` | held-out-segment scoring vs fp32 through openpilot's parser (driving + DM) |
 | `adaround_conv.py` | layer-wise AdaRound for Conv int8 per-channel weights (torch) |
 | `mixed_bits.py` | per-conv int16 weights on top of `quantize_full_qdq`, per-conv / activation-window sensitivity sweeps, per-channel activation experiment |
+| `project_heads.py`, `head_bits.py`, `results/heads_*.json`, `results/headsweep_driving*.json` | §8: simulated head GEMVs, head weight-precision sweeps |
 | `results/acc_*.json`, `results/w16_rank_driving.txt`, `results/sweep_w16.json`, `results/actsweep_only.json`, `results/adaround_*.log` | §6 results |
 
 Reproduce (paths are examples):

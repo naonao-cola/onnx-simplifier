@@ -162,13 +162,17 @@ def test_convert_to_coreml_matches_export_coreml():
 
 
 def test_resize_nearest_asymmetric_floor_matches_onnx():
+    # 2x3 -> 3x5 repeats no input row/column a whole number of times, so this
+    # stays on the index-gather expansion MIL can constant-fold -- which is what
+    # lets this check the sampling rule numerically. The native-op fast path is
+    # covered separately by test_resize_nearest_repeating_uses_native_core_ml_op.
     x = numpy_helper.from_array(
-        np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), name="x"
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
     )
-    scales = numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), name="scales")
+    sizes = numpy_helper.from_array(np.array([1, 1, 3, 5], np.int64), name="sizes")
     node = onnx.helper.make_node(
         "Resize",
-        ["x", "", "scales"],
+        ["x", "", "", "sizes"],
         ["y"],
         mode="nearest",
         coordinate_transformation_mode="asymmetric",
@@ -178,27 +182,33 @@ def test_resize_nearest_asymmetric_floor_matches_onnx():
         [node],
         "nearest_resize",
         [],
-        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 4, 4])],
-        [x, scales],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 3, 5])],
+        [x, sizes],
     )
     model = onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
     )
     model.ir_version = 8
-    expected = np.repeat(
-        np.repeat(np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), 2, 2), 2, 3
-    )
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
     np.testing.assert_array_equal(_mil_const_value(model), expected)
+    # 2x3 -> 3x5 is not whole-column replication, so the gate keeps the gathers
+    # and these are the sampling rules the two modes must agree with.
+    np.testing.assert_array_equal(
+        expected[0, 0, 0],
+        np.array([1.0, 1.0, 2.0, 2.0, 3.0], dtype=np.float32),
+    )
 
 
 def test_resize_nearest_half_pixel_round_prefer_floor_matches_onnx():
     x = numpy_helper.from_array(
-        np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), name="x"
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
     )
-    scales = numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), name="scales")
+    sizes = numpy_helper.from_array(np.array([1, 1, 3, 5], np.int64), name="sizes")
     node = onnx.helper.make_node(
         "Resize",
-        ["x", "", "scales"],
+        ["x", "", "", "sizes"],
         ["y"],
         mode="nearest",
         coordinate_transformation_mode="half_pixel",
@@ -208,17 +218,21 @@ def test_resize_nearest_half_pixel_round_prefer_floor_matches_onnx():
         [node],
         "nearest_resize_half_pixel",
         [],
-        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 4, 4])],
-        [x, scales],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 3, 5])],
+        [x, sizes],
     )
     model = onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
     )
     model.ir_version = 8
-    expected = np.repeat(
-        np.repeat(np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), 2, 2), 2, 3
-    )
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
     np.testing.assert_array_equal(_mil_const_value(model), expected)
+    np.testing.assert_array_equal(
+        expected[0, 0, 0],
+        np.array([1.0, 1.0, 2.0, 3.0, 3.0], dtype=np.float32),
+    )
 
 
 def test_resize_nearest_fixed_sizes_matches_onnxruntime():
@@ -264,6 +278,151 @@ def test_resize_linear_fixed_sizes_lowers_bilinear():
     assert resize.inputs["target_size_height"].val == 4
     assert resize.inputs["target_size_width"].val == 5
     assert resize.inputs["sampling_mode"].val == "UNALIGN_CORNERS"
+
+
+def test_resize_nearest_repeating_uses_native_core_ml_op():
+    # A nearest upsample by an integer factor samples each input row/column a
+    # whole number of times, which is the case Core ML's own
+    # `resize_nearest_neighbor` reproduces exactly (measured against ONNX Runtime
+    # on 2x2->4x4, 3x4->6x8 and 4x4->8x8). That is a real kernel instead of a
+    # pair of index gathers materializing an intermediate feature map, which is
+    # what made a 4-level FPN expensive.
+    model = _model(
+        """
+        nearest_native (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("resize_nearest_neighbor") == 1
+    assert "gather" not in ops
+    (resize,) = [
+        op for op in func.operations if op.op_type == "resize_nearest_neighbor"
+    ]
+    assert resize.inputs["target_size_height"].val == 4
+    assert resize.inputs["target_size_width"].val == 4
+
+
+def test_resize_nearest_non_repeating_keeps_index_gathers():
+    # 2x3 -> 3x4 does not repeat every input row/column a whole number of
+    # times. Core ML's own op samples different positions there (verified on
+    # device), so the gate must fall back to the gather expansion rather than
+    # silently change results.
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        nearest_fallback () => (float[1,1,3,4] y)
+        <int64[4] sizes = {1,1,3,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("gather") == 2
+    assert "resize_nearest_neighbor" not in ops
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_nearest_downscale_keeps_index_gathers():
+    # A downscale never repeats rows. Core ML's op does not reproduce ONNX's
+    # sampling rule for one (4x4 -> 2x2 measured a different first row on
+    # device), so this must stay on the gather path.
+    x = numpy_helper.from_array(
+        np.arange(1, 17, dtype=np.float32).reshape(1, 1, 4, 4), name="x"
+    )
+    model = _model(
+        """
+        nearest_down () => (float[1,1,2,2] y)
+        <int64[4] sizes = {1,1,2,2}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    ops = [op.op_type for op in func.operations]
+    assert ops.count("gather") == 2
+    assert "resize_nearest_neighbor" not in ops
+    expected = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_nearest_index_gate_matches_integer_replication_only():
+    # The gate is the correctness argument for the native op, so pin its
+    # boundaries directly rather than only through a model.
+    up = np.array([0, 0, 1, 1], dtype=np.int32)
+    assert coreml_export._resize_nearest_is_repeating(2, up) is True
+    uneven = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
+    assert coreml_export._resize_nearest_is_repeating(3, uneven) is True
+    # Not a whole-number replication, even though the indices look plausible.
+    assert (
+        coreml_export._resize_nearest_is_repeating(2, np.array([0, 1, 1], np.int32))
+        is False
+    )
+    # A downscale is never eligible.
+    assert (
+        coreml_export._resize_nearest_is_repeating(4, np.array([0, 2], np.int32))
+        is False
+    )
+    # Even an index array of the right length but wrong content is rejected.
+    assert (
+        coreml_export._resize_nearest_is_repeating(2, np.array([0, 1, 1, 1], np.int32))
+        is False
+    )
+
+
+def test_resize_nearest_raises_the_deployment_target_to_ios15():
+    # `resize_nearest_neighbor` is an iOS15 op, so a graph that may emit it has
+    # to build and convert at that target or newer.
+    model = _model(
+        """
+        nearest_target (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model)
+    assert mlmodel.get_spec().specificationVersion >= int(ct.target.iOS15)
+
+    # An explicitly newer target is kept as-is.
+    higher = onnxsim.export_coreml(model, minimum_deployment_target="iOS17")
+    assert higher.get_spec().specificationVersion == int(ct.target.iOS17)
+
+
+def test_resize_nearest_below_ios15_raises():
+    model = _model(
+        """
+        nearest_old (float[1,1,2,2] x) => (float[1,1,4,4] y)
+        <int64[4] sizes = {1,1,4,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="half_pixel", nearest_mode="round_prefer_floor"> (x, , , sizes)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    with pytest.raises(RuntimeError, match="iOS15/macOS12 or newer"):
+        coreml_export.convert_to_coreml(model, minimum_deployment_target="iOS14")
 
 
 def test_gather_nd_batch_dims_preserved():
