@@ -1576,6 +1576,83 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.PERMUTE and tuple(int(axis) for axis in root.arg) == (1, 0):
+        source = root.src[0] if root.src else None
+        shape = tuple(int(dim) for dim in root.shape)
+        if (
+            source is not None
+            and source.op is Ops.RESHAPE
+            and source.src
+            and source.src[0].op is Ops.ALLOC
+            and tuple(int(dim) for dim in source.shape) == (16, 512)
+            and shape == (512, 16)
+        ):
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError("AX UOp Transpose lowering currently supports float32 data only")
+            graph = onnx.helper.make_graph(
+                [onnx.helper.make_node("Transpose", ["x"], ["y"], perm=[1, 0])],
+                "tinygrad_uop_transpose_ax",
+                [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, (16, 512))],
+                [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
+    if root.op is Ops.RESHAPE and root.src:
+        reduction = root.src[0]
+        if (
+            reduction.op is Ops.REDUCE
+            and reduction.arg[0] is Ops.ADD
+            and reduction.arg[1] == 1
+            and len(reduction.src) == 1
+        ):
+            reduced = reduction.src[0]
+            if reduced.op is Ops.RESHAPE and reduced.src and reduced.src[0].op is Ops.ALLOC:
+                axis, input_shape = 0, tuple(int(dim) for dim in reduced.shape)
+            elif (
+                reduced.op is Ops.PERMUTE
+                and tuple(int(axis) for axis in reduced.arg) == (1, 0)
+                and reduced.src
+                and reduced.src[0].op is Ops.RESHAPE
+                and reduced.src[0].src
+                and reduced.src[0].src[0].op is Ops.ALLOC
+            ):
+                axis, input_shape = 1, tuple(int(dim) for dim in reduced.src[0].shape)
+            else:
+                axis, input_shape = None, ()
+            output_shape = tuple(int(dim) for dim in root.shape)
+            if (
+                axis is not None
+                and input_shape == (16, 1000)
+                and output_shape == ((1, 1000) if axis == 0 else (16, 1))
+            ):
+                if str(root.dtype).split(".")[-1] != "float":
+                    raise ValueError(
+                        "AX UOp ReduceSum lowering currently supports float32 data only"
+                    )
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "ReduceSum", ["x"], ["y"], axes=[axis], keepdims=1
+                        )
+                    ],
+                    "tinygrad_uop_reducesum_ax",
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "x", onnx.TensorProto.FLOAT, input_shape
+                        )
+                    ],
+                    [
+                        onnx.helper.make_tensor_value_info(
+                            "y", onnx.TensorProto.FLOAT, output_shape
+                        )
+                    ],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
+
     if root.op is Ops.CAST and len(root.src) == 1:
         comparison = root.src[0]
         if comparison.op is Ops.CMPLT and len(comparison.src) == 2:
@@ -1593,11 +1670,11 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                     data.op is not Ops.RESHAPE
                     or not data.src
                     or data.src[0].op is not Ops.ALLOC
-                    or shape != (16, 64, 112, 112)
+                    or shape not in ((16, 64, 112, 112), (1024, 9, 3136))
                 ):
                     raise ValueError(
                         "AX UOp comparison lowering is measured only for "
-                        "[16,64,112,112] ALLOC-backed inputs"
+                        "one of the measured ALLOC-backed input shapes"
                     )
                 if str(root.dtype).split(".")[-1] != "float":
                     raise ValueError(
@@ -1665,6 +1742,94 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             return onnx.helper.make_model(
                 graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
             )
+
+    if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and len(root.src) == 1:
+        permuted = root.src[0]
+        if (
+            permuted.op is Ops.PERMUTE
+            and tuple(int(axis) for axis in permuted.arg) == (0, 3, 1, 2)
+            and len(permuted.src) == 1
+            and permuted.src[0].op is Ops.RESHAPE
+            and permuted.src[0].src
+            and permuted.src[0].src[0].op is Ops.ALLOC
+        ):
+            input_shape = tuple(int(dim) for dim in permuted.src[0].shape)
+            output_shape = tuple(int(dim) for dim in root.shape)
+            if input_shape not in ((16, 1, 64, 3136), (16, 1, 512, 49)) or output_shape != (
+                (1, 64) if input_shape == (16, 1, 64, 3136) else (1, 512)
+            ):
+                raise ValueError(
+                    "AX UOp ReduceSum lowering requires a measured "
+                    "[16,1,C,S] -> [1,C] form"
+                )
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError(
+                    "AX UOp ReduceSum lowering currently supports float32 data only"
+                )
+            graph = onnx.helper.make_graph(
+                [
+                    onnx.helper.make_node(
+                        "ReduceSum", ["x"], ["y"], axes=[0, 3], keepdims=0
+                    )
+                ],
+                "tinygrad_uop_reducesum_ax",
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "x", onnx.TensorProto.FLOAT, input_shape
+                    )
+                ],
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "y", onnx.TensorProto.FLOAT, output_shape
+                    )
+                ],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
+    # Generic canonical tinygrad reduction lowering.  tinygrad moves reduced
+    # dimensions to the front of a permuted view, so the first ``count``
+    # entries of the permutation are the original ONNX axes.  A plain reshape
+    # is the fast path for a leading-axis reduction.
+    reduction_root = root
+    keepdims = 0
+    if root.op is Ops.RESHAPE and root.src and root.src[0].op is Ops.REDUCE:
+        reduction_root = root.src[0]
+        keepdims = 1
+    if reduction_root.op is Ops.REDUCE and reduction_root.arg[0] is Ops.ADD:
+        source = reduction_root.src[0] if reduction_root.src else None
+        count = int(reduction_root.arg[1])
+        axes = None
+        input_shape = ()
+        if source is not None and source.op is Ops.PERMUTE and source.src:
+            base = source.src[0]
+            if base.op is Ops.RESHAPE and base.src and base.src[0].op is Ops.ALLOC:
+                axes = tuple(sorted(int(axis) for axis in source.arg[:count]))
+                input_shape = tuple(int(dim) for dim in base.shape)
+        elif source is not None and source.op is Ops.RESHAPE and source.src:
+            if source.src[0].op is Ops.ALLOC:
+                axes = tuple(range(count))
+                input_shape = tuple(int(dim) for dim in source.shape)
+        output_shape = tuple(int(dim) for dim in root.shape)
+        if axes is not None and input_shape and str(root.dtype).split(".")[-1] == "float":
+            expected_output = tuple(
+                1 if axis in axes else dim for axis, dim in enumerate(input_shape)
+            ) if keepdims else tuple(dim for axis, dim in enumerate(input_shape) if axis not in axes)
+            if output_shape == expected_output:
+                graph = onnx.helper.make_graph(
+                    [
+                        onnx.helper.make_node(
+                            "ReduceSum", ["x"], ["y"], axes=list(axes), keepdims=keepdims
+                        )
+                    ],
+                    "tinygrad_uop_reducesum_ax",
+                    [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, input_shape)],
+                    [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, output_shape)],
+                )
+                return onnx.helper.make_model(
+                    graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                )
 
     if root.op is Ops.REDUCE and root.arg[0] is Ops.MAX and len(root.src) == 1:
         outer_permute = root.src[0]

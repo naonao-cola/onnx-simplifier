@@ -20,6 +20,7 @@ import compose_emit
 import misc_op_record_emit
 import onnx
 import reshape_emit
+import transpose_real_shapes
 from onnx import numpy_helper
 
 
@@ -119,6 +120,22 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
+    if len(nodes) == 1 and nodes[0].op_type == "Transpose":
+        transpose = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone Transpose requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        perm = tuple(_attrs(transpose).get("perm", ()))
+        if shape != (16, 512) or output_shape != (512, 16) or perm != (1, 0):
+            raise ValueError("standalone Transpose requires the measured [16,512] perm [1,0] form")
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "transpose", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
     if len(nodes) == 1 and nodes[0].op_type in ("Neg", "Sqrt", "Log", "Softmax"):
         neg = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
@@ -168,13 +185,13 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError("standalone comparison cast requires one runtime input named x")
         shape = values.get("x", ())
         if (
-            shape != (16, 64, 112, 112)
+            shape not in ((16, 64, 112, 112), (1024, 9, 3136))
             or values.get(cast.output[0], ()) != shape
             or comparison.input[0] != "x"
             or comparison.input[1] not in _initializer_map(model)
             or cast.input[0] != comparison.output[0]
         ):
-            raise ValueError("standalone comparison cast requires the measured [16,64,112,112] form")
+            raise ValueError("standalone comparison cast requires a measured form")
         return GraphPlan(
             (
                 GraphSegment(
@@ -193,20 +210,36 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         shape = values.get("x", ())
         output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
         attrs = _attrs(reduce_sum)
-        if (
-            shape != (16, 64, 112, 112)
-            or output_shape != (64,)
-            or tuple(attrs.get("axes", ())) != (0, 2, 3)
-            or attrs.get("keepdims") != 0
-        ):
+        key_by_signature = {
+            ((16, 64, 112, 112), (64,), (0, 2, 3), 0):
+                "ReduceSum:16x64x112x112:axes0,2,3:k0",
+            ((16, 1, 64, 3136), (1, 64), (0, 3), 0):
+                "ReduceSum:16x1x64x3136:axes0,3:k0",
+            ((16, 1, 512, 49), (1, 512), (0, 3), 0):
+                "ReduceSum:16x1x512x49:axes0,3:k0",
+            ((16, 1000), (1, 1000), (0,), 1):
+                "ReduceSum:16x1000:axes0:k1",
+            ((16, 1000), (16, 1), (1,), 1):
+                "ReduceSum:16x1000:axes1:k1",
+        }
+        axes = tuple(attrs.get("axes", ()))
+        keepdims = attrs.get("keepdims")
+        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        key = dynamic_key
+        try:
+            misc_op_record_emit.load_template(key)
+        except ValueError:
+            key = key_by_signature.get((shape, output_shape, axes, keepdims))
+        if key is None:
             raise ValueError(
-                "standalone ReduceSum requires the measured "
-                "[16,64,112,112] axes [0,2,3] form"
+                "standalone ReduceSum has no validated template for "
+                f"shape={shape}, axes={axes}, keepdims={keepdims}"
             )
         return GraphPlan(
             (
                 GraphSegment(
-                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape
+                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape,
+                    key,
                 ),
             )
         )
@@ -359,6 +392,13 @@ def generate(
             output_path,
             position=segment.position,
         )
+    elif plan.chain == "transpose":
+        with open(output_path, "wb") as stream:
+            stream.write(
+                transpose_real_shapes.load_template_bytes(
+                    plan.segments[0].input_shape, (1, 0)
+                )
+            )
     elif plan.chain == "reducemean":
         if calibration is None:
             raise ValueError("standalone ReduceMean generation requires explicit calibration")
@@ -366,8 +406,13 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("ReduceMean calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            "ReduceMean:16x512x7x7:axes2,3:k1", scales, zero_points
+        model = misc_op_record_emit.emit_spec(
+            "ReduceMean",
+            plan.segments[0].input_shape,
+            axes=(2, 3),
+            keepdims=1,
+            scales=scales,
+            zero_points=zero_points,
         )
         onnx.save(model, output_path)
     elif plan.chain == "reducesum":
@@ -377,9 +422,25 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("ReduceSum calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            "ReduceSum:16x64x112x112:axes0,2,3:k0", scales, zero_points
-        )
+        segment = plan.segments[0]
+        attrs = _attrs(model.graph.node[0])
+        shape = segment.input_shape
+        axes = tuple(attrs.get("axes", ()))
+        keepdims = attrs.get("keepdims")
+        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        if plan.segments[0].position == dynamic_key:
+            model = misc_op_record_emit.emit_spec(
+                "ReduceSum",
+                shape,
+                axes=axes,
+                keepdims=keepdims,
+                scales=scales,
+                zero_points=zero_points,
+            )
+        else:
+            model = misc_op_record_emit.emit_model(
+                plan.segments[0].position, scales, zero_points
+            )
         onnx.save(model, output_path)
     elif plan.chain == "maxpool":
         if calibration is None:
@@ -388,13 +449,18 @@ def generate(
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("MaxPool calibration requires scales and zero_points mappings")
-        model = misc_op_record_emit.emit_model(
-            "MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1", scales, zero_points
+        model = misc_op_record_emit.emit_spec(
+            "MaxPool",
+            plan.segments[0].input_shape,
+            attrs={"kernel_shape": (3, 3), "strides": (2, 2), "pads": (1, 1, 1, 1)},
+            scales=scales,
+            zero_points=zero_points,
         )
         onnx.save(model, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
-        model = misc_op_record_emit.emit_model(
-            f"{plan.chain.title().replace('cast', 'Cast')}:16x64x112x112"
+        model = misc_op_record_emit.emit_spec(
+            plan.chain.title().replace("cast", "Cast"),
+            plan.segments[0].input_shape,
         )
         onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
@@ -408,17 +474,21 @@ def generate(
             raise ValueError(
                 f"{plan.chain.title()} calibration requires scales and zero_points mappings"
             )
-        model = misc_op_record_emit.emit_model(
-            (
-                f"Softmax:{'x'.join(map(str, plan.segments[0].input_shape))}:axis1"
-                if plan.chain == "softmax"
-                else misc_op_record_emit.template_key(
-                    plan.chain.title(), plan.segments[0].input_shape
-                )
-            ),
-            scales,
-            zero_points,
-        )
+        if plan.chain == "softmax":
+            model = misc_op_record_emit.emit_spec(
+                "Softmax",
+                plan.segments[0].input_shape,
+                attrs={"axis": 1},
+                scales=scales,
+                zero_points=zero_points,
+            )
+        else:
+            model = misc_op_record_emit.emit_spec(
+                plan.chain.title(),
+                plan.segments[0].input_shape,
+                scales=scales,
+                zero_points=zero_points,
+            )
         onnx.save(model, output_path)
     elif plan.chain in ("add", "sub", "mul", "div"):
         if calibration is None:
