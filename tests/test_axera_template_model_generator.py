@@ -39,6 +39,22 @@ def test_same_topology_is_generated_without_compiler(tmp_path):
     )
 
 
+def test_gz_template_can_be_reused_directly(tmp_path):
+    model = _load_template()
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    output = tmp_path / "generated.axmodel.gz"
+    onnx.save(model, str(source))
+    onnx.save(model, str(template_source))
+
+    tmg.generate(str(source), str(template_source), _TEMPLATE, str(output))
+
+    with gzip.open(output, "rb") as stream:
+        assert onnx.load_model_from_string(stream.read()).SerializeToString() == (
+            model.SerializeToString()
+        )
+
+
 def test_topology_mismatch_is_refused(tmp_path):
     model = _load_template()
     source = onnx.ModelProto()

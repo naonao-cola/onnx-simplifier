@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gzip
 import os
 from typing import Any
 
@@ -70,7 +71,19 @@ def _io_signature(model: onnx.ModelProto) -> tuple[tuple, tuple]:
 
 
 def _load(path: str) -> onnx.ModelProto:
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as stream:
+            return onnx.load_model_from_string(stream.read())
     return onnx.load(path, load_external_data=False)
+
+
+def _save(model: onnx.ModelProto, path: str) -> None:
+    payload = model.SerializeToString()
+    if path.endswith(".gz"):
+        with gzip.open(path, "wb") as stream:
+            stream.write(payload)
+    else:
+        onnx.save(model, path)
 
 
 def generate(
@@ -92,7 +105,7 @@ def generate(
     if len(template.graph.node) != 1 or template.graph.node[0].op_type != "neu mode":
         raise ValueError("template must contain exactly one fused neu mode node")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    onnx.save(template, output_path)
+    _save(template, output_path)
     return actual
 
 
