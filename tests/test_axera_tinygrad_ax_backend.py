@@ -590,6 +590,29 @@ def test_lower_tinygrad_stem_conv_uop_to_onnx():
     assert {attr.name for attr in lowered.graph.node[0].attribute} == {"strides", "pads"}
 
 
+@pytest.mark.parametrize(
+    "input_shape,weight_shape,stride,padding,output_shape",
+    [
+        ((2, 3, 16, 16), (5, 3, 3, 3), 1, 1, (2, 5, 16, 16)),
+        ((2, 3, 15, 17), (7, 3, 5, 3), 2, 2, (2, 7, 8, 10)),
+    ],
+)
+def test_lower_tinygrad_arbitrary_shape_conv_uop_to_onnx(
+    input_shape, weight_shape, stride, padding, output_shape
+):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(*input_shape).conv2d(
+        Tensor.empty(*weight_shape), stride=stride, padding=padding
+    ).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    node = lowered.graph.node[0]
+    attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
+    assert node.op_type == "Conv"
+    assert attrs == {"strides": [stride, stride], "pads": [padding] * 4}
+    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

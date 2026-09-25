@@ -1712,16 +1712,23 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                 _, _, kernel_h, kernel_w = weight_shape
                 stride = None
                 pad_h = pad_w = None
-                for candidate_stride in range(1, 5):
-                    numer_h = input_shape[2] + 2 * (kernel_h // 2) - kernel_h
-                    numer_w = input_shape[3] + 2 * (kernel_w // 2) - kernel_w
-                    if (
-                        numer_h // candidate_stride + 1 == output_shape[2]
-                        and numer_w // candidate_stride + 1 == output_shape[3]
-                    ):
+                for candidate_stride in range(1, max(input_shape[2:]) + 1):
+                    valid_h = [
+                        p
+                        for p in range(input_shape[2] + kernel_h)
+                        if (input_shape[2] + 2 * p - kernel_h) // candidate_stride + 1
+                        == output_shape[2]
+                    ]
+                    valid_w = [
+                        p
+                        for p in range(input_shape[3] + kernel_w)
+                        if (input_shape[3] + 2 * p - kernel_w) // candidate_stride + 1
+                        == output_shape[3]
+                    ]
+                    if valid_h and valid_w:
                         stride = candidate_stride
-                        pad_h = kernel_h // 2
-                        pad_w = kernel_w // 2
+                        pad_h = min(valid_h, key=lambda p: abs(2 * p - kernel_h))
+                        pad_w = min(valid_w, key=lambda p: abs(2 * p - kernel_w))
                         break
                 if stride is not None and str(root.dtype).split(".")[-1] == "float":
                     graph = onnx.helper.make_graph(
