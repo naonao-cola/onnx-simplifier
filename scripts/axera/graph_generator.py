@@ -1,11 +1,11 @@
 """Small graph-level AX model generator built from validated templates.
 
 This is the first scheduler-owned layer above the operation emitters.  It
-recognizes the measured Gather -> Reshape -> MatMul -> Transpose -> Add family,
-collapses it to one fused AX program, and retargets the Gather table without a
-Pulsar2 invocation.  Unknown graphs are rejected deliberately: a template
-emitter cannot safely be promoted to a general graph compiler without knowing
-the fused MCode and memory schedule.
+recognizes measured fused Gather and Reshape -> Relu families, collapses each
+to one AX program, and retargets its decoded fields without a Pulsar2
+invocation.  Unknown graphs are rejected deliberately: a template emitter
+cannot safely be promoted to a general graph compiler without knowing the
+fused MCode and memory schedule.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import onnx
 from onnx import numpy_helper
 
 import compose_emit
+import reshape_emit
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28,6 +29,9 @@ class GraphSegment:
     chain: str
     inputs: tuple[str, ...]
     output: str
+    input_shape: tuple[int, ...] = ()
+    output_shape: tuple[int, ...] = ()
+    position: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,7 +68,36 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     launches.  Inputs ``x``, ``w`` and ``b`` are required to remain runtime
     inputs; constant folding them would select a different compiled family.
     """
+    model = onnx.shape_inference.infer_shapes(model)
     nodes = list(model.graph.node)
+    values = {
+        v.name: _shape(v)
+        for v in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    if len(nodes) == 2 and [node.op_type for node in nodes] in (["Reshape", "Relu"], ["Relu", "Reshape"]):
+        reshape = nodes[0] if nodes[0].op_type == "Reshape" else nodes[1]
+        if len(reshape.input) != 2 or reshape.input[1] not in _initializer_map(model):
+            raise ValueError("fused Reshape must use a constant shape initializer")
+        source = values.get(reshape.input[0], ())
+        target = tuple(int(v) for v in numpy_helper.to_array(_initializer_map(model)[reshape.input[1]]).reshape(-1))
+        position = "before" if nodes[0].op_type == "Reshape" else "after"
+        if not source or not target:
+            raise ValueError("fused Reshape shapes must be statically known")
+        if (source, target) not in (reshape_emit.FUSED_BEFORE | reshape_emit.FUSED_AFTER):
+            # Let the emitter provide the more specific measured/not-fused
+            # refusal when generation is attempted, but do not schedule an
+            # unrelated shape as if it were a known fused segment.
+            raise ValueError(f"unmeasured fused Reshape pair {source} -> {target}")
+        if position == "before" and (source, target) not in reshape_emit.FUSED_BEFORE:
+            raise ValueError("Reshape -> Relu pair is not measured as fused")
+        if position == "after" and (source, target) not in reshape_emit.FUSED_AFTER:
+            raise ValueError("Relu -> Reshape pair is not measured as fused")
+        if [v.name for v in model.graph.input] != ["x"]:
+            raise ValueError("fused Reshape generator requires one runtime input named x")
+        return GraphPlan((GraphSegment(
+            "reshape_relu", ("x",), model.graph.output[0].name,
+            source, target, position,
+        ),))
     if not nodes or nodes[0].op_type != "Gather":
         raise ValueError("graph must start with the measured Gather family")
     init = _initializer_map(model)
@@ -82,7 +115,6 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         raise ValueError("Gather input must have shape [1,1,4,16]")
 
     chain = "gather_reshape"
-    expected = ["Reshape"]
     if len(nodes) >= 2 and nodes[1].op_type == "Reshape":
         chain = "gather_reshape"
     else:
@@ -132,7 +164,16 @@ def generate(
     if indices is None:
         init = _initializer_map(model)
         indices = numpy_helper.to_array(init[model.graph.node[0].input[1]]).reshape(-1).tolist()
-    compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
+    if plan.chain == "reshape_relu":
+        segment = plan.segments[0]
+        reshape_emit.emit_fused_reshape_axmodel(
+            segment.input_shape,
+            segment.output_shape,
+            output_path,
+            position=segment.position,
+        )
+    else:
+        compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
     return plan
