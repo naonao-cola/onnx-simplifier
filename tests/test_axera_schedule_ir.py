@@ -67,3 +67,10 @@ def test_schedule_ir_writes_deterministic_json(tmp_path):
     onnx.save(model, str(source))
     schedule_ir.write(str(source), str(output))
     assert '"chain": "gather_reshape_matmul_transpose_add"' in output.read_text()
+
+
+def test_fused_internal_values_do_not_consume_schedule_arena():
+    model = onnx.shape_inference.infer_shapes(_full_model())
+    ir = schedule_ir.build(model)
+    assert {item.name for item in ir.allocations} == {"x", "w", "b", "y"}
+    assert ir.memory_size == 256 + 128 + 192 + 192

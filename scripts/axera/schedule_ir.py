@@ -155,6 +155,20 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
     values = _values(model)
     input_names = {item.name for item in model.graph.input}
     output_names = {item.name for item in model.graph.output}
+    # A fused template owns the tensors between its boundary inputs and
+    # output.  Shape inference commonly leaves those internal values in
+    # ``graph.value_info``; treating them as externally allocatable buffers
+    # needlessly inflates the AXCL arena and suggests that the host scheduler
+    # must manage storage it cannot actually bind.  Keep only graph I/O and
+    # names explicitly exposed by a scheduled kernel.  This remains correct
+    # for a future multi-kernel plan because every inter-kernel edge appears
+    # in a kernel's input/output list.
+    kernel_boundary_names = {
+        name
+        for segment in plan.segments
+        for name in (*segment.inputs, segment.output)
+    }
+    modeled_names = input_names | output_names | kernel_boundary_names
     buffers = {
         value.name: BufferSpec(
             value.name,
@@ -170,6 +184,7 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
             _nbytes(_shape(value), value.type.tensor_type.elem_type),
         )
         for value in values.values()
+        if value.name in modeled_names
     }
     kernels = tuple(
         KernelSpec(
