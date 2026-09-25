@@ -198,6 +198,10 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 "ReduceSum:16x64x112x112:axes0,2,3:k0",
             ((16, 1, 64, 3136), (1, 64), (0, 3), 0):
                 "ReduceSum:16x1x64x3136:axes0,3:k0",
+            ((16, 1000), (1, 1000), (0,), 1):
+                "ReduceSum:16x1000:axes0:k1",
+            ((16, 1000), (16, 1), (1,), 1):
+                "ReduceSum:16x1000:axes1:k1",
         }
         key = key_by_signature.get(
             (shape, output_shape, tuple(attrs.get("axes", ())), attrs.get("keepdims"))
