@@ -158,3 +158,41 @@ def test_hmx_qconv3x3_qdq_exact_on_hexagon_sim(tmp_path, sim, shape):
     out = _run_sim(tmp_path, GEMM / "sim" / sim, [str(case)])
     exact = next(line for line in out.splitlines() if line.startswith("exact"))
     assert " 0 mismatches" in exact and "PASS" in exact, out[-2000:]
+
+
+def test_hmx_graph_runner_bit_exact_on_hexagon_sim(tmp_path):
+    # the whole graph runner (runner/: qdq_graph.py lowering, rn_load.h planning, rn_exec.h execution) on a tiny
+    # ResNet-shaped full_qdq graph (7x7 s2 stem on 3 channels, MaxPool, 3x3 convs, residual Adds, 3x3 s2 + 1x1 s2
+    # downsample): the QC_EXACT run must match ORT CPU's output bit for bit
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("onnxsim.full_qdq")
+    if _harness().tools_dir() is None:
+        pytest.skip("HEXAGON_TOOLS does not point at a toolchain with hexagon-sim")
+    import sys
+
+    runner = GEMM / "runner"
+    subprocess.run(
+        [sys.executable, str(runner / "make_tiny.py"), str(tmp_path)], check=True
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(runner / "qdq_graph.py"),
+            str(tmp_path / "model.onnx"),
+            str(tmp_path / "prog"),
+            str(tmp_path / "input.bin"),
+            str(tmp_path / "ref.bin"),
+        ],
+        check=True,
+    )
+    out = _run_sim(
+        tmp_path,
+        GEMM / "sim" / "runner_sim.c",
+        [
+            str(tmp_path / "prog"),
+            str(tmp_path / "input.bin"),
+            str(tmp_path / "ref.bin"),
+        ],
+    )
+    exact = next(line for line in out.splitlines() if line.startswith("exact"))
+    assert " 0 mismatches" in exact and "PASS" in exact, out[-2000:]

@@ -28,6 +28,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hmx_gemm_u8.h"
@@ -96,7 +97,10 @@ static inline void qc_pack_params(const int8_t* w, int K, int N, const int32_t* 
       /* r = acc * 2^L * bm / 2^31 = v * 2^F: bm = M * 2^(F + 31 - L) < 2^31 and |v| < 512 unsaturated (F <= 21) */
       int e = (int)floor(log2((double)m));        /* M in [2^e, 2^(e+1)) */
       int F = L - e - 1;                           /* largest F with bm < 2^31 */
-      if (F > 21) F = 21;
+      if (F > 21) { /* |v| < 512 must not saturate: lower L instead, keeping bm in [2^30, 2^31) (a tiny-M column) */
+        F = 21, L = F + e + 1;
+        if (L < 0) L = 0;
+      }
       if (F < 1) F = 1;
       double bmd = ldexp((double)m, F + 31 - L);
       long bm = lrint(bmd);
@@ -107,8 +111,11 @@ static inline void qc_pack_params(const int8_t* w, int K, int N, const int32_t* 
        * plus ORT's own fp32 error: half an ulp of |v| < 512 (2^-16) and, for |acc| >= 2^24, fp32(acc)'s rounding */
       double err = 2.0 + ldexp(1.0, 31) * fabs(bmd - (double)bm) / (bmd > 0 ? bmd : 1) + ldexp(1.0, F - 16);
       int ab = qc_bitlen(bound);
-      if (ab > 24) err += ldexp((double)m, F + ab - 25);
+      /* fp32(acc) rounds only for |acc| >= 2^24, i.e. |v| >= M 2^24: irrelevant when those outputs saturate anyway */
+      if (ab > 24 && ldexp((double)m, 24) < 1024) err += ldexp((double)m, F + ab - 25);
       b->win[c] = (int32_t)ceil(err) + 1;
+      if ((double)bound * m < 0.25) /* a (near-)dead column: |v| < 0.25 always, so y = zy exactly (r = 0, never flagged) */
+        b->L[c] = 0, b->bm[c] = 0, b->F[c] = 1, b->half[c] = 1, b->mask[c] = 1, b->win[c] = 0;
     }
   }
 }

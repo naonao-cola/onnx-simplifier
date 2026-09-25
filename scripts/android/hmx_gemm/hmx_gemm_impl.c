@@ -10,6 +10,9 @@
 #include "hmx_gemm.h"
 #include "hmx_gemm_u8.h"
 #include "hmx_qconv3.h"
+extern unsigned long long HAP_perf_get_time_us(void);
+#define RN_NOW() HAP_perf_get_time_us()
+#include "rn_exec.h"
 
 extern unsigned long long HAP_perf_get_time_us(void);
 
@@ -754,5 +757,165 @@ int hmx_gemm_rpc_qconv3(remote_handle64 h, int mode, int H, int W, int C, int N,
   } else
     codes[6] = -1;
   HAP_compute_res_release(ctx);
+  return 0;
+}
+
+/* ---- graph runner (runner/rn_exec.h) ---- */
+static rn_model_t* g_rn_m;
+static uint8_t* g_rn_blob;
+static unsigned int g_rn_ctx;
+static rn_ctx_t g_rn;
+
+int hmx_gemm_rpc_rn_unload(remote_handle64 h) {
+  rn_unplan(&g_rn);
+  if (g_rn_ctx) HAP_compute_res_release(g_rn_ctx);
+  free(g_rn_m), free(g_rn_blob);
+  g_rn_m = NULL, g_rn_blob = NULL, g_rn_ctx = 0;
+  memset(&g_rn, 0, sizeof g_rn);
+  return 0;
+}
+
+int hmx_gemm_rpc_rn_load(remote_handle64 h, const uint8* model, int modelLen, const uint8* blob, int blobLen, int* codes,
+                         int codesLen) {
+  if (codesLen < 8 || modelLen != (int)sizeof(rn_model_t)) return AEE_EBADPARM;
+  memset(codes, 0, codesLen * sizeof(int));
+  hmx_gemm_rpc_rn_unload(h);
+  g_rn_m = (rn_model_t*)malloc(sizeof(rn_model_t));
+  g_rn_blob = (uint8_t*)memalign(128, blobLen + 128);
+  if (!g_rn_m || !g_rn_blob) return codes[7] = -1, 0;
+  memcpy(g_rn_m, model, sizeof(rn_model_t));
+  memcpy(g_rn_blob, blob, blobLen);
+  size_t need = ((size_t)g_rn_m->vtcm_bytes + 0xFFFF) & ~(size_t)0xFFFF;
+  compute_res_attr_t attr;
+  HAP_compute_res_attr_init(&attr);
+  HAP_compute_res_attr_set_vtcm_param_v2(&attr, need, 0, 0);
+  HAP_compute_res_attr_set_hmx_param(&attr, 1);
+  g_rn_ctx = HAP_compute_res_acquire(&attr, 100000);
+  codes[0] = (int)g_rn_ctx;
+  if (!g_rn_ctx) return 0;
+  void* vp = NULL;
+  unsigned int vs = 0;
+  HAP_compute_res_attr_get_vtcm_ptr_v2(&attr, &vp, &vs);
+  codes[4] = (int)vs;
+  if (!vp || vs < need) return codes[6] = -1, 0;
+  memset(&g_rn, 0, sizeof g_rn);
+  g_rn.m = g_rn_m, g_rn.blob = g_rn_blob, g_rn.vtcm = (uint8_t*)vp;
+  codes[5] = rn_plan(&g_rn);
+  return 0;
+}
+
+typedef struct {
+  int mode, iters;
+  const uint8_t* in;
+  uint8_t* out;
+  int outLen;
+  uint64* t;
+  int tLen;
+  int* codes;
+} rn_job_t;
+
+/* weight prefetch on a second HVX thread: one request slot (ops run in order), one waiter per QuRT signal */
+typedef struct {
+  qurt_signal_t req, done; /* req: bit 0 = request (op in .op), bit 1 = quit; done: bit 0 */
+  volatile int op, done_op;
+} rn_pf_t;
+static char g_stack_pf[STACK_SIZE] __attribute__((aligned(128)));
+static void rn_pf_thread(void* p) {
+  rn_pf_t* pf = (rn_pf_t*)p;
+  qurt_hvx_lock(QURT_HVX_MODE_128B);
+  for (;;) {
+    unsigned m = qurt_signal_wait_any(&pf->req, 3);
+    if (m & 2) break;
+    qurt_signal_clear(&pf->req, 1);
+    rn_copy_weights(&g_rn, pf->op);
+    pf->done_op = pf->op;
+    qurt_signal_set(&pf->done, 1);
+  }
+  qurt_hvx_unlock();
+  qurt_thread_exit(0);
+}
+static void rn_pf_request(void* u, int op) {
+  rn_pf_t* pf = (rn_pf_t*)u;
+  pf->op = op;
+  qurt_signal_set(&pf->req, 1);
+}
+static void rn_pf_wait(void* u, int op) {
+  rn_pf_t* pf = (rn_pf_t*)u;
+  while (pf->done_op != op) {
+    qurt_signal_wait_any(&pf->done, 1);
+    qurt_signal_clear(&pf->done, 1);
+  }
+}
+
+static void rn_worker(void* p) {
+  rn_job_t* j = (rn_job_t*)p;
+  static rn_pf_t pf;
+  qurt_thread_t pft = 0;
+  int use_pf = !(j->mode & 2); /* mode bit 1: synchronous weight copies (for comparison) */
+  j->mode &= 1;
+  if (use_pf) {
+    memset(&pf, 0, sizeof pf);
+    pf.done_op = -1;
+    qurt_signal_init(&pf.req);
+    qurt_signal_init(&pf.done);
+    qurt_thread_attr_t ta;
+    qurt_thread_attr_init(&ta);
+    qurt_thread_attr_set_stack_addr(&ta, g_stack_pf);
+    qurt_thread_attr_set_stack_size(&ta, STACK_SIZE);
+    qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
+    if (qurt_thread_create(&pft, &ta, rn_pf_thread, &pf) == 0) g_rn.prefetch = rn_pf_request, g_rn.wait = rn_pf_wait, g_rn.user = &pf;
+    else use_pf = 0;
+  }
+  j->codes[1] = qurt_hvx_lock(QURT_HVX_MODE_128B);
+  j->codes[2] = HAP_compute_res_hmx_lock(g_rn_ctx);
+  if (j->codes[2] == 0) {
+    const rn_tensor_t* O = &g_rn_m->t[g_rn_m->output];
+    unsigned long long tot = 0;
+    for (int it = -1; it < j->iters; it++) {
+      unsigned long long t0 = HAP_perf_get_time_us();
+      int nfix = rn_run(&g_rn, j->in, j->mode);
+      (void)*(volatile uint8_t*)(g_rn.vtcm + O->off);
+      unsigned long long dt = HAP_perf_get_time_us() - t0;
+      if (it < 0) {
+        j->codes[3] = nfix;
+        memcpy(j->out, g_rn.vtcm + O->off, j->outLen);
+      } else
+        tot += dt;
+    }
+    j->t[0] = j->iters ? tot / j->iters : 0;
+    for (int i = 0; i < g_rn_m->nops && 1 + i < j->tLen; i++) j->t[1 + i] = g_rn.us[i];
+    for (int i = 0; i < g_rn_m->nops; i++)
+      for (int k = 0; k < 5 && 1 + g_rn_m->nops + 5 * i + k < j->tLen; k++) j->t[1 + g_rn_m->nops + 5 * i + k] = g_rn.ph[i][k];
+    HAP_compute_res_hmx_unlock(g_rn_ctx);
+  }
+  if (j->codes[1] == 0) qurt_hvx_unlock();
+  if (use_pf) {
+    int st;
+    qurt_signal_set(&pf.req, 2);
+    qurt_thread_join(pft, &st);
+    qurt_signal_destroy(&pf.req);
+    qurt_signal_destroy(&pf.done);
+    g_rn.prefetch = NULL, g_rn.wait = NULL, g_rn.user = NULL;
+  }
+  qurt_thread_exit(0);
+}
+
+int hmx_gemm_rpc_rn_run(remote_handle64 h, int mode, int iters, const uint8* input, int inputLen, uint8* output, int outputLen,
+                        uint64* t, int tLen, int* codes, int codesLen) {
+  if (!g_rn_m || !g_rn_ctx || codesLen < 8 || tLen < 1) return AEE_EBADPARM;
+  const rn_tensor_t *I = &g_rn_m->t[g_rn_m->input], *O = &g_rn_m->t[g_rn_m->output];
+  if (inputLen < (int)qc_geom_bytes(&I->g, I->cp / 32) || outputLen < (int)qc_geom_bytes(&O->g, O->cp / 32)) return AEE_EBADPARM;
+  memset(t, 0, tLen * sizeof(uint64));
+  memset(codes, 0, codesLen * sizeof(int));
+  rn_job_t j = {mode, iters, input, output, (int)qc_geom_bytes(&O->g, O->cp / 32), t, tLen, codes};
+  qurt_thread_attr_t ta;
+  qurt_thread_attr_init(&ta);
+  qurt_thread_attr_set_stack_addr(&ta, g_stack);
+  qurt_thread_attr_set_stack_size(&ta, STACK_SIZE);
+  qurt_thread_attr_set_priority(&ta, qurt_thread_get_priority(qurt_thread_get_id()));
+  qurt_thread_t tid;
+  int st;
+  codes[5] = qurt_thread_create(&tid, &ta, rn_worker, &j);
+  if (codes[5] == 0) qurt_thread_join(tid, &st);
   return 0;
 }
