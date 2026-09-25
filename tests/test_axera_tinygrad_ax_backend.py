@@ -396,6 +396,39 @@ def test_lower_and_compile_tinygrad_greatercast_uop_without_calibration(tmp_path
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "greatercast"
 
 
+def test_lower_and_compile_tinygrad_lesscast_uop_without_calibration(tmp_path):
+    from tinygrad import Tensor
+
+    root = (Tensor.empty(1024, 9, 3136) < 0).cast("float32").uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Less", "Cast"]
+    schedule = tmp_path / "lesscast.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "lesscast"
+
+
+def test_lower_and_compile_tinygrad_reducesum_reshaped_uop_with_explicit_calibration(
+    tmp_path,
+):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 1, 64, 3136).sum(axis=(0, 3)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
+    _, meta = misc.load_template("ReduceSum:16x1x64x3136:axes0,3:k0")
+    schedule = tmp_path / "reducesum_reshaped.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

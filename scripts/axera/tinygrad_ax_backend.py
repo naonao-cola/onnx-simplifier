@@ -1593,11 +1593,11 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                     data.op is not Ops.RESHAPE
                     or not data.src
                     or data.src[0].op is not Ops.ALLOC
-                    or shape != (16, 64, 112, 112)
+                    or shape not in ((16, 64, 112, 112), (1024, 9, 3136))
                 ):
                     raise ValueError(
                         "AX UOp comparison lowering is measured only for "
-                        "[16,64,112,112] ALLOC-backed inputs"
+                        "one of the measured ALLOC-backed input shapes"
                     )
                 if str(root.dtype).split(".")[-1] != "float":
                     raise ValueError(
@@ -1648,6 +1648,49 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
                 [
                     onnx.helper.make_node(
                         "ReduceSum", ["x"], ["y"], axes=[0, 2, 3], keepdims=0
+                    )
+                ],
+                "tinygrad_uop_reducesum_ax",
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "x", onnx.TensorProto.FLOAT, input_shape
+                    )
+                ],
+                [
+                    onnx.helper.make_tensor_value_info(
+                        "y", onnx.TensorProto.FLOAT, output_shape
+                    )
+                ],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
+    if root.op is Ops.REDUCE and root.arg[0] is Ops.ADD and len(root.src) == 1:
+        permuted = root.src[0]
+        if (
+            permuted.op is Ops.PERMUTE
+            and tuple(int(axis) for axis in permuted.arg) == (0, 3, 1, 2)
+            and len(permuted.src) == 1
+            and permuted.src[0].op is Ops.RESHAPE
+            and permuted.src[0].src
+            and permuted.src[0].src[0].op is Ops.ALLOC
+        ):
+            input_shape = tuple(int(dim) for dim in permuted.src[0].shape)
+            output_shape = tuple(int(dim) for dim in root.shape)
+            if input_shape != (16, 1, 64, 3136) or output_shape != (1, 64):
+                raise ValueError(
+                    "AX UOp ReduceSum lowering is measured only for "
+                    "[16,1,64,3136] -> [1,64]"
+                )
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError(
+                    "AX UOp ReduceSum lowering currently supports float32 data only"
+                )
+            graph = onnx.helper.make_graph(
+                [
+                    onnx.helper.make_node(
+                        "ReduceSum", ["x"], ["y"], axes=[0, 3], keepdims=0
                     )
                 ],
                 "tinygrad_uop_reducesum_ax",

@@ -168,13 +168,13 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             raise ValueError("standalone comparison cast requires one runtime input named x")
         shape = values.get("x", ())
         if (
-            shape != (16, 64, 112, 112)
+            shape not in ((16, 64, 112, 112), (1024, 9, 3136))
             or values.get(cast.output[0], ()) != shape
             or comparison.input[0] != "x"
             or comparison.input[1] not in _initializer_map(model)
             or cast.input[0] != comparison.output[0]
         ):
-            raise ValueError("standalone comparison cast requires the measured [16,64,112,112] form")
+            raise ValueError("standalone comparison cast requires a measured form")
         return GraphPlan(
             (
                 GraphSegment(
@@ -193,20 +193,22 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         shape = values.get("x", ())
         output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
         attrs = _attrs(reduce_sum)
-        if (
-            shape != (16, 64, 112, 112)
-            or output_shape != (64,)
-            or tuple(attrs.get("axes", ())) != (0, 2, 3)
-            or attrs.get("keepdims") != 0
-        ):
-            raise ValueError(
-                "standalone ReduceSum requires the measured "
-                "[16,64,112,112] axes [0,2,3] form"
-            )
+        key_by_signature = {
+            ((16, 64, 112, 112), (64,), (0, 2, 3), 0):
+                "ReduceSum:16x64x112x112:axes0,2,3:k0",
+            ((16, 1, 64, 3136), (1, 64), (0, 3), 0):
+                "ReduceSum:16x1x64x3136:axes0,3:k0",
+        }
+        key = key_by_signature.get(
+            (shape, output_shape, tuple(attrs.get("axes", ())), attrs.get("keepdims"))
+        )
+        if key is None:
+            raise ValueError("standalone ReduceSum requires a measured form")
         return GraphPlan(
             (
                 GraphSegment(
-                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape
+                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape,
+                    key,
                 ),
             )
         )
@@ -378,7 +380,7 @@ def generate(
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
             raise ValueError("ReduceSum calibration requires scales and zero_points mappings")
         model = misc_op_record_emit.emit_model(
-            "ReduceSum:16x64x112x112:axes0,2,3:k0", scales, zero_points
+            plan.segments[0].position, scales, zero_points
         )
         onnx.save(model, output_path)
     elif plan.chain == "maxpool":
@@ -394,7 +396,7 @@ def generate(
         onnx.save(model, output_path)
     elif plan.chain in ("greatercast", "lesscast"):
         model = misc_op_record_emit.emit_model(
-            f"{plan.chain.title().replace('cast', 'Cast')}:16x64x112x112"
+            f"{plan.chain.title().replace('cast', 'Cast')}:{'x'.join(map(str, plan.segments[0].input_shape))}"
         )
         onnx.save(model, output_path)
     elif plan.chain in ("neg", "sqrt", "log", "softmax"):
