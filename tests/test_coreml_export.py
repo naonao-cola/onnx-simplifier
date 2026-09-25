@@ -191,6 +191,155 @@ def test_resize_nearest_asymmetric_floor_matches_onnx():
     np.testing.assert_array_equal(_mil_const_value(model), expected)
 
 
+def test_resize_nearest_half_pixel_round_prefer_floor_matches_onnx():
+    x = numpy_helper.from_array(
+        np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), name="x"
+    )
+    scales = numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), name="scales")
+    node = onnx.helper.make_node(
+        "Resize",
+        ["x", "", "scales"],
+        ["y"],
+        mode="nearest",
+        coordinate_transformation_mode="half_pixel",
+        nearest_mode="round_prefer_floor",
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "nearest_resize_half_pixel",
+        [],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 4, 4])],
+        [x, scales],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
+    expected = np.repeat(
+        np.repeat(np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2), 2, 2), 2, 3
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_nearest_fixed_sizes_matches_onnxruntime():
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        nearest_sizes () => (float[1,1,3,4] y)
+        <int64[4] sizes = {1,1,3,4}>
+        {
+            y = Resize <mode="nearest", coordinate_transformation_mode="asymmetric", nearest_mode="floor"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    expected = session.run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_resize_linear_fixed_sizes_lowers_bilinear():
+    x = numpy_helper.from_array(
+        np.arange(1, 7, dtype=np.float32).reshape(1, 1, 2, 3), name="x"
+    )
+    model = _model(
+        """
+        linear_sizes () => (float[1,1,4,5] y)
+        <int64[4] sizes = {1,1,4,5}>
+        {
+            y = Resize <mode="linear", coordinate_transformation_mode="half_pixel"> (x, , , sizes)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    func, _ = _build_ops(model)
+    (resize,) = [op for op in func.operations if op.op_type == "resize_bilinear"]
+    assert tuple(resize.outputs[0].shape) == (1, 1, 4, 5)
+    assert resize.inputs["target_size_height"].val == 4
+    assert resize.inputs["target_size_width"].val == 5
+    assert resize.inputs["sampling_mode"].val == "UNALIGN_CORNERS"
+
+
+def test_gather_nd_batch_dims_preserved():
+    x = numpy_helper.from_array(
+        np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4), name="x"
+    )
+    indices = numpy_helper.from_array(
+        np.array([[[0, 2], [1, 3]], [[2, 0], [3, 1]]], dtype=np.int64), name="indices"
+    )
+    model = _model(
+        "gathernd (float[2,3,4] x, int64[2,2,2] indices) "
+        "=> (float[2,2] y) { y = GatherND <batch_dims=1> (x, indices) }",
+        initializer=[x, indices],
+    )
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        model,
+        mb,
+        types,
+        Function,
+        Program,
+        RangeDim,
+        TensorType,
+        opset_version=ct.target.iOS16,
+    )
+    (gather,) = [
+        op for op in prog.functions["main"].operations if op.op_type == "gather_nd"
+    ]
+    assert gather.inputs["batch_dims"].val == 1
+    assert tuple(gather.outputs[0].shape) == (2, 2)
+    assert coreml_export._resolve_gather_nd_target(ct, model, None) == ct.target.iOS16
+    with pytest.raises(RuntimeError, match="iOS16/macOS13 or newer"):
+        coreml_export._resolve_gather_nd_target(ct, model, ct.target.iOS15)
+
+
+def test_expand_multidirectional_broadcast():
+    x = numpy_helper.from_array(
+        np.arange(1 * 8 * 20, dtype=np.float32).reshape(1, 8, 20), name="x"
+    )
+    model = _model(
+        "expand_mdi (float[1,8,20] x) => (float[6,8,20] y) "
+        "<int64[3] shape = {6,1,1}> { y = Expand (x, shape) }",
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    expected = session.run(None, {})[0]
+    np.testing.assert_array_equal(_mil_const_value(model), expected)
+
+
+def test_gather_nd_unbatched_does_not_require_ios16():
+    x = numpy_helper.from_array(
+        np.arange(2 * 3, dtype=np.float32).reshape(2, 3), name="x"
+    )
+    indices = numpy_helper.from_array(
+        np.array([[0, 2], [1, 0]], dtype=np.int64), name="indices"
+    )
+    model = _model(
+        "gathernd0 (float[2,3] x, int64[2,2] indices) "
+        "=> (float[2] y) { y = GatherND (x, indices) }",
+        initializer=[x, indices],
+    )
+    mb, types, Function, Program, RangeDim, TensorType = coreml_export._import_mil()
+    prog, _ = coreml_export._build_mil_program(
+        model, mb, types, Function, Program, RangeDim, TensorType
+    )
+    (gather,) = [
+        op for op in prog.functions["main"].operations if op.op_type == "gather_nd"
+    ]
+    assert "batch_dims" not in gather.inputs
+    assert tuple(gather.outputs[0].shape) == (2,)
+    assert coreml_export._resolve_gather_nd_target(ct, model, None) is None
+
+
 # ---------------------------------------------------------------------------
 # A small CNN pipeline, exercising conv/norm/pool/gemm/softmax together
 # ---------------------------------------------------------------------------
@@ -417,6 +566,29 @@ def test_dequantize_linear_wiring_and_shape():
     ]
     assert tuple(dq.inputs["scale"].shape) == ()
     assert dq.inputs["zero_point"].val is not None
+    assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
+
+
+def test_dequantize_linear_int32_zero_point_lowers_to_cast_mul():
+    # Mask R-CNN QDQ exports an int32 bias with a scalar zero point. MIL
+    # dequantize rejects int32, while cast-and-mul preserves this case.
+    x = np.array([-50, 0, 25], dtype=np.int32)
+    scale = np.array(0.02, dtype=np.float32)
+    zp = np.array(0, dtype=np.int32)
+    model = _model(
+        "dq32 () => (float[3] y) { y = DequantizeLinear (x, s, zp) }",
+        initializer=[
+            numpy_helper.from_array(x, name="x"),
+            numpy_helper.from_array(scale, name="s"),
+            numpy_helper.from_array(zp, name="zp"),
+        ],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    ops = prog.functions["main"].operations
+    assert [op.op_type for op in ops if op.op_type not in ("const", "identity")] == [
+        "cast",
+        "mul",
+    ]
     assert tuple(prog.functions["main"].outputs[0].shape) == (3,)
 
 
