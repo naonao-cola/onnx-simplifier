@@ -30,7 +30,7 @@ def _model():
     return onnx.parser.parse_model(
         """
         <ir_version: 8, opset_import: ["" : 11]>
-        agraph (float[4, 3] x, float[4, 2] y, float[3, 2] w, float[] lr) => (float[1, 1] loss) {
+        agraph (float[4, 3] x, float[4, 2] y, float[3, 2] w, float[1] lr) => (float[1, 1] loss) {
             xm = MatMul(x, w)
             d = Sub(xm, y)
             sq = Mul(d, d)
@@ -107,3 +107,17 @@ def test_trajectory_list_cycles(tmp_path):
     )
     got = [float(s.flat[0]) for s in _read_tar(wd, "dataset/w.tar")]
     assert got == [7.0, 9.0, 7.0, 9.0]
+
+
+def test_scalar_trajectory_is_lifted_to_rank_one_input(tmp_path):
+    wd = make_training_calib.make_work_dir(
+        _save(str(tmp_path / "step.onnx")),
+        str(tmp_path / "wd"),
+        n=3,
+        real_data={"lr": [0.1, 0.2]},
+    )
+    got = _read_tar(wd, "dataset/lr.tar")
+    assert [tuple(sample.shape) for sample in got] == [(1,)] * 3
+    np.testing.assert_allclose(
+        [float(sample[0]) for sample in got], [0.1, 0.2, 0.1]
+    )
