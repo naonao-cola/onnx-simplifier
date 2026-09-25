@@ -17,6 +17,90 @@ import run_models
 from onnxsim.full_qdq import quantize_full_qdq
 
 
+def backbone_nodes(model):
+    """Nodes the Convs depend on (the conv backbone and its input preprocessing), in graph order.
+
+    Everything else -- the Gemm/MatMul heads, the recurrent state bookkeeping (`next_state_*` Concats,
+    which sit early in node order but never feed a Conv) -- stays float: quantizing a recurrent state
+    tensor re-quantizes it every frame and the error compounds.
+    """
+    nodes = list(model.graph.node)
+    prod = {o: i for i, n in enumerate(nodes) for o in n.output}
+    seen, stack = set(), [i for i, n in enumerate(nodes) if n.op_type == "Conv"]
+    while stack:
+        i = stack.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        stack += [prod[x] for x in nodes[i].input if x in prod]
+    return [nodes[i] for i in sorted(seen)]
+
+
+def non_backbone_node_names(model):
+    bb = {n.name or n.output[0] for n in backbone_nodes(model)}
+    return [
+        n.name or n.output[0]
+        for n in model.graph.node
+        if (n.name or n.output[0]) not in bb
+    ]
+
+
+def exact_input_ranges(model):
+    """Activation ranges that follow exactly from the uint8 camera inputs, not from calibration.
+
+    The pixel normalization in front of each backbone ((x - 127.5) / 63.75 for driving, x / 255 for DM)
+    is interval-propagated from [0, 255] through data movement (Cast, Slice, Gather, Reshape, Transpose,
+    Unsqueeze, Concat) and elementwise ops with a constant operand (Sub, Add, Mul, Div). Calibration
+    only sees the pixel values present in its frames (e.g. no pixel below 22 in the driving calibration
+    set), so every darker pixel in another segment would be clipped at the network's very first tensor.
+    """
+    from onnx import numpy_helper
+
+    consts = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
+    for n in model.graph.node:
+        if n.op_type == "Constant":
+            consts[n.output[0]] = numpy_helper.to_array(n.attribute[0].t)
+    r = {
+        i.name: (0.0, 255.0)
+        for i in model.graph.input
+        if i.type.tensor_type.elem_type == onnx.TensorProto.UINT8
+    }
+    move = {
+        "Cast",
+        "Slice",
+        "Gather",
+        "Reshape",
+        "Transpose",
+        "Unsqueeze",
+        "Squeeze",
+        "Flatten",
+        "Identity",
+    }
+    for n in model.graph.node:
+        ins = [x for x in n.input if x]
+        if n.op_type in move and ins[0] in r:
+            r[n.output[0]] = r[ins[0]]
+        elif n.op_type == "Concat" and all(x in r for x in ins):
+            r[n.output[0]] = (min(r[x][0] for x in ins), max(r[x][1] for x in ins))
+        elif (
+            n.op_type in ("Sub", "Add", "Mul", "Div")
+            and len(ins) == 2
+            and ins[0] in r
+            and ins[1] in consts
+        ):
+            c = consts[ins[1]].astype(np.float64)
+            lo, hi = r[ins[0]]
+            f = {
+                "Sub": lambda v: v - c,
+                "Add": lambda v: v + c,
+                "Mul": lambda v: v * c,
+                "Div": lambda v: v / c,
+            }[n.op_type]
+            e = np.concatenate([np.ravel(f(lo)), np.ravel(f(hi))])
+            r[n.output[0]] = (float(e.min()), float(e.max()))
+    return r
+
+
 def driving_samples(model, inputs, n, stride):
     sess = run_models.session(model)
     ins = {i.name: i for i in sess.get_inputs()}
@@ -99,9 +183,8 @@ def main():
     excl_nodes = [
         n.name for n in m.graph.node if any(n.name.startswith(p) for p in prefixes)
     ]
-    if args.float_after_last_conv:
-        last = max(i for i, n in enumerate(m.graph.node) if n.op_type == "Conv")
-        excl_nodes += [n.name or n.output[0] for n in m.graph.node[last + 1 :]]
+    if args.float_heads:
+        excl_nodes += non_backbone_node_names(m)
     tensor_dtypes = {}
     if args.policy:
         pol = json.load(open(args.policy))

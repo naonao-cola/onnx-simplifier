@@ -70,6 +70,7 @@ def layers(model_path, policy, act):
                 dict(
                     kind="conv",
                     name=n.output[0],
+                    node=n.name,
                     x=x,
                     w=w,
                     y=y,
@@ -108,6 +109,13 @@ def main():
     ap.add_argument("model")
     ap.add_argument("--act", default="uint8", choices=["uint8", "uint16"])
     ap.add_argument("--policy")
+    ap.add_argument(
+        "--w16",
+        default="",
+        help="comma list of conv node names with int16 weights, or 'all' "
+        "(pw/dense: 2 vrmpy weight-byte passes, estimated as 2x the int8-weight cycles; depthwise "
+        "already multiplies 16-bit weights)",
+    )
     ap.add_argument("--clock-mhz", type=float, default=1000.0)
     ap.add_argument("--hvx-threads", type=int, default=2)
     ap.add_argument(
@@ -122,6 +130,7 @@ def main():
     cache = json.load(open(args.cache)) if os.path.exists(args.cache) else {}
     lut_rate = None
     rows = []
+    w16 = set(args.w16.split(","))
     for L in layers(args.model, args.policy, args.act)[0]:
         u16 = L["dtype"] == "uint16"
         if L["kind"] == "eltwise":
@@ -162,6 +171,9 @@ def main():
             N = rup(w[0], 8)
             cyc = sim_cycles(["pw16" if u16 else "pw", rup(P, 32), K, N], cache)
             note = "sim"
+            if args.w16 == "all" or L["node"] in w16:
+                cyc *= 2
+                note += " x2 W16 est"
             if k > 1:
                 cyc += (
                     rup(P, 32) * K * (2 if u16 else 1) / 64.0

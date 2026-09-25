@@ -20,14 +20,18 @@ This directory asks whether that can be done again without SNPE, with our own in
 | Compute | 0.85 GMAC: backbone 0.79 (FastViT-style convs), heads 0.053 (23.5 M params, GEMV-shaped) | 0.41 GMAC: backbone 0.41, heads 0.001 |
 | GPU today, from the route's rlog (openpilot 0.10.4, older model) | 29.2-29.7 ms mean, p95 ≤ 30.7 ms | 14.3-14.8 ms mean |
 | openpilot CI budget (`test_onroad.py`) | mean < 40 ms, max < 60 ms | mean < 50 ms, max < 300 ms |
-| Int8 PTQ accuracy (fp32 = reference) | W8A8: **broken** (plan lateral error 4.4 m mean). W8A16 backbone + float heads: 0.07 m mean, lead prob p95 error 0.19 | W8A8: blink decisions agree only 72-94%. **W8A16: ≥ 98.8%**, worst probability head error 1.5% |
-| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed) | W8A8 11.8 ms, **mixed A8/A16 16.2 ms**, W8A16 19.7 ms; heads are extra, ~3 ms int8 (estimated) | W8A8 6.1 ms, **W8A16 10.9 ms** |
+| fp16 (deployed precision) vs fp32, held-out segments 8 / 5 | plan lateral 0.9 / 0.4 mm, lead prob p95 5e-4 / 5e-6 | worst probability head 2.3e-4 / 1.9e-4 |
+| Best integer config (§6) | **W16A16**: plan 5.7 / 4.5 mm, lead p95 0.009 / 7e-5 (6-12x fp16's error) | **W16A16**: worst head 5.9e-4 / 4.2e-4 (~2.5x fp16), blink agreement ≥ 99.8% |
+| Cheaper config (§6) | W8 AdaRound + 10 convs W16, A16: plan 1.4 / 1.7 cm, lead p95 0.017 | W8 AdaRound, A16: worst head 0.006, blink ≥ 99.7% |
+| Plain int8 PTQ (§3) | W8A8: **broken** (plan 4.3 m) | W8A8: blink agreement 86-95% |
+| Projected V65 backbone latency, 2 HVX threads at 1.0 GHz (assumed) | W16A16 33.4 ms, cheaper config 21.3 ms, W8A16 19.7 ms, W8A8 11.8 ms; heads extra (§7) | W16A16 19.2 ms, W8A16 10.9 ms, W8A8 6.1 ms |
 | Upstream tinygrad `DEV=DSP` on these models | fp16 graph: fails to link (`__extendhfsf2`/`__truncsfhf2` undefined). fp32 graph: not tried (see the DM column) | fp32 graph: compiles (730 kernels) and matches ORT to 1.4e-5 under qemu. It is scalar float code: V65 HVX has no float |
 
-On compute alone, the DSP looks competitive with the GPU numbers in the route's logs, if the 845's cDSP
-really runs 2 HVX threads at around 1 GHz. **Accuracy is the real blocker.** Plain int8 PTQ breaks the
-driving model and the DM blink heads. W8A16 is close but still moves the driving model's lead
-probabilities. The next step is QAT, or at least a better weight-rounding pass, not faster kernels.
+**Accuracy sets the cost.** No integer config reaches fp16's own error against fp32: not even with every
+weight and activation in 16 bits, and not with the stem in float on top of that (§6). The best integer
+config (W16A16) is within 6-12x of fp16 on the driving model and ~2.5x on DM. At the assumed
+2 threads x 1 GHz it projects to 33 ms (driving) + 19 ms (DM) of DSP time, above the GPU's 29.5 + 14.5 ms
+in the route's logs. The cheaper configs fit, at 15-40x fp16's error.
 
 ## 1. Models and profile (`profile_models.py`)
 
@@ -191,6 +195,99 @@ Results here, with `MOCKDSP=1` and openpilot's `compile_onnx.py`:
   But V65 HVX has no float, so this is scalar float code. It gives no speed signal (qemu), and it is not
   the int8 HVX path this study needs.
 
+## 6. Accuracy, round 2: better rounding, mixed precision, calibration (`evaluate.py`, `adaround_conv.py`, `mixed_bits.py`)
+
+Everything is scored against the fp32 model on **two held-out segments (8 and 5)** with openpilot's
+parser (`evaluate.py`), free-running with recurrent state as in modeld. Calibration and every ranking
+sweep use segments 3 and 12 only. Results: `results/acc_driving.json`, `results/acc_dm.json`.
+
+**The target is fp16's own error vs fp32**, measured first (row "fp16"). Integer configs are compared
+to that floor.
+
+Three fixes to round 1's setup, which apply to every row below:
+- **Exact input ranges** (`quantize.exact_input_ranges`). The pixel normalization's range is propagated
+  from the uint8 camera input ([-2, 2] for driving, [0, 1] for DM) instead of calibrated. Calibration had
+  seen no pixel below 22, so darker pixels on other segments were clipped at the first tensor. W16A16
+  plan error: 1.4 → 0.57 cm.
+- **Recurrent state and heads stay float** (`quantize.backbone_nodes`). "Float after the last Conv" is
+  replaced by "everything the Convs don't depend on". The `next_state_*` Concats sit early in node
+  order; they turned out not to be quantized in round 1 either, so the numbers didn't move.
+- **Quiet eval.** ORT runs at the basic level, as before.
+
+### Driving
+
+| config (heads + state float) | plan lat mean s8 / s5 | lead prob p95 err s8 / s5 | lead agree s8 | projected ms (2 thr @ 1 GHz) |
+|---|---:|---:|---:|---:|
+| fp16 (floor) | 0.0009 / 0.0004 m | 0.0005 / 5e-6 | 1.000 | GPU |
+| W8A8 | 4.31 / 1.05 m | 0.46 / 0.068 | 0.953 | 11.8 |
+| W8A16, round-to-nearest | 0.061 / 0.048 m | 0.178 / 5e-4 | 0.940 | 19.7 |
+| W8A16, AdaRound | 0.046 / 0.041 m | 0.199 / 0.0012 | 0.938 | 19.7 |
+| + `conv2d_2` W16 (top 1) | 0.026 / 0.024 m | 0.049 / 4e-4 | 0.992 | 19.9 |
+| + top 4 W16 | 0.017 / 0.022 m | 0.030 / 2e-4 | 0.993 | 20.7 |
+| + top 10 W16 | 0.014 / 0.017 m | 0.017 / 3e-4 | 0.998 | 21.3 |
+| **W16A16** | **0.0057 / 0.0045 m** | **0.0088 / 7e-5** | 0.997 | 33.4 |
+| W16A16, stem stage (12 nodes) float | 0.0038 / 0.0021 m | 0.0043 / 4e-5 | 0.998 | not on the DSP |
+
+**Weight rounding.**
+- **onnxsim's own passes don't cover these models.**
+  - `apply_adaround` / `apply_gptq` / `apply_tesseraq` target weight-only INT4 MatMul/Gemm, and
+    `apply_adaquant` targets QDQ MatMul/Gemm. None handles Conv, and both backbones are all Conv.
+  - `cross_layer_equalize` matched **0 pairs**: GELU is not positive-homogeneous, and most convs are
+    depthwise.
+  - `correct_bias` made things much worse: plan 6 cm → 1.6-1.9 m. It measures each layer's *cumulative*
+    output error (upstream error included, not chained) and adds it after *every* layer, so through 60
+    convs and 88 Gemms the corrections stack up.
+- **`adaround_conv.py`** is a small torch port of AdaRound's objective for Conv, layer-wise, on real
+  frames. Mean reconstruction gain is 2.1 dB (driving) and 4.6 dB (DM). Driving plan error drops
+  25%, and the lead error is unchanged. On DM it is the difference between W8A16 (worst head 0.017)
+  and 0.006.
+
+**Mixed precision.**
+- **Weights.** `mixed_bits.py sweep` ranks each conv by the damage of making only it int8 (everything
+  else W16), on segment 3. One conv dominates: `conv2d_2`, the stem's 1x1 64→64, which accounts for
+  half of all the int8-weight error. Making just it W16 costs 1% more cycles and cuts lead error 4x.
+- **Activations.** With every weight W16, a windowed "quantize only this window" sweep on segment 12
+  finds the activation error concentrated in the **stem stage**, the first 12 backbone nodes. Keeping
+  that stage float still leaves 4-6x fp16's error, spread over the rest of the network.
+- **Why A16 falls short of fp16.** fp16's rounding error is relative to each value. A16's is relative to
+  the tensor's range. These activations are heavy-tailed (max/std 20-60), so typical values get 20-60x
+  less relative precision than the range suggests.
+
+**Other options tried:**
+- **Per-channel activation scales** (`--per-channel-acts`, foldable into the neighbouring convs on the
+  DSP) are **worse**: plan 1.5-18 cm. Per-channel min/max from 64 frames clips channels that are rarely
+  active in calibration.
+- **A range margin** (`--range-margin`, headroom against clipping) is also worse: ×1.25 is neutral,
+  ×2 doubles the error. So the error is resolution, not clipping.
+- **Calibration method** (`results/acc_driving_crossfit.json`): W16A16 cross-fit, calibrating on
+  segment 3 or on segment 12, each scored on 8 and 5. **minmax wins in both folds**; percentile and mse
+  are 2-6x worse. At 16 bits, clipping costs more than resolution. The fold spread itself is large (s8
+  plan 0.66 vs 2.4 cm), so calibration data matters as much as the method.
+
+### Driver monitoring
+
+| config (heads float) | worst head err s8 / s5 | blink agree L/R s8 | projected ms |
+|---|---:|---:|---:|
+| fp16 (floor) | 2.3e-4 / 1.9e-4 | 1.000 / 1.000 | GPU |
+| W8A8 | 0.102 / 0.107 | 0.913 / 0.930 | 6.1 |
+| W8A8, AdaRound | 0.121 / 0.117 | 0.857 / 0.873 | 6.1 |
+| W8A16 | 0.017 / 0.011 | 0.988 / 0.993 | 10.9 |
+| W8A16, AdaRound | 0.0059 / 0.0050 | 0.998 / 0.998 | 10.9 |
+| **W16A16** | **5.9e-4 / 4.2e-4** | 1.000 / 1.000 | 19.2 |
+
+The heads now include `sleep_prob`: the round 1 clamp is gone because the heads are float. AdaRound
+hurts at A8. Its rounding is optimized against float inputs, so the activation error dominates there.
+
+**Cost model for W16.** `project_latency.py --w16` estimates a W16 pointwise/dense conv at 2x its int8
+cycles: two `vrmpy` passes over the weight bytes, with the low byte unsigned (`vrmpy(Vu.ub, Rt.ub)`).
+This is an estimate, not simulated. The depthwise kernel already multiplies 16-bit weights, so it costs
+no more.
+
+**Where this leaves it.** Beating the GPU's route-log timing needs the cheaper configs (W8 AdaRound +
+top-10 W16 at 21 ms, DM W8A16 AdaRound at 11 ms), at 15-40x fp16's own error. Matching fp16's accuracy
+isn't possible with 16-bit integer tensors on these nets. The next levers are QAT with the real training
+data (comma-side only), or faster kernels, so that W16A16's 33 ms fits (§4, depthwise first).
+
 ## Going on device (plan)
 
 1. **Access.** comma devices run AGNOS (Linux, root).
@@ -206,7 +303,8 @@ Results here, with `MOCKDSP=1` and openpilot's `compile_onnx.py`:
    ION/dmabuf buffers.
 3. **Measure first.** Before optimizing, get the real cDSP clock (DCVS/turbo vote) and the HVX thread
    count, then check the sim's cycles against the device.
-4. **Accuracy.** Needs QAT or AdaRound/GPTQ before int8 on the DSP can replace the GPU's fp16 path.
+4. **Accuracy.** See §6: W16A16 for fp16-like accuracy (still 2.5-12x fp16's error), or the cheaper
+   mixed configs at 15-40x.
 
 ## Files
 
@@ -221,6 +319,10 @@ Results here, with `MOCKDSP=1` and openpilot's `compile_onnx.py`:
 | `hvx65/kernels.c`, `build_sim.sh`, `run_sim.sh` | V65 HVX kernels + hexagon-sim harness |
 | `project_latency.py`, `sim_cycles_cache.json`, `results/` | per-layer sim runs → model latency projection |
 | `tinygrad_dsp_check.py` | upstream tinygrad `DEV=DSP MOCKDSP=1` vs ORT on real DM frames |
+| `evaluate.py` | held-out-segment scoring vs fp32 through openpilot's parser (driving + DM) |
+| `adaround_conv.py` | layer-wise AdaRound for Conv int8 per-channel weights (torch) |
+| `mixed_bits.py` | per-conv int16 weights on top of `quantize_full_qdq`, per-conv / activation-window sensitivity sweeps, per-channel activation experiment |
+| `results/acc_*.json`, `results/w16_rank_driving.txt`, `results/sweep_w16.json`, `results/actsweep_only.json`, `results/adaround_*.log` | §6 results |
 
 Reproduce (paths are examples):
 

@@ -57,6 +57,7 @@ def output_slices(path):
 def session(path, threads=8):
     so = ort.SessionOptions()
     so.intra_op_num_threads = threads
+    so.log_severity_level = 3
     # basic level: QDQ stays simulated in float, instead of ORT's fused u8s8 kernels (which saturate on
     # CPUs without VNNI and requantize differently from the reference Q/DQ semantics)
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
