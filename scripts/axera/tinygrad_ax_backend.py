@@ -1546,6 +1546,25 @@ def build_graph_template_request(
     return json.dumps(req, sort_keys=True)
 
 
+def build_generated_graph_request(
+    source_path: str,
+    output_path: str | None = None,
+    schedule_path: str | None = None,
+) -> str:
+    """Build the JSON request for a measured graph generator family.
+
+    Unlike ``build_graph_template_request``, this request does not need a
+    source/template AX pair: ``graph_generator`` selects a validated fused
+    family and emits its model plus optional scheduler sidecar directly.
+    """
+    req = {"kind": "generated_graph", "source": source_path}
+    if output_path is not None:
+        req["output"] = output_path
+    if schedule_path is not None:
+        req["schedule"] = schedule_path
+    return json.dumps(req, sort_keys=True)
+
+
 def apply_policy(
     key: TemplateKey, policy: QuantPolicy, node: str | None = None
 ) -> TemplateKey:
@@ -1596,6 +1615,27 @@ def compile_request(
             req["template_axmodel"],
             output,
         )
+        with open(output, "rb") as f:
+            return f.read()
+    if req.get("kind") == "generated_graph":
+        source = req.get("source")
+        if not isinstance(source, str):
+            raise ValueError("generated_graph request missing source path")
+        import graph_generator
+
+        output = req.get("output")
+        schedule = req.get("schedule")
+        if output is not None and not isinstance(output, str):
+            raise ValueError("generated_graph output must be a path")
+        if schedule is not None and not isinstance(schedule, str):
+            raise ValueError("generated_graph schedule must be a path")
+        if output is None:
+            with tempfile.TemporaryDirectory() as directory:
+                output = os.path.join(directory, "generated.axmodel")
+                graph_generator.generate(source, output, schedule_path=schedule)
+                with open(output, "rb") as f:
+                    return f.read()
+        graph_generator.generate(source, output, schedule_path=schedule)
         with open(output, "rb") as f:
             return f.read()
     key = TemplateKey.from_json(req["key"])

@@ -150,6 +150,31 @@ def test_compiler_request_generates_graph_template_without_pulsar2(tmp_path):
     assert axb.compile_request(request) == template.SerializeToString()
 
 
+def test_compiler_request_runs_measured_generator_without_pulsar2(tmp_path):
+    shape = numpy_helper.from_array(np.array([1, 1, 8, 16], dtype=np.int64), "shape")
+    source_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Reshape", ["x", "shape"], ["r"]),
+                onnx.helper.make_node("Relu", ["r"], ["y"]),
+            ],
+            "source",
+            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 8, 4, 4])],
+            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 8, 16])],
+            [shape],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    source = tmp_path / "source.onnx"
+    output = tmp_path / "generated.axmodel"
+    schedule = tmp_path / "generated.schedule.json"
+    onnx.save(source_model, source)
+    request = axb.build_generated_graph_request(str(source), str(output), str(schedule))
+    generated = onnx.load_from_string(axb.compile_request(request))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
 def test_cache_graph_template_bytes_avoids_output_file(tmp_path):
     template_path = os.path.join(
         _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
