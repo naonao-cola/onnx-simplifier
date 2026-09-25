@@ -1576,6 +1576,16 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    def alloc_backed_view(node):
+        """Whether a reshape/permute view ultimately reads one allocation."""
+        if node.op is Ops.ALLOC:
+            return True
+        return bool(
+            node.src
+            and node.op in (Ops.RESHAPE, Ops.PERMUTE)
+            and alloc_backed_view(node.src[0])
+        )
+
     def lower_matmul(node):
         bias = None
         if node.op is Ops.ADD and len(node.src) == 2:
@@ -1598,9 +1608,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         if (
             left.op is not Ops.RESHAPE
             or not left.src
-            or left.src[0].op is not Ops.RESHAPE
-            or not left.src[0].src
-            or left.src[0].src[0].op is not Ops.ALLOC
+            or not alloc_backed_view(left.src[0])
         ):
             return None
         if (
@@ -1608,9 +1616,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             or not right.src
             or right.src[0].op is not Ops.RESHAPE
             or not right.src[0].src
-            or right.src[0].src[0].op is not Ops.RESHAPE
-            or not right.src[0].src[0].src
-            or right.src[0].src[0].src[0].op is not Ops.ALLOC
+            or not alloc_backed_view(right.src[0].src[0])
         ):
             return None
         a_shape = tuple(int(dim) for dim in left.src[0].shape)

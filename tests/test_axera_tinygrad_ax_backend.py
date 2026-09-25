@@ -559,6 +559,25 @@ def test_lower_tinygrad_batched_bias_matmul_to_matmul_add():
     assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == (2, 3, 5)
 
 
+@pytest.mark.parametrize(
+    "transpose_left,transpose_right,output_shape",
+    [
+        (True, False, (3, 5)),
+        (False, True, (3, 5)),
+    ],
+)
+def test_lower_tinygrad_transposed_matmul_views(
+    transpose_left, transpose_right, output_shape
+):
+    from tinygrad import Tensor
+
+    left = Tensor.empty(4, 3).transpose() if transpose_left else Tensor.empty(3, 4)
+    right = Tensor.empty(5, 4).transpose() if transpose_right else Tensor.empty(4, 5)
+    lowered = axb.lower_uop_to_onnx((left @ right).uop)
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
+    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+
+
 def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     from tinygrad import Tensor
 
