@@ -457,6 +457,37 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     assert tuple(generated.graph.output[0].type.tensor_type.shape.dim[i].dim_value for i in range(2)) == output_shape
 
 
+def test_lower_and_compile_tinygrad_transpose_uop_without_pulsar2(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 512).permute(1, 0).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Transpose"]
+    schedule = tmp_path / "transpose.schedule.json"
+    generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "transpose"
+
+
+def test_lower_and_compile_tinygrad_wide_reducesum_uop(tmp_path):
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 1, 512, 49).sum(axis=(0, 3)).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
+    _, meta = misc.load_template("ReduceSum:16x1x512x49:axes0,3:k0")
+    schedule = tmp_path / "reducesum_wide.schedule.json"
+    generated = onnx.load_from_string(
+        axb.compile_uop(
+            root,
+            str(schedule),
+            {"scales": meta["scales"], "zero_points": meta["zero_points"]},
+        )
+    )
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 

@@ -20,6 +20,7 @@ import compose_emit
 import misc_op_record_emit
 import onnx
 import reshape_emit
+import transpose_real_shapes
 from onnx import numpy_helper
 
 
@@ -119,6 +120,22 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 ),
             )
         )
+    if len(nodes) == 1 and nodes[0].op_type == "Transpose":
+        transpose = nodes[0]
+        if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
+            raise ValueError("standalone Transpose requires one runtime input named x")
+        shape = values.get("x", ())
+        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        perm = tuple(_attrs(transpose).get("perm", ()))
+        if shape != (16, 512) or output_shape != (512, 16) or perm != (1, 0):
+            raise ValueError("standalone Transpose requires the measured [16,512] perm [1,0] form")
+        return GraphPlan(
+            (
+                GraphSegment(
+                    "transpose", ("x",), model.graph.output[0].name, shape, output_shape
+                ),
+            )
+        )
     if len(nodes) == 1 and nodes[0].op_type in ("Neg", "Sqrt", "Log", "Softmax"):
         neg = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
@@ -198,6 +215,8 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 "ReduceSum:16x64x112x112:axes0,2,3:k0",
             ((16, 1, 64, 3136), (1, 64), (0, 3), 0):
                 "ReduceSum:16x1x64x3136:axes0,3:k0",
+            ((16, 1, 512, 49), (1, 512), (0, 3), 0):
+                "ReduceSum:16x1x512x49:axes0,3:k0",
             ((16, 1000), (1, 1000), (0,), 1):
                 "ReduceSum:16x1000:axes0:k1",
             ((16, 1000), (16, 1), (1,), 1):
@@ -365,6 +384,13 @@ def generate(
             output_path,
             position=segment.position,
         )
+    elif plan.chain == "transpose":
+        with open(output_path, "wb") as stream:
+            stream.write(
+                transpose_real_shapes.load_template_bytes(
+                    plan.segments[0].input_shape, (1, 0)
+                )
+            )
     elif plan.chain == "reducemean":
         if calibration is None:
             raise ValueError("standalone ReduceMean generation requires explicit calibration")

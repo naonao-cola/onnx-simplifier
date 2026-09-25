@@ -1576,6 +1576,29 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """
     from tinygrad.uop.ops import Ops
 
+    if root.op is Ops.PERMUTE and tuple(int(axis) for axis in root.arg) == (1, 0):
+        source = root.src[0] if root.src else None
+        shape = tuple(int(dim) for dim in root.shape)
+        if (
+            source is not None
+            and source.op is Ops.RESHAPE
+            and source.src
+            and source.src[0].op is Ops.ALLOC
+            and tuple(int(dim) for dim in source.shape) == (16, 512)
+            and shape == (512, 16)
+        ):
+            if str(root.dtype).split(".")[-1] != "float":
+                raise ValueError("AX UOp Transpose lowering currently supports float32 data only")
+            graph = onnx.helper.make_graph(
+                [onnx.helper.make_node("Transpose", ["x"], ["y"], perm=[1, 0])],
+                "tinygrad_uop_transpose_ax",
+                [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, (16, 512))],
+                [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, shape)],
+            )
+            return onnx.helper.make_model(
+                graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+            )
+
     if root.op is Ops.RESHAPE and root.src:
         reduction = root.src[0]
         if (
@@ -1732,10 +1755,12 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         ):
             input_shape = tuple(int(dim) for dim in permuted.src[0].shape)
             output_shape = tuple(int(dim) for dim in root.shape)
-            if input_shape != (16, 1, 64, 3136) or output_shape != (1, 64):
+            if input_shape not in ((16, 1, 64, 3136), (16, 1, 512, 49)) or output_shape != (
+                (1, 64) if input_shape == (16, 1, 64, 3136) else (1, 512)
+            ):
                 raise ValueError(
-                    "AX UOp ReduceSum lowering is measured only for "
-                    "[16,1,64,3136] -> [1,64]"
+                    "AX UOp ReduceSum lowering requires a measured "
+                    "[16,1,C,S] -> [1,C] form"
                 )
             if str(root.dtype).split(".")[-1] != "float":
                 raise ValueError(
