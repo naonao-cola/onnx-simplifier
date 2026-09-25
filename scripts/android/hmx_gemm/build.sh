@@ -8,7 +8,7 @@ HEX_ARCH="${HEX_ARCH:-v69}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT:-$SRC/build}"
 mkdir -p "$OUT" && cd "$OUT"
-cp "$SRC"/hmx_gemm_rpc.idl "$SRC"/hmx_gemm_impl.c "$SRC"/hmx_gemm_client.c "$SRC"/hmx_gemm_llm_client.c "$SRC"/hmx_gemm.h "$SRC"/hmx_block.h "$SRC"/hmx_runtime.h .
+cp "$SRC"/hmx_gemm_rpc.idl "$SRC"/hmx_gemm_impl.c "$SRC"/hmx_gemm_client.c "$SRC"/hmx_gemm_llm_client.c "$SRC"/hmx_gemm_u8_client.c "$SRC"/hmx_gemm_layers_client.c "$SRC"/hmx_gemm.h "$SRC"/hmx_gemm_u8.h "$SRC"/hmx_block.h "$SRC"/hmx_runtime.h .
 "$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic" -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef" hmx_gemm_rpc.idl
 INC=(-I . -I "$HEXAGON_SDK_ROOT/incs" -I "$HEXAGON_SDK_ROOT/incs/stddef")
 QURT_INC=(-I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/qurt" -I "$HEXAGON_SDK_ROOT/rtos/qurt/compute$HEX_ARCH/include/posix")
@@ -21,4 +21,10 @@ LIBPATH="$HEXAGON_TOOLCHAIN/target/hexagon/lib/$HEX_ARCH/G0"
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
 "$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o hmx_gemm_llm_client hmx_gemm_llm_client.c -lm hmx_gemm_rpc_stub.c \
   -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
-echo "built $OUT/hmx_gemm_rpc.so $OUT/hmx_gemm_client $OUT/hmx_gemm_llm_client"
+"$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o hmx_gemm_u8_client hmx_gemm_u8_client.c -lm hmx_gemm_rpc_stub.c \
+  -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
+for c in hmx_gemm_layers_client; do
+  "$NDK_CLANG" -O2 "${INC[@]}" -I "$HEXAGON_SDK_ROOT/ipc/fastrpc/rpcmem/inc" -o $c $c.c -lm hmx_gemm_rpc_stub.c \
+    -L "$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" -lcdsprpc
+done
+echo "built $OUT/hmx_gemm_rpc.so $OUT/hmx_gemm_client $OUT/hmx_gemm_llm_client $OUT/hmx_gemm_u8_client $OUT/hmx_gemm_layers_client"
