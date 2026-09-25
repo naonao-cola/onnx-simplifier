@@ -87,6 +87,49 @@ def test_cache_miss_is_not_built():
         axb.TemplateCache().get_or_build(axb.TemplateKey("Mul", ((1, 64, 56, 56),)))
 
 
+def test_cache_generates_same_topology_without_pulsar2(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    output = tmp_path / "generated.axmodel"
+    for path in (source, template_source, axmodel):
+        onnx.save(template, str(path))
+
+    got = axb.TemplateCache().generate_graph_template(
+        str(source), str(template_source), str(axmodel), str(output)
+    )
+
+    assert got == str(output)
+    assert onnx.load(str(output), load_external_data=False).SerializeToString() == (
+        template.SerializeToString()
+    )
+
+
+def test_cache_graph_template_refuses_topology_change(tmp_path):
+    template_path = os.path.join(
+        _FIX, "compose_gather_reshape_matmul_transpose_add.axmodel.gz"
+    )
+    template = _load_gz(template_path)
+    source = onnx.ModelProto()
+    source.CopyFrom(template)
+    source.graph.node[0].attribute[0].s = b"different"
+    source_path = tmp_path / "source.onnx"
+    template_source = tmp_path / "template_source.onnx"
+    axmodel = tmp_path / "template.axmodel"
+    onnx.save(source, str(source_path))
+    onnx.save(template, str(template_source))
+    onnx.save(template, str(axmodel))
+
+    with pytest.raises(ValueError, match="topology"):
+        axb.TemplateCache().generate_graph_template(
+            str(source_path), str(template_source), str(axmodel), str(tmp_path / "out.axmodel")
+        )
+
+
 def test_gather_edit_writes_indices_and_keeps_mcode():
     key = _gather_key()
     template = axb.TemplateCache().load(key)

@@ -521,7 +521,13 @@ class TemplateEntry:
 
 
 class TemplateCache:
-    """Resolves keys to committed Pulsar2-built fixtures. No builds."""
+    """Resolves measured templates and performs safe Pulsar-free graph reuse.
+
+    Op-level misses remain explicit errors because synthesizing a new fused
+    program still requires a compiler.  A complete source graph can however
+    reuse a validated AX model when its topology is identical; that path is
+    delegated to :mod:`template_model_generator` and never invokes Pulsar2.
+    """
 
     def lookup(self, key: TemplateKey) -> TemplateEntry:
         if key.toolchain != TOOLCHAIN:
@@ -581,6 +587,32 @@ class TemplateCache:
 
     def load(self, key: TemplateKey) -> onnx.ModelProto:
         return _load_gz_model(self.lookup(key).path)
+
+    def generate_graph_template(
+        self,
+        source_path: str,
+        template_source_path: str,
+        template_axmodel_path: str,
+        output_path: str,
+    ) -> str:
+        """Copy a validated same-topology AX template without Pulsar2.
+
+        The source graph is checked against the graph used to validate the
+        compiled template.  This deliberately does not patch weights or
+        constants: those changes need an emitter with a corresponding
+        validation record.  Returning the output path makes this suitable for
+        the tinygrad compiler/cache seam while keeping the generic generator
+        independently usable from the command line.
+        """
+        from template_model_generator import generate
+
+        generate(
+            source_path,
+            template_source_path,
+            template_axmodel_path,
+            output_path,
+        )
+        return output_path
 
     def get_or_build(self, key: TemplateKey, onnx_bytes: bytes | None = None):
         """Plan section 6: build on a miss. Builds are Pulsar2 runs, out of scope
