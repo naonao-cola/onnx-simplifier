@@ -31,7 +31,9 @@ from tinygrad.uop.ops import Ops
 from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.helpers import is_image_shape
 from tinygrad.nn.onnx import OnnxRunner
-from tinygrad.renderer.cstyle import OpenCLRenderer, QCOMCLRenderer
+from tinygrad.renderer import Renderer
+from tinygrad.renderer.cstyle import OpenCLRenderer
+from tinygrad.helpers import FLOAT16
 
 class _TryCompile(Compiler):
   """Build every kernel once with the vendor compiler in a separate process (TG_CLC: the clc tool from this directory)
@@ -48,9 +50,14 @@ class _TryCompile(Compiler):
     return src.encode()
 
 class AdrenoCLRenderer(OpenCLRenderer):
-  """OpenCL C for Qualcomm's OpenCL compiler: QCOMCLRenderer's workarounds (half only for IMAGE+FLOAT16, bool buffers as
-  uchar), but plain source for the vendor OpenCL runtime instead of QCOMCLRenderer's kgsl-only binaries."""
-  supported_dtypes = QCOMCLRenderer.supported_dtypes
+  """OpenCL C for Qualcomm's OpenCL compiler: QCOMCLRenderer's workarounds (no fp8/bf16/double, bool buffers as uchar),
+  but plain source for the vendor OpenCL runtime instead of QCOMCLRenderer's kgsl-only binaries."""
+  # native half whenever FLOAT16 is on (QCOMCLRenderer only allows it with IMAGE too): a kernel that falls back to plain
+  # buffers (below) keeps its fp16 buffers native instead of emulating them as ushort (2 s instead of ~10 ms on the
+  # -seg models' prototype upsampling conv)
+  def supported_dtypes(self):
+    return {d for d in Renderer.supported_dtypes(self)
+            if (d != dtypes.float16 or bool(FLOAT16)) and d not in dtypes.fp8s+(dtypes.bfloat16, dtypes.double)}
   def __init__(self, target):
     super().__init__(target)
     self.compiler = _TryCompile()
@@ -85,6 +92,16 @@ def main():
     orig_to_program = cg.to_program
     def to_program_fallback(ast, renderer):
       try: return orig_to_program(ast, renderer)
+      except KeyError:
+        # tinygrad's image rewrite (codegen/late/coalesce.py _drop_valid_stmts) can fail on a kernel (KeyError on a
+        # FLOORMOD, the -seg models' mask-prototype kernels): render that kernel on plain buffers. image2d_t args are
+        # created over the same buffers with no pitch padding, so kernels may mix the two views of one buffer.
+        # tinygrad's heuristics for this kernel shape are poor without images (27 ms): BEAM it
+        with Context(IMAGE=0):
+          b = ast.replace(arg=replace(ast.arg, beam=args.fallback_beam)) if ast.op is Ops.SINK and not ast.arg.beam else ast
+          prg = orig_to_program(b, renderer)
+        fallbacks.append(f"{prg.src[0].arg.function_name}(no image, beam)")
+        return prg
       except CompileError:
         # BEAM skips the candidates the vendor compiler rejects (the screening compile raises for them); NOOPT is the
         # last resort (slow: it launches one work item per output)

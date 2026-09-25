@@ -59,6 +59,17 @@ post-processing (conf 0.25, per-class NMS 0.7) matched to fp32 ONNX Runtime (sam
 |---|---|---:|---:|---:|---:|
 | YOLO11n | QNN HTP, int8 | **2.58 ms** | **94** | 79 / 91 | 21 |
 | YOLO11n | tinygrad, Adreno OpenCL, `IMAGE=1 FLOAT16=1` | 44.3 ms | 16.2 | **90 / 91** | **0** |
+| YOLO26n | QNN HTP, int8 | **2.5 ms** (README above) | **100-111** | 68 / 78 | 7 |
+| YOLO26n | tinygrad | 44.8 ms | 16.0 | **78 / 78** | **0** |
+| YOLO26n-seg | QNN HTP, int8 | **3.4 ms** (README above) | **85** | see below | |
+| YOLO26n-seg | tinygrad | 86-88 ms | 9.4 | **82 / 83** | **0** |
+| YOLO11n-seg | QNN HTP, int8 | **3.4 ms** (README above) | **70** | see below | |
+| YOLO11n-seg | tinygrad | 82-84 ms | 9.8 | **89 / 90** | **0** |
+
+(YOLO26n uses the app's post=end2end: x1,y1,x2,y2, best class per anchor, top 300, no NMS. The -seg rows compare
+boxes; the mask prototypes' worst max |diff| relative to fp32 over the 20 images is 1.9% for YOLO11n-seg and 10% for
+YOLO26n-seg, fp16 on the GPU. The HTP -seg numbers in `../maskrcnn_demo_app/README.md` use `seg_check.py`'s own
+matching: 69/84 and 78/91 fp32 detections.)
 
 - tinygrad's fp16 GPU graph is much closer to fp32 than the int8 HTP graph (max score difference on matched boxes
   0.020 vs 0.352), but **17x slower** than the HTP: 122 kernel calls per frame, 38.8 ms of GPU time (the largest
@@ -68,4 +79,8 @@ post-processing (conf 0.25, per-class NMS 0.7) matched to fp32 ONNX Runtime (sam
   tinygrad matches fp32 ORT to 7.7e-3 on 637-pixel box coordinates.
 - Load: 2.5 s the first time (vendor compile of `kernels.cl`), 7 ms after (cached device binary). The export itself
   takes ~3 minutes on the phone (17 minutes the first time, with the one BEAM-searched kernel uncached).
+- The -seg models need two more things: tinygrad's IMAGE rewrite crashed on their prototype upsampling conv
+  (`_drop_valid_stmts` KeyError, fixed in onnxsim/tinygrad#10; `export_cl.py` also renders such a kernel on plain
+  buffers as a fallback), and `AdrenoCLRenderer` keeps fp16 buffers native (QCOMCLRenderer's rule would emulate
+  them as ushort: 2 s for that one kernel). Their largest kernel (18-19 ms) is one fused 20x20/40x40/80x80 head kernel.
 - Fixed per-frame overhead in the app: the 1.2 MB input upload and 2.8 MB output readback are inside the 44.3 ms.
