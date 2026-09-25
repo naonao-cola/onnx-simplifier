@@ -83,6 +83,32 @@ class Model:
 
 def _validate_schedule(model: Model, schedule: dict) -> None:
     """Check that a Pulsar-free schedule matches the loaded AX model IO."""
+    if schedule.get("schema_version") != 1:
+        raise DeviceError("unsupported or missing schedule schema_version")
+    try:
+        memory_size = int(schedule["memory_size"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise DeviceError("schedule has no valid memory plan") from error
+    allocations = schedule.get("allocations")
+    if not isinstance(allocations, list):
+        raise DeviceError("schedule has no allocation list")
+    allocation_by_name = {}
+    for allocation in allocations:
+        try:
+            name = allocation["name"]
+            offset = int(allocation["offset"])
+            nbytes = int(allocation["nbytes"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise DeviceError("schedule contains a malformed allocation") from error
+        if (
+            not isinstance(name, str)
+            or offset < 0
+            or nbytes <= 0
+            or offset % 64
+            or offset + nbytes > memory_size
+        ):
+            raise DeviceError(f"schedule allocation is outside its memory plan: {allocation}")
+        allocation_by_name[name] = allocation
     for kind, specs in (("inputs", model.inputs), ("outputs", model.outputs)):
         entries = schedule.get(kind)
         if not isinstance(entries, list) or len(entries) != len(specs):
@@ -102,9 +128,12 @@ def _validate_schedule(model: Model, schedule: dict) -> None:
                     f"schedule {kind}[{index}] does not match model: "
                     f"scheduled={expected}, loaded={actual}"
                 )
+            allocation = allocation_by_name.get(spec.name)
+            if allocation is None:
+                raise DeviceError(f"schedule has no allocation for model {kind[:-1]} {spec.name!r}")
     if not isinstance(schedule.get("kernels"), list) or not schedule["kernels"]:
         raise DeviceError("schedule has no executable kernels")
-    if int(schedule.get("memory_size", 0)) <= 0:
+    if memory_size <= 0:
         raise DeviceError("schedule has no positive memory plan")
 
 

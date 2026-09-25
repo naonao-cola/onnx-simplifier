@@ -22,7 +22,12 @@ def _schedule():
         "inputs": [{"name": "x", "shape": [1, 4], "elem_type": 1, "nbytes": 16}],
         "outputs": [{"name": "y", "shape": [1, 4], "elem_type": 1, "nbytes": 16}],
         "kernels": [{"name": "kernel_0"}],
-        "memory_size": 64,
+        "allocations": [
+            {"name": "x", "offset": 0, "nbytes": 16},
+            {"name": "y", "offset": 64, "nbytes": 16},
+        ],
+        "memory_size": 128,
+        "schema_version": 1,
     }
 
 
@@ -34,4 +39,11 @@ def test_schedule_validation_rejects_io_mismatch():
     schedule = _schedule()
     schedule["outputs"][0]["nbytes"] = 32
     with pytest.raises(axcl_session.DeviceError, match="does not match"):
+        axcl_session._validate_schedule(_model(), schedule)
+
+
+def test_schedule_validation_rejects_out_of_bounds_allocation():
+    schedule = _schedule()
+    schedule["allocations"][1]["offset"] = 128
+    with pytest.raises(axcl_session.DeviceError, match="outside"):
         axcl_session._validate_schedule(_model(), schedule)

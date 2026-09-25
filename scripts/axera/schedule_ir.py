@@ -55,7 +55,9 @@ class ScheduleIR:
     memory_size: int
 
     def to_json(self) -> dict:
-        return dataclasses.asdict(self)
+        payload = dataclasses.asdict(self)
+        payload["schema_version"] = 1
+        return payload
 
 
 def _shape(value: onnx.ValueInfoProto) -> tuple[int, ...]:
