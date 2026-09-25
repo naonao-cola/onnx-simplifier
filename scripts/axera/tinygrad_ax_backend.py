@@ -1589,7 +1589,7 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         if not node.src or node.src[0].op is not Ops.PERMUTE:
             return None
         output_permute = node.src[0]
-        if tuple(int(axis) for axis in output_permute.arg) != (2, 0, 1) or not output_permute.src:
+        if not output_permute.src:
             return None
         product = output_permute.src[0]
         if product.op is not Ops.MUL or len(product.src) != 2:
@@ -1597,7 +1597,6 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         left, right = product.src
         if (
             left.op is not Ops.RESHAPE
-            or tuple(int(dim) for dim in left.shape)[1] != 1
             or not left.src
             or left.src[0].op is not Ops.RESHAPE
             or not left.src[0].src
@@ -1606,7 +1605,6 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
             return None
         if (
             right.op is not Ops.PERMUTE
-            or tuple(int(axis) for axis in right.arg) != (0, 2, 1)
             or not right.src
             or right.src[0].op is not Ops.RESHAPE
             or not right.src[0].src
@@ -1618,27 +1616,49 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
         a_shape = tuple(int(dim) for dim in left.src[0].shape)
         b_shape = tuple(int(dim) for dim in right.src[0].src[0].shape)
         output_shape = tuple(int(dim) for dim in node.shape)
-        if len(a_shape) != 2 or len(b_shape) != 2 or output_shape != (a_shape[0], b_shape[1]):
+        if len(a_shape) < 2 or len(b_shape) < 2:
             return None
-        if a_shape[1] != b_shape[0] or str(node.dtype).split(".")[-1] != "float":
+        batch_shape = a_shape[:-2]
+        if b_shape[:-2] not in ((), batch_shape):
             return None
-        op_type = "Gemm" if bias is not None else "MatMul"
+        if b_shape[-2] != a_shape[-1] or output_shape != batch_shape + (a_shape[-2], b_shape[-1]):
+            return None
+        expected_left = batch_shape + (a_shape[-2], 1, a_shape[-1])
+        right_batch = b_shape[:-2]
+        expected_right = right_batch + (1, b_shape[-2], b_shape[-1])
+        expected_output_permute = (len(batch_shape) + 2,) + tuple(range(len(batch_shape) + 2))
+        expected_right_permute = tuple(range(len(right_batch) + 1)) + (
+            len(right_batch) + 2,
+            len(right_batch) + 1,
+        )
+        if (
+            tuple(int(dim) for dim in left.shape) != expected_left
+            or tuple(int(axis) for axis in right.arg) != expected_right_permute
+            or tuple(int(dim) for dim in right.src[0].shape) != expected_right
+            or tuple(int(axis) for axis in output_permute.arg) != expected_output_permute
+            or str(node.dtype).split(".")[-1] != "float"
+        ):
+            return None
+        op_type = "Gemm" if bias is not None and len(a_shape) == len(b_shape) == 2 else "MatMul"
         graph_inputs = [
             onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, a_shape),
             onnx.helper.make_tensor_value_info("z", onnx.TensorProto.FLOAT, b_shape),
         ]
         inputs = ["x", "z"]
         if bias is not None:
-            if tuple(int(dim) for dim in bias.shape) != (b_shape[1],):
+            if tuple(int(dim) for dim in bias.shape) != (b_shape[-1],):
                 return None
             graph_inputs.append(
                 onnx.helper.make_tensor_value_info(
-                    "b", onnx.TensorProto.FLOAT, (b_shape[1],)
+                    "b", onnx.TensorProto.FLOAT, (b_shape[-1],)
                 )
             )
             inputs.append("b")
+        nodes = [onnx.helper.make_node(op_type, inputs, ["matmul_y"] if op_type == "MatMul" and bias is not None else ["y"])]
+        if op_type == "MatMul" and bias is not None:
+            nodes.append(onnx.helper.make_node("Add", ["matmul_y", "b"], ["y"]))
         graph = onnx.helper.make_graph(
-            [onnx.helper.make_node(op_type, inputs, ["y"])],
+            nodes,
             "tinygrad_uop_matmul_ax",
             graph_inputs,
             [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, output_shape)],

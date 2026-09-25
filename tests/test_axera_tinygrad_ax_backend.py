@@ -537,6 +537,18 @@ def test_lower_tinygrad_rank2_matmul_uop_to_onnx():
     )
 
 
+@pytest.mark.parametrize(
+    "a_shape,b_shape,output_shape",
+    [((3, 4), (4, 5), (3, 5)), ((2, 3, 4), (2, 4, 5), (2, 3, 5)), ((2, 3, 4), (4, 5), (2, 3, 5))],
+)
+def test_lower_tinygrad_arbitrary_shape_matmul_uop_to_onnx(a_shape, b_shape, output_shape):
+    from tinygrad import Tensor
+
+    lowered = axb.lower_uop_to_onnx((Tensor.empty(*a_shape) @ Tensor.empty(*b_shape)).uop)
+    assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
+    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+
+
 def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     from tinygrad import Tensor
 
