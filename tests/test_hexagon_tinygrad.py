@@ -399,6 +399,48 @@ def test_codegen_qlinear_add_exact(flags):
     hexagon_tools() is None,
     reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
 )
+def test_hand_hmx_kernels_are_tinygrad_oracles():
+    """The hand-written HMX kernels (hmx_gemm fp16 GEMM, the QDQ-exact 1x1 / 3x3 convs) now live in the tinygrad fork as test
+    oracles (test/external/dsp/hand): each is run next to tinygrad's lowering of the same op on hexagon-sim, bit-exact."""
+    env = dict(tinygrad_env())
+    env.update(
+        CC=clang() or "clang",
+        HEXAGON_TOOLS=str(hexagon_tools()),
+        HMX="1",
+        DEV="DSP",
+        MOCKDSP="1",
+        TC="1",
+        HVX_ARCH="v69",
+    )
+    root = _run(
+        [
+            sys.executable,
+            "-c",
+            "import tinygrad, os; print(os.path.dirname(os.path.dirname(tinygrad.__file__)))",
+        ],
+        env=env,
+    )
+    tg = Path(root.stdout.strip())
+    if not (tg / "test/external/dsp/hand").is_dir():
+        pytest.skip(
+            f"the tinygrad at {tg} has no test/external/dsp/hand (not the fork's checkout)"
+        )
+    out = _ok(
+        _run(
+            [sys.executable, "-m", "pytest", "-q", "-s", "test/external/dsp/hand"],
+            env=env,
+            cwd=tg,
+        ),
+        "tinygrad test/external/dsp/hand",
+    )
+    assert " passed" in out and "failed" not in out and " skipped" not in out, out
+
+
+@needs_tinygrad
+@pytest.mark.skipif(
+    hexagon_tools() is None,
+    reason="needs the Hexagon toolchain's hexagon-sim (HEXAGON_TOOLS)",
+)
 def test_codegen_hexsim_vectorized_add_beats_scalar():
     """hexagon-sim --timing cycles: the default (HVX) codegen vs NOOPT=1 (scalar). Measured ~50x on toolchain
     19.0.04; only a generous ratio is asserted so simulator versions can't make this flaky."""
