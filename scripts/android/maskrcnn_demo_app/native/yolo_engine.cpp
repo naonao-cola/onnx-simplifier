@@ -14,6 +14,11 @@
 //                 max_det over queries x classes, cx,cy,w,h normalized to the square input, labels
 //                 are COCO category ids. The input is the frame *stretched* to SxS (RF-DETR's
 //                 predict() preprocessing), not letterboxed; boxes scale back by the frame size.
+//   -seg models (../../deploy/models/yolo26n-seg.yaml, yolo11n-seg.yaml): the head output carries
+//                 nm = 32 mask coefficients after the class scores, (1, 4+nc+nm, N), and a second output
+//                 holds the (1, nm, 160, 160) mask prototypes. Boxes are selected as above; each shown
+//                 detection's mask is sigmoid(coefficients . prototypes) (Ultralytics' process_mask),
+//                 sampled on a side x side grid over its box (the box crop), for the overlay.
 // Built into its own libyolo_demo.so, loaded only by YoloActivity (its own process).
 #include <jni.h>
 #include <android/bitmap.h>
@@ -47,7 +52,12 @@ std::unique_ptr<Ort::Session> g_sess;
 std::string g_in, g_out, g_post, g_err;
 std::vector<uint8_t> g_q(S * S * 3);
 std::vector<float> g_head;
-int g_ch = 0, g_n = 0, g_maxdet = 300;
+int g_ch = 0, g_n = 0, g_nc = 0, g_maxdet = 300;
+// -seg models: prototype output name, mask count, prototype grid
+bool g_seg = false;
+std::string g_out_proto;
+std::vector<float> g_proto;
+int g_nm = 0, g_ph = 0, g_pw = 0;
 std::mutex g_mu;
 float g_conf = 0.25f, g_iou = 0.7f;
 // post=detr (RF-DETR): input side, second output, query/class counts, the upright display-size
@@ -123,22 +133,23 @@ void infer(float* times, double t0) {
   }
   int64_t ishape[4] = {1, S, S, 3};
   Ort::Value in = Ort::Value::CreateTensor<uint8_t>(mi, g_q.data(), g_q.size(), ishape, 4);
-  int64_t oshape[3] = {1, g_ch, g_n};
-  Ort::Value out = Ort::Value::CreateTensor<float>(mi, g_head.data(), g_head.size(), oshape, 3);
+  int64_t oshape[3] = {1, g_ch, g_n}, pshape[4] = {1, g_nm, g_ph, g_pw};
+  Ort::Value outs[2] = {Ort::Value::CreateTensor<float>(mi, g_head.data(), g_head.size(), oshape, 3), Ort::Value{nullptr}};
+  if (g_seg) outs[1] = Ort::Value::CreateTensor<float>(mi, g_proto.data(), g_proto.size(), pshape, 4);
   const char* in_names[] = {g_in.c_str()};
-  const char* out_names[] = {g_out.c_str()};
-  g_sess->Run(Ort::RunOptions{nullptr}, in_names, &in, 1, out_names, &out, 1);
+  const char* out_names[] = {g_out.c_str(), g_out_proto.c_str()};
+  g_sess->Run(Ort::RunOptions{nullptr}, in_names, &in, 1, out_names, outs, g_seg ? 2 : 1);
   times[1] = (float)(t1 - t0);
   times[2] = (float)(now_ms() - t1);
 }
 
 struct Det {
   float x1, y1, x2, y2, s;
-  int c;
+  int c, a = -1;  // a: the anchor (head column), for the -seg models' mask coefficients
 };
 
 std::vector<Det> post_end2end() {
-  const int nc = g_ch - 4, N = g_n, k = std::min(g_maxdet, N);
+  const int nc = g_nc, N = g_n, k = std::min(g_maxdet, N);
   const float* h = g_head.data();
   std::vector<float> best(N, -1e30f);
   for (int c = 0; c < nc; ++c) {
@@ -163,7 +174,7 @@ std::vector<Det> post_end2end() {
     const int a = idx[ci[j] / nc];
     const float s = cand[ci[j]];
     if (s < g_conf) break;  // sorted: the rest are lower (display threshold, not part of the top-k)
-    d.push_back({h[a], h[(size_t)N + a], h[(size_t)2 * N + a], h[(size_t)3 * N + a], s, ci[j] % nc});
+    d.push_back({h[a], h[(size_t)N + a], h[(size_t)2 * N + a], h[(size_t)3 * N + a], s, ci[j] % nc, a});
   }
   return d;
 }
@@ -176,7 +187,7 @@ float iou(const Det& a, const Det& b) {
 }
 
 std::vector<Det> post_nms() {
-  const int nc = g_ch - 4, N = g_n;
+  const int nc = g_nc, N = g_n;
   const float* h = g_head.data();
   std::vector<Det> cand;
   for (int c = 0; c < nc; ++c) {
@@ -184,7 +195,7 @@ std::vector<Det> post_nms() {
     for (int a = 0; a < N; ++a)
       if (row[a] > g_conf) {
         const float cx = h[a], cy = h[(size_t)N + a], w = h[(size_t)2 * N + a] * 0.5f, hh = h[(size_t)3 * N + a] * 0.5f;
-        cand.push_back({cx - w, cy - hh, cx + w, cy + hh, row[a], c});
+        cand.push_back({cx - w, cy - hh, cx + w, cy + hh, row[a], c, a});
       }
   }
   std::stable_sort(cand.begin(), cand.end(), [](const Det& a, const Det& b) { return a.s > b.s; });
@@ -220,8 +231,48 @@ std::vector<Det> post_detr(int w, int h) {
   return d;
 }
 
-// Detections back into the upright frame's pixel coordinates (the display bitmap: fw x fh).
-int emit(const Fit& f, float* times, double t0, JNIEnv* e, jfloatArray jb, jintArray jl, jfloatArray js) {
+// A -seg detection's mask as side x side probabilities over its box (row-major, box-relative): the
+// nm prototypes are combined with its coefficients only over the prototype cells the box covers,
+// then sampled bilinearly (cell centres) at the grid points and passed through the sigmoid.
+void seg_mask(const Det& d, int side, float* out) {
+  const float sx = (float)g_pw / S, sy = (float)g_ph / S;  // input pixels -> prototype cells (1/4)
+  const float bx1 = d.x1 * sx, by1 = d.y1 * sy, bx2 = d.x2 * sx, by2 = d.y2 * sy;
+  const int x0 = std::max(0, (int)std::floor(bx1 - 0.5f)), x1 = std::min(g_pw - 1, (int)std::ceil(bx2 - 0.5f));
+  const int y0 = std::max(0, (int)std::floor(by1 - 0.5f)), y1 = std::min(g_ph - 1, (int)std::ceil(by2 - 0.5f));
+  if (x1 < x0 || y1 < y0) {
+    std::fill(out, out + (size_t)side * side, 0.f);
+    return;
+  }
+  const int rw = x1 - x0 + 1, rh = y1 - y0 + 1;
+  std::vector<float> m((size_t)rw * rh, 0.f);
+  for (int k = 0; k < g_nm; ++k) {
+    const float c = g_head[(size_t)(4 + g_nc + k) * g_n + d.a];
+    const float* P = g_proto.data() + (size_t)k * g_ph * g_pw;
+    for (int y = 0; y < rh; ++y) {
+      const float* row = P + (size_t)(y0 + y) * g_pw + x0;
+      float* o = m.data() + (size_t)y * rw;
+      for (int x = 0; x < rw; ++x) o[x] += c * row[x];
+    }
+  }
+  for (int v = 0; v < side; ++v) {
+    const float fy = std::min((float)(rh - 1), std::max(0.f, by1 + (v + 0.5f) * (by2 - by1) / side - 0.5f - y0));
+    const int iy = std::min(rh - 2, (int)fy) < 0 ? 0 : std::min(rh - 2, (int)fy);
+    const float wy = rh > 1 ? fy - iy : 0.f;
+    for (int u = 0; u < side; ++u) {
+      const float fx = std::min((float)(rw - 1), std::max(0.f, bx1 + (u + 0.5f) * (bx2 - bx1) / side - 0.5f - x0));
+      const int ix = std::min(rw - 2, (int)fx) < 0 ? 0 : std::min(rw - 2, (int)fx);
+      const float wx = rw > 1 ? fx - ix : 0.f;
+      auto at = [&](int y, int x) { return m[(size_t)std::min(y, rh - 1) * rw + std::min(x, rw - 1)]; };
+      const float l = (1 - wy) * ((1 - wx) * at(iy, ix) + wx * at(iy, ix + 1)) + wy * ((1 - wx) * at(iy + 1, ix) + wx * at(iy + 1, ix + 1));
+      out[(size_t)v * side + u] = 1.f / (1.f + std::exp(-l));
+    }
+  }
+}
+
+// Detections back into the upright frame's pixel coordinates (the display bitmap: fw x fh), and
+// for the -seg models their masks (jm: side x side per detection; empty = none).
+int emit(const Fit& f, float* times, double t0, JNIEnv* e, jfloatArray jb, jintArray jl, jfloatArray js,
+         jfloatArray jm, int side) {
   const double t2 = now_ms();
   std::vector<Det> d = g_detr ? post_detr(f.fw, f.fh) : g_post == "nms" ? post_nms() : post_end2end();
   const int cap = std::min<int>(e->GetArrayLength(js), (int)d.size());
@@ -238,6 +289,13 @@ int emit(const Fit& f, float* times, double t0, JNIEnv* e, jfloatArray jb, jintA
   e->SetFloatArrayRegion(jb, 0, 4 * cap, b.data());
   e->SetFloatArrayRegion(js, 0, cap, s.data());
   e->SetIntArrayRegion(jl, 0, cap, l.data());
+  const int per = side * side;
+  if (g_seg && jm && per > 0 && e->GetArrayLength(jm) >= (jsize)cap * per) {
+    std::vector<float> m((size_t)cap * per);
+    for (int i = 0; i < cap; ++i)
+      if (d[i].s >= g_conf) seg_mask(d[i], side, m.data() + (size_t)i * per);  // shown ones only
+    e->SetFloatArrayRegion(jm, 0, cap * per, m.data());
+  }
   const double t3 = now_ms();
   times[3] = (float)(t3 - t2);
   times[0] = (float)(t3 - t0);
@@ -251,6 +309,7 @@ void init(const std::string& dir, const std::string& lib_dir, const std::string&
                                    {"conf", rf ? "0.5" : "0.25"}});  // RF-DETR predict()'s default 0.5
   g_post = o["post"];
   g_detr = g_post == "detr";
+  g_seg = false;
   g_conf = std::stof(o["conf"]);
   g_htp.init(lib_dir, "yolo");
   g_sess.reset();  // one model at a time: the previous HTP session goes before the next loads
@@ -282,12 +341,28 @@ void init(const std::string& dir, const std::string& lib_dir, const std::string&
   }
   g_S = S;
   g_q.assign((size_t)S * S * 3, 0);
-  auto sh = g_sess->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-  if (sh.size() != 3) throw std::runtime_error("expected a (1, 4+nc, N) head output");
-  g_ch = (int)sh[1];
-  g_n = (int)sh[2];
+  g_nm = 0;
+  for (size_t i = 0; i < g_sess->GetOutputCount(); ++i) {  // the head (rank 3) and, for -seg, the prototypes (rank 4)
+    auto shp = g_sess->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape();
+    std::string nm = g_sess->GetOutputNameAllocated(i, a).get();
+    if (shp.size() == 3) {
+      g_out = nm;
+      g_ch = (int)shp[1];
+      g_n = (int)shp[2];
+    } else if (shp.size() == 4) {
+      g_seg = true;
+      g_out_proto = nm;
+      g_nm = (int)shp[1];
+      g_ph = (int)shp[2];
+      g_pw = (int)shp[3];
+    }
+  }
+  if (!g_ch) throw std::runtime_error("expected a (1, 4+nc[+nm], N) head output");
+  g_nc = g_ch - 4 - g_nm;
   g_head.assign((size_t)g_ch * g_n, 0.f);
-  LOGI("%s: %s -> %s (1,%d,%d), post %s", model.c_str(), g_in.c_str(), g_out.c_str(), g_ch, g_n, g_post.c_str());
+  g_proto.assign(g_seg ? (size_t)g_nm * g_ph * g_pw : 0, 0.f);
+  LOGI("%s: %s -> %s (1,%d,%d)%s, post %s", model.c_str(), g_in.c_str(), g_out.c_str(), g_ch, g_n,
+       g_seg ? (" + " + g_out_proto + " prototypes (" + std::to_string(g_nm) + " masks)").c_str() : "", g_post.c_str());
 }
 }  // namespace
 
@@ -323,7 +398,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
 // error (nativeLastError), boxes in the display bitmap's pixels.
 extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativeRunYuv(
     JNIEnv* e, jclass, jobject jy, jobject ju, jobject jv, jint ys, jint uvs, jint uvps, jint w, jint h, jint rot,
-    jobject disp, jfloatArray jb, jintArray jl, jfloatArray js, jfloatArray jt) {
+    jobject disp, jfloatArray jb, jintArray jl, jfloatArray js, jfloatArray jm, jint side, jfloatArray jt) {
   std::lock_guard<std::mutex> l(g_mu);
   const double t0 = now_ms();
   float times[4] = {0, 0, 0, 0};
@@ -355,7 +430,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
       infer(times, t0);
       Fit fd = f;
       fd.left = fd.top = 0;  // no letterbox: boxes are already in the display frame's pixels
-      int n = emit(fd, times, t0, e, jb, jl, js);
+      int n = emit(fd, times, t0, e, jb, jl, js, jm, side);
       e->SetFloatArrayRegion(jt, 0, 4, times);
       return n;
     }
@@ -377,7 +452,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
     });
     if (dp) AndroidBitmap_unlockPixels(e, disp);
     infer(times, t0);
-    int n = emit(f, times, t0, e, jb, jl, js);
+    int n = emit(f, times, t0, e, jb, jl, js, jm, side);
     e->SetFloatArrayRegion(jt, 0, 4, times);
     return n;
   } catch (const std::exception& ex) {
@@ -390,7 +465,8 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
 // centered into the letterbox. Boxes come back in the bitmap's pixels.
 extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativeRun(JNIEnv* e, jclass, jobject bmp,
                                                                                     jfloatArray jb, jintArray jl,
-                                                                                    jfloatArray js, jfloatArray jt) {
+                                                                                    jfloatArray js, jfloatArray jm,
+                                                                                    jint side, jfloatArray jt) {
   std::lock_guard<std::mutex> l(g_mu);
   const double t0 = now_ms();
   float times[4] = {0, 0, 0, 0};
@@ -410,7 +486,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
       stretch_into_input(px, f.fw, f.fh, 4, bi.stride);
       AndroidBitmap_unlockPixels(e, bmp);
       infer(times, t0);
-      int n = emit(f, times, t0, e, jb, jl, js);
+      int n = emit(f, times, t0, e, jb, jl, js, jm, side);
       e->SetFloatArrayRegion(jt, 0, 4, times);
       return n;
     }
@@ -429,7 +505,7 @@ extern "C" JNIEXPORT jint JNICALL Java_org_onnxsim_maskrcnndemo_YoloEngine_nativ
     }
     AndroidBitmap_unlockPixels(e, bmp);
     infer(times, t0);
-    int n = emit(f, times, t0, e, jb, jl, js);
+    int n = emit(f, times, t0, e, jb, jl, js, jm, side);
     e->SetFloatArrayRegion(jt, 0, 4, times);
     return n;
   } catch (const std::exception& ex) {
