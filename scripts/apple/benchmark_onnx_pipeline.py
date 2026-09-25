@@ -461,7 +461,7 @@ def main() -> None:
     parser.add_argument(
         "--compute-units",
         choices=["ALL", "CPU_AND_GPU", "CPU_AND_NE"],
-        default="CPU_AND_NE",
+        default="ALL",
     )
     parser.add_argument(
         "--compute-precision",

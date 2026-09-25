@@ -116,10 +116,13 @@ python scripts/apple/benchmark_onnx_pipeline.py pipeline.json \
 ```
 
 Each stage is reported against ONNX Runtime CPU for Core ML, eager tinygrad
-Metal, and tinygrad Metal JIT. The selected per-stage backends are then timed
-end to end, including tensor handoffs. Set `input_connections` for inputs that
-are shared by multiple stages but are not produced by an earlier stage (for
-example, projection LUTs). Set `fuse` to an object such as
+Metal, and tinygrad Metal JIT. The staged benchmark defaults Core ML to
+`ALL`, allowing its CPU, GPU, or Neural Engine placement logic to choose per
+operation; pass `--compute-units CPU_AND_NE` for an ANE-only comparison. The
+selected per-stage backends are then timed end to end, including tensor
+handoffs. Set
+`input_connections` for inputs that are shared by multiple stages but are not
+produced by an earlier stage (for example, projection LUTs). Set `fuse` to an object such as
 `{"stages": ["backbone", "head"], "backend": "coreml"}` to additionally measure
 one merged ONNX graph; the original per-stage and unfused end-to-end results
 remain in the report. The fused graph is written beside the JSON output.
