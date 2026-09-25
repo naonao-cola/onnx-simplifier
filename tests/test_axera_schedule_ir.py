@@ -53,6 +53,9 @@ def test_schedule_ir_records_measured_fused_kernel():
             "gather_reshape_matmul_transpose_add",
         ),
     )
+    assert ir.dependencies == ()
+    assert ir.inputs[0].nbytes == 1 * 1 * 4 * 16 * 4
+    assert ir.outputs[0].nbytes == 1 * 1 * 6 * 8 * 4
 
 
 def test_schedule_ir_writes_deterministic_json(tmp_path):

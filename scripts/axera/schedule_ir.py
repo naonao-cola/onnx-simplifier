@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Mapping
+from math import prod
 
 import graph_generator
 import onnx
@@ -23,6 +24,7 @@ class BufferSpec:
     shape: tuple[int, ...]
     elem_type: int
     kind: str
+    nbytes: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,6 +41,7 @@ class ScheduleIR:
     inputs: tuple[BufferSpec, ...]
     outputs: tuple[BufferSpec, ...]
     kernels: tuple[KernelSpec, ...]
+    dependencies: tuple[tuple[str, str], ...]
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -50,6 +53,14 @@ def _shape(value: onnx.ValueInfoProto) -> tuple[int, ...]:
     if not shape or any(dim <= 0 for dim in shape):
         raise ValueError(f"schedule requires a static shape for {value.name!r}")
     return shape
+
+
+def _nbytes(shape: tuple[int, ...], elem_type: int) -> int:
+    try:
+        dtype = onnx.helper.tensor_dtype_to_np_dtype(elem_type)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"schedule has unsupported tensor type {elem_type}") from error
+    return prod(shape) * dtype.itemsize
 
 
 def _values(model: onnx.ModelProto) -> Mapping[str, onnx.ValueInfoProto]:
@@ -72,6 +83,7 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
             _shape(value),
             value.type.tensor_type.elem_type,
             "input" if value.name in input_names else "output",
+            _nbytes(_shape(value), value.type.tensor_type.elem_type),
         )
         for value in values.values()
         if value.name in io_names
@@ -88,10 +100,29 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
     )
     if not kernels:
         raise ValueError("schedule contains no executable kernels")
+    known_buffers = set(buffers)
+    produced: dict[str, str] = {}
+    dependencies: list[tuple[str, str]] = []
+    for kernel in kernels:
+        if kernel.output in produced:
+            raise ValueError(f"schedule has multiple producers for {kernel.output!r}")
+        for input_name in kernel.inputs:
+            if input_name not in known_buffers and input_name not in produced:
+                raise ValueError(
+                    f"kernel {kernel.name!r} uses unknown buffer {input_name!r}"
+                )
+            producer = produced.get(input_name)
+            if producer is not None:
+                dependencies.append((producer, kernel.name))
+        produced[kernel.output] = kernel.name
+    for output in model.graph.output:
+        if output.name not in produced and output.name not in input_names:
+            raise ValueError(f"schedule output {output.name!r} has no producer")
     return ScheduleIR(
         tuple(buffers[item.name] for item in model.graph.input),
         tuple(buffers[item.name] for item in model.graph.output),
         kernels,
+        tuple(dependencies),
     )
 
 
