@@ -23,8 +23,20 @@ def _schedule():
         "outputs": [{"name": "y", "shape": [1, 4], "elem_type": 1, "nbytes": 16}],
         "kernels": [{"name": "kernel_0"}],
         "allocations": [
-            {"name": "x", "offset": 0, "nbytes": 16},
-            {"name": "y", "offset": 64, "nbytes": 16},
+            {
+                "name": "x",
+                "offset": 0,
+                "nbytes": 16,
+                "first_kernel": 0,
+                "last_kernel": 0,
+            },
+            {
+                "name": "y",
+                "offset": 64,
+                "nbytes": 16,
+                "first_kernel": 0,
+                "last_kernel": 0,
+            },
         ],
         "memory_size": 128,
         "schema_version": 1,
@@ -46,4 +58,11 @@ def test_schedule_validation_rejects_out_of_bounds_allocation():
     schedule = _schedule()
     schedule["allocations"][1]["offset"] = 128
     with pytest.raises(axcl_session.DeviceError, match="outside"):
+        axcl_session._validate_schedule(_model(), schedule)
+
+
+def test_schedule_validation_rejects_live_allocation_overlap():
+    schedule = _schedule()
+    schedule["allocations"][1]["offset"] = 0
+    with pytest.raises(axcl_session.DeviceError, match="overlap"):
         axcl_session._validate_schedule(_model(), schedule)

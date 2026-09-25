@@ -93,11 +93,14 @@ def _validate_schedule(model: Model, schedule: dict) -> None:
     if not isinstance(allocations, list):
         raise DeviceError("schedule has no allocation list")
     allocation_by_name = {}
+    allocation_ranges = []
     for allocation in allocations:
         try:
             name = allocation["name"]
             offset = int(allocation["offset"])
             nbytes = int(allocation["nbytes"])
+            first_kernel = int(allocation["first_kernel"])
+            last_kernel = int(allocation["last_kernel"])
         except (KeyError, TypeError, ValueError) as error:
             raise DeviceError("schedule contains a malformed allocation") from error
         if (
@@ -105,10 +108,51 @@ def _validate_schedule(model: Model, schedule: dict) -> None:
             or offset < 0
             or nbytes <= 0
             or offset % 64
+            or first_kernel < 0
+            or first_kernel > last_kernel
             or offset + nbytes > memory_size
         ):
-            raise DeviceError(f"schedule allocation is outside its memory plan: {allocation}")
+            raise DeviceError(
+                f"schedule allocation is outside its memory plan: {allocation}"
+            )
+        if name in allocation_by_name:
+            raise DeviceError(f"schedule has duplicate allocation {name!r}")
         allocation_by_name[name] = allocation
+        allocation_ranges.append(
+            (name, offset, offset + nbytes, first_kernel, last_kernel)
+        )
+    kernels = schedule.get("kernels")
+    if not isinstance(kernels, list) or not kernels:
+        raise DeviceError("schedule has no executable kernels")
+    if any(
+        first >= len(kernels) or last >= len(kernels)
+        for _, _, _, first, last in allocation_ranges
+    ):
+        raise DeviceError("schedule allocation lifetime exceeds kernel list")
+    for index, left in enumerate(allocation_ranges):
+        for right in allocation_ranges[index + 1 :]:
+            live = left[3] <= right[4] and right[3] <= left[4]
+            overlaps = left[1] < right[2] and right[1] < left[2]
+            if live and overlaps:
+                raise DeviceError(
+                    f"schedule allocations overlap while live: {left[0]!r}, {right[0]!r}"
+                )
+    kernel_names = [kernel.get("name") for kernel in kernels]
+    if any(not isinstance(name, str) or not name for name in kernel_names):
+        raise DeviceError("schedule contains a malformed kernel")
+    kernel_index = {name: index for index, name in enumerate(kernel_names)}
+    dependencies = schedule.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise DeviceError("schedule dependencies must be a list")
+    for dependency in dependencies:
+        if (
+            not isinstance(dependency, list | tuple)
+            or len(dependency) != 2
+            or dependency[0] not in kernel_index
+            or dependency[1] not in kernel_index
+            or kernel_index[dependency[0]] >= kernel_index[dependency[1]]
+        ):
+            raise DeviceError(f"schedule contains an invalid dependency {dependency!r}")
     for kind, specs in (("inputs", model.inputs), ("outputs", model.outputs)):
         entries = schedule.get(kind)
         if not isinstance(entries, list) or len(entries) != len(specs):
@@ -130,9 +174,9 @@ def _validate_schedule(model: Model, schedule: dict) -> None:
                 )
             allocation = allocation_by_name.get(spec.name)
             if allocation is None:
-                raise DeviceError(f"schedule has no allocation for model {kind[:-1]} {spec.name!r}")
-    if not isinstance(schedule.get("kernels"), list) or not schedule["kernels"]:
-        raise DeviceError("schedule has no executable kernels")
+                raise DeviceError(
+                    f"schedule has no allocation for model {kind[:-1]} {spec.name!r}"
+                )
     if memory_size <= 0:
         raise DeviceError("schedule has no positive memory plan")
 
