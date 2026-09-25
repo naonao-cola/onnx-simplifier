@@ -21,7 +21,9 @@ def _schedule():
     return {
         "inputs": [{"name": "x", "shape": [1, 4], "elem_type": 1, "nbytes": 16}],
         "outputs": [{"name": "y", "shape": [1, 4], "elem_type": 1, "nbytes": 16}],
-        "kernels": [{"name": "kernel_0"}],
+        "kernels": [
+            {"name": "kernel_0", "inputs": ["x"], "output": "y"}
+        ],
         "allocations": [
             {
                 "name": "x",
@@ -65,4 +67,20 @@ def test_schedule_validation_rejects_live_allocation_overlap():
     schedule = _schedule()
     schedule["allocations"][1]["offset"] = 0
     with pytest.raises(axcl_session.DeviceError, match="overlap"):
+        axcl_session._validate_schedule(_model(), schedule)
+
+
+def test_schedule_validation_rejects_missing_kernel_buffer_allocation():
+    schedule = _schedule()
+    schedule["kernels"][0]["inputs"] = ["missing"]
+    with pytest.raises(axcl_session.DeviceError, match="kernel buffer"):
+        axcl_session._validate_schedule(_model(), schedule)
+
+
+def test_schedule_validation_rejects_duplicate_kernel_names():
+    schedule = _schedule()
+    schedule["kernels"].append(
+        {"name": "kernel_0", "inputs": ["x"], "output": "y"}
+    )
+    with pytest.raises(axcl_session.DeviceError, match="duplicate kernel"):
         axcl_session._validate_schedule(_model(), schedule)

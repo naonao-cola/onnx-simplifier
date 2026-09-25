@@ -140,6 +140,33 @@ def _validate_schedule(model: Model, schedule: dict) -> None:
     kernel_names = [kernel.get("name") for kernel in kernels]
     if any(not isinstance(name, str) or not name for name in kernel_names):
         raise DeviceError("schedule contains a malformed kernel")
+    if len(set(kernel_names)) != len(kernel_names):
+        raise DeviceError("schedule contains duplicate kernel names")
+    kernel_buffers = set()
+    for kernel in kernels:
+        inputs = kernel.get("inputs")
+        output = kernel.get("output")
+        if (
+            not isinstance(inputs, list | tuple)
+            or not isinstance(output, str)
+            or not output
+            or any(not isinstance(name, str) or not name for name in inputs)
+        ):
+            raise DeviceError(f"schedule contains a malformed kernel {kernel!r}")
+        kernel_buffers.update(inputs)
+        kernel_buffers.add(output)
+    missing_buffers = kernel_buffers - set(allocation_by_name)
+    if missing_buffers:
+        raise DeviceError(
+            "schedule has no allocation for kernel buffer(s): "
+            + ", ".join(sorted(missing_buffers))
+        )
+    unused_buffers = set(allocation_by_name) - kernel_buffers
+    if unused_buffers:
+        raise DeviceError(
+            "schedule contains allocation(s) unused by kernels: "
+            + ", ".join(sorted(unused_buffers))
+        )
     kernel_index = {name: index for index, name in enumerate(kernel_names)}
     dependencies = schedule.get("dependencies", [])
     if not isinstance(dependencies, list):
