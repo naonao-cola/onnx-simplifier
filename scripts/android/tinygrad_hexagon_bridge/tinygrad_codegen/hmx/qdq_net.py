@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "hmx_gemm" / "runner"))
 import qdq_graph  # noqa: E402
 from tinygrad import Tensor, dtypes  # noqa: E402
+from tinygrad.helpers import getenv  # noqa: E402
 from tinygrad.runtime.ops_dsp import hmx_qlinear_add  # noqa: E402
 
 f32 = np.float32
@@ -43,6 +44,19 @@ def canon(g, Ho, Wo, Wg, C, zp, pad, L):
   x = x.pad(((pad, pad), (pad, pad), (0, 0)), value=zp).reshape(-1, C)
   return x.pad(((0, L - x.shape[0]), (0, 0)), value=zp).contiguous()
 
+def into_grid(y:Tensor, H, W, C, zp, L) -> Tensor:
+  """a stride-1 conv's output grid (row stride Wp = W + 2, pixel p = i*Wp + j) written straight into the next padded grid:
+  pixel (i, j) belongs at (i+1)*Wp + (j+1) = p + Wp + 1, so the grid goes in at that offset and its 2 garbage columns per row
+  land on the pad columns; then the ring (and the rows the grid overran into) is rewritten with zp. No copy of the tensor"""
+  Wp, P64 = W + 2, y.shape[0]
+  assert L >= Wp + 1 + P64
+  g = Tensor.empty(L, C, dtype=dtypes.uint8, device=y.device)
+  g[Wp + 1: Wp + 1 + P64].assign(y)
+  v = g[: (H + 2) * Wp].reshape(H + 2, Wp, C)
+  for sl in ((slice(0, 1), slice(0, Wp)), (slice(H + 1, H + 2), slice(0, Wp)), (slice(1, H + 1), slice(0, 1)), (slice(1, H + 1), slice(Wp - 1, Wp))):
+    v[sl].assign(Tensor.full(v[sl].shape, zp, dtype=dtypes.uint8, device=y.device))
+  return g
+
 def window(x:Tensor, Wp, k, s, P64, base, kx=None):
   """(L, C) -> (P64, dy, dx, C): x[base + s*p + dy*Wp + dx], dy < k, dx < kx (default k)"""
   C, kx = x.shape[1], kx or k
@@ -63,6 +77,10 @@ class Net:
       if o["op"] == "conv": need(o["x"], 1 if o["x"] is not self.xin else 3, o["k"], o["s"])
       elif o["op"] == "maxpool": need(o["x"], 1, 3, 2)
       need(o["y"], 1, 1, 1)
+    for o in self.ops:  # a stride-1 conv writes its whole output grid into the next padded grid at offset Wp + 1
+      if o["op"] == "conv" and o["s"] == 1 and o["x"] is not self.xin:
+        y, Wp = o["y"], o["y"].w + 2
+        self.L[y.name] = max(self.L[y.name], Wp + 1 + r64(y.h * Wp))
     for o in self.ops:  # an Add runs over its inputs' whole buffers: all three the same length
       if o["op"] == "add":
         n = max(self.L[o[k].name] for k in ("a", "b", "y"))
@@ -99,9 +117,12 @@ class Net:
         v = window(a.t, a.Wp, k, s, P64, (a.pad - k // 2) * (a.Wp + 1), kx)
         acc = (v.reshape(P64, 1, k, kx, a.C).cast(dtypes.int32) *
                W_.permute(3, 0, 1, 2).reshape(1, N, k, kx, a.C).cast(dtypes.int32)).sum((2, 3, 4)) + B_
-        # materialized on its grid: fused with the crop that follows, tinygrad splits the pixel axis again (no TensorCore)
-        y = ((acc.cast(dtypes.float32) * M_).round() + float(yt.zp)).clip(0, 255).cast(dtypes.uint8).contiguous()
-        vals[yt.name] = Act(canon(y, Ho, Wo, a.Wp, N, yt.zp, 1, self.L[yt.name]), Ho, Wo, N, 1, yt.zp)
+        y = ((acc.cast(dtypes.float32) * M_).round() + float(yt.zp)).clip(0, 255).cast(dtypes.uint8)
+        if s == 1 and a.pad == 1 and getenv("QDQ_INTO_GRID", 1):  # same row stride: straight into the next padded grid
+          vals[yt.name] = Act(into_grid(y, Ho, Wo, N, yt.zp, self.L[yt.name]), Ho, Wo, N, 1, yt.zp)
+        else:
+          # materialized on its grid: fused with the crop that follows, tinygrad splits the pixel axis again (no TensorCore)
+          vals[yt.name] = Act(canon(y.contiguous(), Ho, Wo, a.Wp, N, yt.zp, 1, self.L[yt.name]), Ho, Wo, N, 1, yt.zp)
       elif o["op"] == "add":
         a, b, yt = vals[o["a"].name], vals[o["b"].name], o["y"]
         ra, rb, fixed = qdq_graph.add_consts(o["a"], o["b"], yt)
