@@ -19,6 +19,9 @@
 //                 holds the (1, nm, 160, 160) mask prototypes. Boxes are selected as above; each shown
 //                 detection's mask is sigmoid(coefficients . prototypes) (Ultralytics' process_mask),
 //                 sampled on a side x side grid over its box (the box crop), for the overlay.
+// engine=tinygrad runs the same model as a tinygrad ahead-of-time OpenCL bundle on the Adreno GPU instead of the HTP
+// (../tinygrad_aot: <models>/<model>.tg/{kernels.cl,plan.txt,consts.bin,meta.txt}, same uint8 NHWC input and float
+// outputs, so pre/post-processing are shared); engine=qnn (the default) is the HTP session above.
 // Built into its own libyolo_demo.so, loaded only by YoloActivity (its own process).
 #include <jni.h>
 #include <android/bitmap.h>
@@ -33,11 +36,13 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "htp_session.h"
+#include "tg_cl_runner.h"
 #include "yuv_upright.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "YoloDemo", __VA_ARGS__)
@@ -49,6 +54,13 @@ using demo::now_ms;
 
 demo::Htp g_htp;
 std::unique_ptr<Ort::Session> g_sess;
+// engine=tinygrad: the AOT bundle and its outputs' names and shapes (meta.txt), in bundle output order
+std::unique_ptr<tgcl::Model> g_tg;
+struct TgOut {
+  std::string name;
+  std::vector<int64_t> shape;
+};
+std::vector<TgOut> g_tg_outs;
 std::string g_in, g_out, g_post, g_err;
 std::vector<uint8_t> g_q(S * S * 3);
 std::vector<float> g_head;
@@ -117,6 +129,15 @@ void pad_rows(int top, int fh) {
 // times: 0 total, 1 pre, 2 htp, 3 post
 void infer(float* times, double t0) {
   const double t1 = now_ms();
+  if (g_tg) {  // outputs in bundle order, mapped to the same host buffers the HTP path fills
+    std::vector<void*> outs;
+    for (auto& o : g_tg_outs)
+      outs.push_back(o.name == g_out2 && g_detr ? g_boxes.data() : o.name == g_out ? g_head.data() : g_proto.data());
+    g_tg->run({g_q.data()}, outs);
+    times[1] = (float)(t1 - t0);
+    times[2] = (float)(now_ms() - t1);
+    return;
+  }
   Ort::MemoryInfo mi = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   if (g_detr) {
     int64_t ishape[4] = {1, g_S, g_S, 3};
@@ -302,17 +323,65 @@ int emit(const Fit& f, float* times, double t0, JNIEnv* e, jfloatArray jb, jintA
   return cap;
 }
 
+// engine=tinygrad: load <bundle>, read its input/outputs from meta.txt ("input <name> 1x640x640x3 uchar",
+// "output <name> 1x84x8400 float", ...) and size the same buffers the HTP path uses
+void init_tinygrad(const std::string& bundle, const std::string& cache_dir) {
+  const double t = now_ms();
+  g_tg = std::make_unique<tgcl::Model>();
+  g_tg->load(bundle, cache_dir);
+  g_tg_outs.clear();
+  std::istringstream meta(tgcl::read_file(bundle + "/meta.txt"));
+  std::string kind, name, dims, dt;
+  std::vector<int64_t> in_shape;
+  while (meta >> kind >> name >> dims >> dt) {
+    std::vector<int64_t> shp;
+    std::istringstream ds(dims);
+    for (std::string d; std::getline(ds, d, 'x');) shp.push_back(std::stoll(d));
+    if (kind == "input") g_in = name, in_shape = shp;
+    else g_tg_outs.push_back({name, shp});
+  }
+  if (in_shape.size() != 4 || in_shape[3] != 3) throw std::runtime_error("tinygrad bundle: expected a uint8 NHWC input");
+  g_S = (int)in_shape[1];
+  g_q.assign((size_t)g_S * g_S * 3, 0);
+  g_nm = 0;
+  if (g_detr) {
+    init_cat_map();
+    for (auto& o : g_tg_outs)
+      if (o.name == "logits") g_out = o.name, g_nq = (int)o.shape[1], g_ncls = (int)o.shape[2];
+      else if (o.name == "boxes") g_out2 = o.name;
+    if (!g_nq || g_out2.empty()) throw std::runtime_error("post=detr expects `logits` and `boxes` outputs");
+    g_head.assign((size_t)g_nq * g_ncls, 0.f);
+    g_boxes.assign((size_t)g_nq * 4, 0.f);
+  } else {
+    for (auto& o : g_tg_outs)
+      if (o.shape.size() == 3) g_out = o.name, g_ch = (int)o.shape[1], g_n = (int)o.shape[2];
+      else if (o.shape.size() == 4) g_seg = true, g_out_proto = o.name, g_nm = (int)o.shape[1], g_ph = (int)o.shape[2], g_pw = (int)o.shape[3];
+    if (!g_ch) throw std::runtime_error("expected a (1, 4+nc[+nm], N) head output");
+    g_nc = g_ch - 4 - g_nm;
+    g_head.assign((size_t)g_ch * g_n, 0.f);
+    g_proto.assign(g_seg ? (size_t)g_nm * g_ph * g_pw : 0, 0.f);
+  }
+  LOGI("tinygrad %s: %zu kernel calls, program %.0f ms, load %.0f ms", bundle.c_str(), g_tg->calls.size(), g_tg->build_ms,
+       now_ms() - t);
+}
+
 void init(const std::string& dir, const std::string& lib_dir, const std::string& model, const std::string& opts) {
   const bool rf = model.rfind("rfdetr", 0) == 0;
   auto o = demo::parse_opts(opts, {{"post", rf ? "detr" : model.rfind("yolo26", 0) == 0 ? "end2end" : "nms"},
                                    {"htp_performance_mode", "burst"},
+                                   {"engine", "qnn"},
                                    {"conf", rf ? "0.5" : "0.25"}});  // RF-DETR predict()'s default 0.5
   g_post = o["post"];
   g_detr = g_post == "detr";
   g_seg = false;
   g_conf = std::stof(o["conf"]);
+  g_sess.reset();  // one model at a time: the previous session goes before the next loads
+  g_tg.reset();
+  if (o["engine"] == "tinygrad") {
+    init_tinygrad(dir + "/" + model + ".tg", dir);
+    return;
+  }
   g_htp.init(lib_dir, "yolo");
-  g_sess.reset();  // one model at a time: the previous HTP session goes before the next loads
   g_sess = g_htp.session(dir, model, o["htp_performance_mode"], "YoloDemo");
   Ort::AllocatorWithDefaultOptions a;
   g_in = g_sess->GetInputNameAllocated(0, a).get();
