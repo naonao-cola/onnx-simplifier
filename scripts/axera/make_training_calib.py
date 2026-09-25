@@ -184,6 +184,17 @@ def make_work_dir(
                     arr = np.array(
                         [1e-4 * (1.0 + 1e-3 * rng.standard_normal())], dtype=np.float32
                     )
+                elif inp.name == "grad_seed":
+                    # The normal runtime seed is one.  Keep the default
+                    # calibration centred there instead of treating this
+                    # control scalar as an arbitrary trainable tensor.  A
+                    # caller that deliberately uses loss/gradient scaling
+                    # should pass ``real_data={"grad_seed": [...]}`` with
+                    # the intended range; otherwise AX quantization can pin
+                    # the seed to an unrelated random value.
+                    arr = np.array(
+                        [1.0 + 1e-3 * rng.standard_normal()], dtype=np.float32
+                    )
                 elif inp.name == x_name:
                     arr = (rng.standard_normal(dims) * x_scale).astype(np.float32)
                 else:

@@ -34,7 +34,14 @@ def _initial_state(forward_path: str) -> dict[str, np.ndarray]:
     return {name: initializers[name].copy() for name in builder.TRAIN_PARAMS}
 
 
-def run(model_path: str, forward_path: str, steps: int, lr: float, seed: int) -> None:
+def run(
+    model_path: str,
+    forward_path: str,
+    steps: int,
+    lr: float,
+    seed: int,
+    grad_seed: float,
+) -> None:
     model_onnx = onnx.load(model_path)
     x_shape = next(i for i in model_onnx.graph.input if i.name == "x").type.tensor_type.shape
     batch = x_shape.dim[0].dim_value
@@ -58,7 +65,7 @@ def run(model_path: str, forward_path: str, steps: int, lr: float, seed: int) ->
                     "x": x,
                     "y": y,
                     "lr": np.array([lr], dtype=np.float32),
-                    "grad_seed": np.array([1.0], dtype=np.float32),
+                    "grad_seed": np.array([grad_seed], dtype=np.float32),
                     **state,
                 }
                 return [np.asarray(values[name], dtype=np.float32) for name in input_names]
@@ -100,8 +107,9 @@ def main(argv=None) -> int:
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--grad-seed", type=float, default=1.0)
     args = parser.parse_args(argv)
-    run(args.model, args.forward, args.steps, args.lr, args.seed)
+    run(args.model, args.forward, args.steps, args.lr, args.seed, args.grad_seed)
     return 0
 
 
