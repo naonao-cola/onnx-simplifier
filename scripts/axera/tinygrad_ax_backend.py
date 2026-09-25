@@ -1651,6 +1651,88 @@ def lower_uop_to_onnx(root) -> onnx.ModelProto:
     if matmul_model is not None:
         return matmul_model
 
+    def walk(node):
+        yield node
+        for child in node.src:
+            yield from walk(child)
+
+    reductions = [node for node in walk(root) if node.op is Ops.REDUCE]
+    if len(reductions) == 1 and reductions[0].arg[0] is Ops.ADD:
+        reduction = reductions[0]
+        output_shape = tuple(int(dim) for dim in root.shape)
+        reduction_shape = tuple(int(dim) for dim in reduction.shape)
+        if (
+            len(output_shape) == 4
+            and len(reduction_shape) == 5
+            and reduction_shape[1] == 1
+            and reduction_shape[2:] == output_shape[1:]
+        ):
+            alloc_reshapes = [
+                node
+                for node in walk(reduction)
+                if node.op is Ops.RESHAPE
+                and node.src
+                and node.src[0].op is Ops.ALLOC
+                and len(node.shape) == 4
+            ]
+            batch = output_shape[0]
+            input_candidates = [
+                tuple(int(dim) for dim in node.shape)
+                for node in alloc_reshapes
+                if int(node.shape[0]) == batch
+            ]
+            weight_candidates = [
+                tuple(int(dim) for dim in node.shape)
+                for node in alloc_reshapes
+                if int(node.shape[0]) == output_shape[1]
+            ]
+            if len(input_candidates) == 1 and len(weight_candidates) == 1:
+                input_shape = input_candidates[0]
+                weight_shape = weight_candidates[0]
+                _, _, kernel_h, kernel_w = weight_shape
+                stride = None
+                pad_h = pad_w = None
+                for candidate_stride in range(1, 5):
+                    numer_h = input_shape[2] + 2 * (kernel_h // 2) - kernel_h
+                    numer_w = input_shape[3] + 2 * (kernel_w // 2) - kernel_w
+                    if (
+                        numer_h // candidate_stride + 1 == output_shape[2]
+                        and numer_w // candidate_stride + 1 == output_shape[3]
+                    ):
+                        stride = candidate_stride
+                        pad_h = kernel_h // 2
+                        pad_w = kernel_w // 2
+                        break
+                if stride is not None and str(root.dtype).split(".")[-1] == "float":
+                    graph = onnx.helper.make_graph(
+                        [
+                            onnx.helper.make_node(
+                                "Conv",
+                                ["x", "w"],
+                                ["y"],
+                                strides=[stride, stride],
+                                pads=[pad_h, pad_w, pad_h, pad_w],
+                            )
+                        ],
+                        "tinygrad_uop_conv_ax",
+                        [
+                            onnx.helper.make_tensor_value_info(
+                                "x", onnx.TensorProto.FLOAT, input_shape
+                            ),
+                            onnx.helper.make_tensor_value_info(
+                                "w", onnx.TensorProto.FLOAT, weight_shape
+                            ),
+                        ],
+                        [
+                            onnx.helper.make_tensor_value_info(
+                                "y", onnx.TensorProto.FLOAT, output_shape
+                            )
+                        ],
+                    )
+                    return onnx.helper.make_model(
+                        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+                    )
+
     if root.op is Ops.PERMUTE and tuple(int(axis) for axis in root.arg) == (1, 0):
         source = root.src[0] if root.src else None
         shape = tuple(int(dim) for dim in root.shape)

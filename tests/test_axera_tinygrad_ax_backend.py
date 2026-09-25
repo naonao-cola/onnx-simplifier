@@ -545,6 +545,21 @@ def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
     assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
 
 
+def test_lower_tinygrad_stem_conv_uop_to_onnx():
+    from tinygrad import Tensor
+
+    root = Tensor.empty(16, 3, 224, 224).conv2d(
+        Tensor.empty(64, 3, 7, 7), stride=2, padding=3
+    ).uop
+    lowered = axb.lower_uop_to_onnx(root)
+    assert [node.op_type for node in lowered.graph.node] == ["Conv"]
+    assert [tuple(d.dim_value for d in value.type.tensor_type.shape.dim) for value in lowered.graph.input] == [
+        (16, 3, 224, 224),
+        (64, 3, 7, 7),
+    ]
+    assert {attr.name for attr in lowered.graph.node[0].attribute} == {"strides", "pads"}
+
+
 def test_lower_uop_rejects_unvalidated_pattern():
     from tinygrad import Tensor
 
