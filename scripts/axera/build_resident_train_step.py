@@ -570,6 +570,59 @@ def _fold_constants(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
+def _deduplicate_exact_quantizers(model: onnx.ModelProto) -> int:
+    """Merge equivalent quantize/dequantize computations.
+
+    The key includes every input and serialized attribute, so quantizers with
+    different scales, zero points, axes, or domains are never merged.
+    """
+    producers: dict[tuple, str] = {}
+    replacements: dict[str, str] = {}
+    removed: set[str] = set()
+    for node in model.graph.node:
+        if node.op_type not in {"QuantizeLinear", "DequantizeLinear"}:
+            continue
+        if len(node.output) != 1 or any(not name for name in node.input):
+            continue
+        key = (
+            node.domain,
+            node.op_type,
+            tuple(node.input),
+            tuple(
+                (attribute.name, attribute.SerializeToString())
+                for attribute in sorted(node.attribute, key=lambda item: item.name)
+            ),
+        )
+        canonical = producers.get(key)
+        if canonical is None:
+            producers[key] = node.output[0]
+        else:
+            replacements[node.output[0]] = canonical
+            removed.add(node.output[0])
+
+    if not replacements:
+        return 0
+
+    def resolve(name: str) -> str:
+        while name in replacements:
+            name = replacements[name]
+        return name
+
+    for node in model.graph.node:
+        for index, name in enumerate(node.input):
+            node.input[index] = resolve(name)
+    for output in model.graph.output:
+        output.name = resolve(output.name)
+    kept = [
+        node
+        for node in model.graph.node
+        if not any(name in removed for name in node.output)
+    ]
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+    return len(removed)
+
+
 def build_resident_step(
     forward_and_loss: onnx.ModelProto,
     params: Sequence[str],
@@ -734,6 +787,9 @@ def build_resident_step(
     )
     if not ok:
         raise RuntimeError("post-legalize simplify() failed its own correctness check")
+
+    _deduplicate_exact_quantizers(step_model)
+    onnx.checker.check_model(step_model)
 
     if metric_scale is not None:
         if not math.isfinite(metric_scale) or metric_scale <= 0:

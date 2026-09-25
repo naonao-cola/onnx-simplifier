@@ -69,6 +69,34 @@ def _run(model, feeds, output_names=None):
     return sess.run(output_names, feeds)
 
 
+def test_exact_quantizers_are_shared_only_when_their_domain_matches():
+    scale = _f32(np.array([0.25]), "scale")
+    zero_point = onnx.numpy_helper.from_array(
+        np.array([0], dtype=np.uint8), "zero_point"
+    )
+    graph = onnx.helper.make_graph(
+        [
+            onnx.helper.make_node(
+                "QuantizeLinear", ["x", "scale", "zero_point"], ["qx0"]
+            ),
+            onnx.helper.make_node(
+                "QuantizeLinear", ["x", "scale", "zero_point"], ["qx1"]
+            ),
+            onnx.helper.make_node("Add", ["qx0", "qx1"], ["y"]),
+        ],
+        "quant_dedup",
+        [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 4])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.UINT8, [1, 4])],
+        [scale, zero_point],
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+    assert brts._deduplicate_exact_quantizers(model) == 1
+    assert [node.output[0] for node in model.graph.node] == ["qx0", "y"]
+    assert model.graph.node[-1].input == ["qx0", "qx0"]
+
+
 def test_add_mse_loss_matches_manual_computation():
     forward = _forward_model()
     with_loss = brts.add_mse_loss(forward, "logits", num_classes=10)
