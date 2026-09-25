@@ -37,11 +37,22 @@ class KernelSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class Allocation:
+    name: str
+    offset: int
+    nbytes: int
+    first_kernel: int
+    last_kernel: int
+
+
+@dataclasses.dataclass(frozen=True)
 class ScheduleIR:
     inputs: tuple[BufferSpec, ...]
     outputs: tuple[BufferSpec, ...]
     kernels: tuple[KernelSpec, ...]
     dependencies: tuple[tuple[str, str], ...]
+    allocations: tuple[Allocation, ...]
+    memory_size: int
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -63,6 +74,72 @@ def _nbytes(shape: tuple[int, ...], elem_type: int) -> int:
     return prod(shape) * dtype.itemsize
 
 
+def _align(value: int, alignment: int = 64) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _allocate(
+    buffers: Mapping[str, BufferSpec],
+    kernels: tuple[KernelSpec, ...],
+    input_names: set[str],
+    output_names: set[str],
+) -> tuple[tuple[Allocation, ...], int]:
+    """Assign reusable aligned storage using kernel use lifetimes."""
+    uses = {
+        name: [index for index, kernel in enumerate(kernels) if name in kernel.inputs]
+        for name in buffers
+    }
+    producers = {kernel.output: index for index, kernel in enumerate(kernels)}
+    lifetimes = []
+    for name, buffer in buffers.items():
+        references = uses[name]
+        if name in input_names:
+            first = 0
+        elif name in producers:
+            first = producers[name]
+        else:
+            continue
+        last = max(references or [first])
+        if name in output_names:
+            last = max(last, len(kernels) - 1)
+        lifetimes.append((first, last, name, buffer.nbytes))
+
+    allocations: list[Allocation] = []
+    active: list[Allocation] = []
+    free: list[tuple[int, int]] = []
+    cursor = 0
+    for first, last, name, nbytes in sorted(lifetimes):
+        still_active = []
+        for allocation in active:
+            if allocation.last_kernel < first:
+                free.append((allocation.offset, _align(allocation.nbytes)))
+            else:
+                still_active.append(allocation)
+        active = still_active
+        size = _align(nbytes)
+        free.sort(key=lambda item: (item[1], item[0]))
+        slot = next(
+            (
+                (index, offset, available)
+                for index, (offset, available) in enumerate(free)
+                if available >= size
+            ),
+            None,
+        )
+        if slot is None:
+            offset = _align(cursor)
+            cursor = offset + size
+        else:
+            index, offset, available = slot
+            del free[index]
+            if available > size:
+                free.append((offset + size, available - size))
+        allocation = Allocation(name, offset, nbytes, first, last)
+        allocations.append(allocation)
+        active.append(allocation)
+    return tuple(allocations), _align(cursor)
+
+
 def _values(model: onnx.ModelProto) -> Mapping[str, onnx.ValueInfoProto]:
     return {
         value.name: value
@@ -76,17 +153,21 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
     values = _values(model)
     input_names = {item.name for item in model.graph.input}
     output_names = {item.name for item in model.graph.output}
-    io_names = input_names | output_names
     buffers = {
         value.name: BufferSpec(
             value.name,
             _shape(value),
             value.type.tensor_type.elem_type,
-            "input" if value.name in input_names else "output",
+            (
+                "input"
+                if value.name in input_names
+                else "output"
+                if value.name in output_names
+                else "intermediate"
+            ),
             _nbytes(_shape(value), value.type.tensor_type.elem_type),
         )
         for value in values.values()
-        if value.name in io_names
     }
     kernels = tuple(
         KernelSpec(
@@ -118,11 +199,14 @@ def build(model: onnx.ModelProto) -> ScheduleIR:
     for output in model.graph.output:
         if output.name not in produced and output.name not in input_names:
             raise ValueError(f"schedule output {output.name!r} has no producer")
+    allocations, memory_size = _allocate(buffers, kernels, input_names, output_names)
     return ScheduleIR(
         tuple(buffers[item.name] for item in model.graph.input),
         tuple(buffers[item.name] for item in model.graph.output),
         kernels,
         tuple(dependencies),
+        allocations,
+        memory_size,
     )
 
 

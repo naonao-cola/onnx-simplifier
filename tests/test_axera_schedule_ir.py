@@ -56,6 +56,8 @@ def test_schedule_ir_records_measured_fused_kernel():
     assert ir.dependencies == ()
     assert ir.inputs[0].nbytes == 1 * 1 * 4 * 16 * 4
     assert ir.outputs[0].nbytes == 1 * 1 * 6 * 8 * 4
+    assert ir.memory_size == 256 + 128 + 192 + 192
+    assert [allocation.name for allocation in ir.allocations] == ["b", "w", "x", "y"]
 
 
 def test_schedule_ir_writes_deterministic_json(tmp_path):
