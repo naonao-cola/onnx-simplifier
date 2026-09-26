@@ -120,6 +120,15 @@ def _mil_const_value(model: onnx.ModelProto):
     return np.asarray(prog.functions["main"].outputs[0].val)
 
 
+def _mil_two_outputs(model: onnx.ModelProto):
+    """Like :func:`_mil_const_value` but for a two-output op, reading back each
+    of the graph's declared outputs in order."""
+    prog, _flexible_inputs = coreml_export._build_mil_program(
+        model, *coreml_export._import_mil()
+    )
+    return tuple(np.asarray(o.val) for o in prog.functions["main"].outputs)
+
+
 # ---------------------------------------------------------------------------
 # Basic conversion
 # ---------------------------------------------------------------------------
@@ -696,6 +705,205 @@ def test_dequantize_linear_rejects_unsupported_zero_point_dtype():
     # reinterpreted as another width.
     with pytest.raises(RuntimeError, match="Unsupported tensor dtype int16"):
         coreml_export._as_mil_array(np.array([0], dtype=np.int16))
+
+
+# ---------------------------------------------------------------------------
+# Detection-head ops: TopK / Less / ReduceMin / ReduceProd (Mask R-CNN's
+# proposal NMS and box head), plus explicit refusals for RoiAlign, NonZero and
+# higher-rank ScatterElements.
+# ---------------------------------------------------------------------------
+
+
+def test_topk_lowers_to_native_topk():
+    # MIL's `topk` has the same (values, indices) contract as ONNX TopK, so this
+    # is a 1:1 lowering. Check the wiring (k, axis, order) rather than only the
+    # op name, since a wrong axis or k would still "convert".
+    model = _model(
+        """
+        topk (float[2,10] x) => (float[2,3] values, int64[2,3] indices)
+        <int64[1] k = {3}>
+        {
+            values, indices = TopK <axis=-1> (x, k)
+        }
+        """
+    )
+    func, _ = _build_ops(model)
+    (topk,) = [op for op in func.operations if op.op_type == "topk"]
+    assert topk.inputs["k"].val == 3
+    assert topk.inputs["axis"].val == 1  # -1 resolved against rank 2
+    assert topk.inputs["ascending"].val is False
+    assert tuple(topk.outputs[0].shape) == (2, 3)
+    assert tuple(topk.outputs[1].shape) == (2, 3)
+
+
+def test_topk_rejects_largest_zero():
+    # largest=0 selects the k *smallest*; Core ML's top_k cannot express that
+    # without negating the input, so it must be refused rather than be wrong.
+    model = _model(
+        """
+        topk_small (float[2,10] x) => (float[2,3] v, int64[2,3] i)
+        <int64[1] k = {3}>
+        {
+            v, i = TopK <axis=-1, largest=0> (x, k)
+        }
+        """,
+    )
+    with pytest.raises(RuntimeError, match="largest=0"):
+        _build_ops(model)
+
+
+def test_topk_rejects_unsorted():
+    model = _model(
+        """
+        topk_unsorted (float[2,10] x) => (float[2,3] v, int64[2,3] i)
+        <int64[1] k = {3}>
+        {
+            v, i = TopK <axis=-1, sorted=0> (x, k)
+        }
+        """,
+    )
+    with pytest.raises(RuntimeError, match="sorted=0"):
+        _build_ops(model)
+
+
+def test_roi_align_average_mode_is_refused_with_a_reason():
+    # Mask R-CNN's head emits mode="average". Core ML's crop_resize is
+    # bilinear-only, so this must be refused with an explanation rather than
+    # silently converted to a different (wrong) sampling rule.
+    model = _model(
+        "roi (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
+        '{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, '
+        'spatial_scale=1.0, mode="average"> (x, rois) }',
+    )
+    with pytest.raises(RuntimeError, match="crop_resize is bilinear-only"):
+        _build_ops(model)
+
+
+def test_roi_align_bilinear_mode_is_refused_with_a_reason():
+    # Even the bilinear case is not lowered yet (the rank-5 batch-indexed ROI
+    # layout is still missing), and it should say so rather than fail generically.
+    model = _model(
+        "roi_bl (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
+        '{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, '
+        'spatial_scale=1.0, mode="bilinear"> (x, rois) }',
+    )
+    with pytest.raises(RuntimeError, match="rank-5 batch-indexed"):
+        _build_ops(model)
+
+
+def test_nonzero_is_refused_with_a_reason():
+    # NonZero's output length is the data-dependent nonzero count, which Core
+    # ML's static model I/O cannot express (and MIL has no nonzero op). It must
+    # be refused explicitly, not converted into a fixed-size approximation.
+    model = _model("nz (float[2,3] x) => (int64[2,N] y) { y = NonZero (x) }")
+    with pytest.raises(RuntimeError, match="data-dependent count of nonzero"):
+        _build_ops(model)
+
+
+def test_less_lowers_to_native_comparison():
+    x = numpy_helper.from_array(
+        np.array([1.0, 5.0, 3.0], dtype=np.float32), name="x"
+    )
+    y = numpy_helper.from_array(
+        np.array([2.0, 2.0, 2.0], dtype=np.float32), name="y"
+    )
+    model = _model(
+        "less () => (bool[3] out) { out = Less (x, y) }", initializer=[x, y]
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    (op,) = [o for o in prog.functions["main"].operations if o.op_type == "less"]
+    assert tuple(op.outputs[0].shape) == (3,)
+    np.testing.assert_array_equal(
+        _mil_const_value(model), np.array([True, False, False])
+    )
+
+
+def test_reduce_min_and_prod_match_onnx():
+    x = numpy_helper.from_array(
+        np.array([[[1.0, 5.0], [3.0, 2.0]]], dtype=np.float32), name="x"
+    )
+    model = _model(
+        """
+        red () => (float[1,1,2] mn, float[1,1,2] pr)
+        {
+            mn = ReduceMin <axes=[1]> (x)
+            pr = ReduceProd <axes=[1]> (x)
+        }
+        """,
+        initializer=[x],
+    )
+    onnx.checker.check_model(model)
+    ref_mn, ref_pr = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})
+    mn, pr = _mil_two_outputs(model)
+    np.testing.assert_allclose(mn, ref_mn, rtol=1e-6)
+    np.testing.assert_allclose(pr, ref_pr, rtol=1e-6)
+
+
+def test_scatter_elements_rank1_lowers_to_native_scatter():
+    # Only the rank-1 shape agrees between ONNX ScatterElements (indices of the
+    # same rank as data) and MIL's scatter (a 1-D index vector). ONNX's
+    # reduction="none" maps onto MIL's mode="update"; forwarding the ONNX name
+    # would silently be wrong, so the mapping is checked explicitly.
+    data = numpy_helper.from_array(np.zeros(6, dtype=np.float32), name="data")
+    indices = numpy_helper.from_array(
+        np.array([0, 2, 4], dtype=np.int64), name="indices"
+    )
+    updates = numpy_helper.from_array(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32), name="updates"
+    )
+    model = _model(
+        "sc () => (float[6] out) { out = ScatterElements (data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    (op,) = [o for o in prog.functions["main"].operations if o.op_type == "scatter"]
+    assert op.inputs["mode"].val == "update"
+    assert np.asarray(op.inputs["indices"].val).tolist() == [0, 2, 4]
+    assert tuple(op.outputs[0].shape) == (6,)
+    # MIL's constant folder does not evaluate `scatter`, so the numbers are
+    # checked against ONNX Runtime here and on the Core ML runtime in the
+    # macOS prediction job.
+    ref = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run(None, {})[0]
+    np.testing.assert_allclose(
+        ref, np.array([1.0, 0.0, 2.0, 0.0, 3.0, 0.0], np.float32), rtol=1e-6
+    )
+
+
+def test_scatter_elements_higher_rank_is_refused_with_a_reason():
+    # Mask R-CNN's NMS scatters with 4-D indices. MIL's scatter cannot express
+    # that shape, so it must be refused rather than converted into something that
+    # runs but writes to the wrong positions.
+    data = numpy_helper.from_array(np.zeros((1, 4), dtype=np.float32), name="data")
+    indices = numpy_helper.from_array(
+        np.array([[0, 2]], dtype=np.int64), name="indices"
+    )
+    updates = numpy_helper.from_array(
+        np.array([[[1.0, 2.0]]], dtype=np.float32), name="updates"
+    )
+    model = _model(
+        "sc2 () => (float[1,4] out) "
+        "{ out = ScatterElements <axis=1> (data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    with pytest.raises(RuntimeError, match="1-D index vector"):
+        _build_ops(model)
+
+
+def test_scatter_elements_rejects_unknown_reduction():
+    data = numpy_helper.from_array(np.zeros(4, np.float32), name="data")
+    indices = numpy_helper.from_array(np.array([0], np.int64), name="indices")
+    updates = numpy_helper.from_array(np.array([1.0], np.float32), name="updates")
+    model = _model(
+        'sc () => (float[4] out) { out = ScatterElements <reduction="pow"> '
+        "(data, indices, updates) }",
+        initializer=[data, indices, updates],
+    )
+    with pytest.raises(RuntimeError, match="reduction='pow' is not supported"):
+        _build_ops(model)
 
 
 def test_gemm_alpha_beta_fp16_matches_expected():
