@@ -365,6 +365,7 @@ for _onnx_op, _mil_op in [
     ("Div", "real_div"),
     ("Pow", "pow"),
     ("Equal", "equal"),
+    ("Less", "less"),
     ("LessOrEqual", "less_equal"),
     ("GreaterOrEqual", "greater_equal"),
     ("Greater", "greater"),
@@ -1203,6 +1204,11 @@ def _reduce(mil_name: str):
 _OP_HANDLERS["ReduceMean"] = _reduce("reduce_mean")
 _OP_HANDLERS["ReduceSum"] = _reduce("reduce_sum")
 _OP_HANDLERS["ReduceMax"] = _reduce("reduce_max")
+# MIL's `reduce_min` is a true elementwise minimum reduction over `axes`, the
+# same contract as ONNX ReduceMin, so it needs no lowering of its own. Mask
+# R-CNN's ROI head uses it to clamp a score/size tensor.
+_OP_HANDLERS["ReduceMin"] = _reduce("reduce_min")
+_OP_HANDLERS["ReduceProd"] = _reduce("reduce_prod")
 
 
 @_register("Reshape")
@@ -1519,6 +1525,147 @@ def _op_slice(lowerer, node, ins, attrs):
             name=lowerer.fresh_name(node),
         )
     ]
+
+
+@_register("NonZero")
+def _op_nonzero(lowerer, node, ins, attrs):
+    """NonZero is refused with its reason.
+
+    ONNX NonZero returns a 2-D `[rank, N]` tensor whose length N is the number
+    of nonzero elements -- a data-dependent shape. Every Core ML model input
+    and output has a static shape, and MIL has no nonzero op, so there is no
+    way to express this that does not either invent a fixed N (silently
+    truncating or padding the result) or fail at run time. Mask R-CNN's NMS
+    uses it to compact a boolean keep-mask; that stage has to stay elsewhere.
+    """
+    raise RuntimeError(
+        "NonZero is not supported by the Core ML exporter: its output length is "
+        "the data-dependent count of nonzero elements, and Core ML model I/O "
+        "requires static shapes (MIL has no nonzero op to lower onto). Replace it "
+        "with a fixed-size form, e.g. a top_k over the mask, or keep this stage on "
+        "another backend."
+    )
+
+
+@_register("ScatterElements")
+def _op_scatter_elements(lowerer, node, ins, attrs):
+    """ScatterElements -> MIL `scatter`, but only for the shape ONNX and MIL
+    actually agree on.
+
+    MIL's `scatter` takes a **1-D** `indices` vector and writes `updates[i]`
+    into `data[..., indices[i], ...]`. ONNX ScatterElements instead requires
+    `indices` to have the *same rank as data*, writing `updates[..., i, ...]` at
+    every `indices[..., i, ...]` position. The two coincide only when `data` is
+    rank 1; for anything higher-rank (which is what detectors emit -- Mask
+    R-CNN's NMS uses 4-D indices) the shapes do not line up, so forwarding would
+    silently change the result and is refused with the reason instead.
+    """
+    data, indices, updates = ins[0], ins[1], ins[2]
+    axis = int(attrs.get("axis", 0))
+    if axis < 0:
+        axis += data.rank
+    if data.rank != 1 or int(indices.rank) != 1:
+        raise RuntimeError(
+            f"ScatterElements with rank-{data.rank} data and rank-"
+            f"{int(indices.rank)} indices is not supported: Core ML's scatter "
+            "indexes with a 1-D index vector, while ONNX ScatterElements requires "
+            "indices of the same rank as data. Only the rank-1 case is lowered."
+        )
+    # ONNX spells this `reduction` ("none" = plain overwrite); MIL calls the
+    # same thing `mode` and spells the plain overwrite "update".
+    reduction = attrs.get("reduction", b"none")
+    if isinstance(reduction, bytes):
+        reduction = reduction.decode()
+    mil_mode = {
+        "none": "update",
+        "add": "add",
+        "mul": "mul",
+        "max": "max",
+        "min": "min",
+    }
+    if reduction not in mil_mode:
+        raise RuntimeError(
+            f"ScatterElements reduction={reduction!r} is not supported (supported: "
+            + ", ".join(sorted(mil_mode))
+        )
+    return [
+        lowerer.mb.scatter(
+            data=data,
+            indices=indices,
+            updates=updates,
+            axis=axis,
+            mode=mil_mode[reduction],
+            name=lowerer.fresh_name(node),
+        )
+    ]
+
+
+@_register("RoiAlign")
+def _op_roi_align(lowerer, node, ins, attrs):
+    """RoiAlign is refused with the reason, rather than left to a bare
+    "unsupported op".
+
+    Core ML's nearest equivalent, MIL's `crop_resize`, is bilinear-only. ONNX
+    RoiAlign defaults to ``mode="average"`` (pooling over ``sampling_ratio``
+    samples per bin), which is what Mask R-CNN's detector head emits -- and that
+    is *not* bilinear sampling. Mapping `average` onto `crop_resize` would
+    convert and run while quietly producing different numbers, so every mode is
+    refused here, each with the reason it cannot be lowered today.
+    """
+    mode = attrs.get("mode", b"average")
+    if isinstance(mode, bytes):
+        mode = mode.decode()
+    if mode != "bilinear":
+        raise RuntimeError(
+            f"RoiAlign with mode={mode!r} is not supported: Core ML's crop_resize "
+            "is bilinear-only, and mapping ONNX's 'average' pooling onto it would "
+            "silently change the sampled values. Re-export with mode='bilinear', or "
+            "keep this stage on another backend."
+        )
+    raise RuntimeError(
+        "RoiAlign with mode='bilinear' is not supported yet: it still needs "
+        "lowering onto Core ML's crop_resize, including the rank-5 batch-indexed "
+        "ROI layout ONNX does not use."
+    )
+
+
+@_register("TopK")
+def _op_topk(lowerer, node, ins, attrs):
+    """ONNX TopK -> MIL `topk`, which has the same two-output contract.
+
+    Mask R-CNN's NMS head uses this to keep the highest-scoring proposals.
+    ONNX's two non-default attributes are rejected explicitly rather than
+    approximated: `largest=0` (the k *smallest*) would need the input negated
+    and the indices remapped, and `sorted=0` (unsorted values) has no MIL
+    equivalent because `topk` always returns descending order.
+    """
+    if not bool(attrs.get("largest", 1)):
+        raise RuntimeError(
+            "TopK with largest=0 is not supported; Core ML's top_k returns the "
+            "largest k values only (negate the input and invert the comparison "
+            "to select the smallest k)"
+        )
+    if not bool(attrs.get("sorted", 1)):
+        raise RuntimeError(
+            "TopK with sorted=0 is not supported; Core ML's top_k always returns "
+            "its k values in sorted order"
+        )
+    x = ins[0]
+    axis = int(attrs.get("axis", -1))
+    if axis < 0:
+        axis += x.rank
+    k = ins[1] if len(ins) > 1 and ins[1] is not None else None
+    if k is None or k.val is None:
+        raise RuntimeError("TopK needs a compile-time-constant 'k' input")
+    k_val = int(np.asarray(k.val).reshape(-1)[0])
+    values, indices = lowerer.mb.topk(
+        x=x,
+        k=k_val,
+        axis=axis,
+        ascending=False,
+        name=lowerer.fresh_name(node),
+    )
+    return [values, indices]
 
 
 @_register("Gather")
