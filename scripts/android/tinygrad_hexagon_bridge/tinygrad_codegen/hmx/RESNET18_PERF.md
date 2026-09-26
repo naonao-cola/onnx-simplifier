@@ -124,12 +124,19 @@ a whole-graph ~150k pcycles for activation packing, but the stem's A operand alo
 flat copy did. Saving 4.3M pcycles of MACs and paying 46.4M for the gather is a large net
 loss.
 
-**What this says about the lever.** Removing the stem's wasted MACs needs the *pack* to stay
+## What this says about the lever. Removing the stem's wasted MACs needs the *pack* to stay
 flat, not just the MAC count to drop. That means the wasted lanes have to be filled from
 data already contiguous in memory - the hand kernel's crouton layout, where a 3x3 conv is
 `:single` windows over shifted copies of an already-packed 2 KB activation. That is a
 graph-level layout change (the README's own next step), not a re-lane-packing of the same
 grid. The branch was dropped rather than kept behind a flag.
+
+Two further attempts at this are recorded in [RESNET18_STEM_CROUTON.md](./RESNET18_STEM_CROUTON.md),
+which also carries the measurement caveat that matters for any future bisection: dropping the
+fused requant lets the compiler eliminate the accumulator's stores, so a run that measures
+"cost removed" that way is reading dead code. Note also that the HMX MACs are the *small* term
+in these kernels (the 3x3 family spends ~330k of 682k pcycles in requant, ~150k in activation
+packing and ~20k in MACs), so removing MACs alone is attacking the wrong end.
 
 ## The three layer4 convs (23.4%)
 
