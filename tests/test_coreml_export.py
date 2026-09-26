@@ -772,7 +772,7 @@ def test_roi_align_average_mode_is_refused_with_a_reason():
     # silently converted to a different (wrong) sampling rule.
     model = _model(
         "roi (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
-        '{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, '
+        "{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, "
         'spatial_scale=1.0, mode="average"> (x, rois) }',
     )
     with pytest.raises(RuntimeError, match="crop_resize is bilinear-only"):
@@ -784,7 +784,7 @@ def test_roi_align_bilinear_mode_is_refused_with_a_reason():
     # layout is still missing), and it should say so rather than fail generically.
     model = _model(
         "roi_bl (float[1,4,8,8] x, float[2,4] rois) => (float[2,4,7,7] y) "
-        '{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, '
+        "{ y = RoiAlign <output_height=7, output_width=7, sampling_ratio=2, "
         'spatial_scale=1.0, mode="bilinear"> (x, rois) }',
     )
     with pytest.raises(RuntimeError, match="rank-5 batch-indexed"):
@@ -801,15 +801,9 @@ def test_nonzero_is_refused_with_a_reason():
 
 
 def test_less_lowers_to_native_comparison():
-    x = numpy_helper.from_array(
-        np.array([1.0, 5.0, 3.0], dtype=np.float32), name="x"
-    )
-    y = numpy_helper.from_array(
-        np.array([2.0, 2.0, 2.0], dtype=np.float32), name="y"
-    )
-    model = _model(
-        "less () => (bool[3] out) { out = Less (x, y) }", initializer=[x, y]
-    )
+    x = numpy_helper.from_array(np.array([1.0, 5.0, 3.0], dtype=np.float32), name="x")
+    y = numpy_helper.from_array(np.array([2.0, 2.0, 2.0], dtype=np.float32), name="y")
+    model = _model("less () => (bool[3] out) { out = Less (x, y) }", initializer=[x, y])
     prog, _ = coreml_export._build_mil_program(model, *coreml_export._import_mil())
     (op,) = [o for o in prog.functions["main"].operations if o.op_type == "less"]
     assert tuple(op.outputs[0].shape) == (3,)
