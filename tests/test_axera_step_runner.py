@@ -571,6 +571,27 @@ def test_onnx_binary_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path, op):
             {"axes": [0, 2, 3], "keepdims": 0},
             "ReduceSum:16x64x112x112:axes0,2,3:k0",
         ),
+        (
+            "Sqrt",
+            (512, 512, 3, 3),
+            (512, 512, 3, 3),
+            {},
+            "Sqrt:512x512x3x3",
+        ),
+        (
+            "Log",
+            (16, 1000),
+            (16, 1000),
+            {},
+            "Log:16x1000",
+        ),
+        (
+            "Neg",
+            (1, 1),
+            (1, 1),
+            {},
+            "Neg:1x1",
+        ),
     ],
 )
 def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
@@ -607,13 +628,14 @@ def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
     schedule = tmp_path / f"onnx_{op.lower()}_to_uop.schedule.json"
     axmodel = axb.compile_onnx(model, str(schedule), calibration)
     rng = np.random.default_rng(1965)
-    bounds = (
-        (-0.02, 0.02)
-        if op == "ReduceSum"
-        else (0.0, 1.0)
-        if op in ("ReduceMean", "MaxPool")
-        else (-1.0, 1.0)
-    )
+    bounds = {
+        "ReduceSum": (-0.02, 0.02),
+        "ReduceMean": (0.0, 1.0),
+        "MaxPool": (0.0, 1.0),
+        "Sqrt": (0.01, 1.0),
+        "Log": (0.1, 1.0),
+        "Neg": (-0.02, 0.02),
+    }.get(op, (-1.0, 1.0))
     x = rng.uniform(*bounds, input_shape).astype(np.float32)
 
     # AXCL's virtiofs layer can retain the previous m0.axmodel by pathname;
@@ -633,11 +655,20 @@ def test_onnx_misc_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(
         want = windows[:, :, ::2, ::2].max(axis=(-1, -2))
     elif op == "ReduceSum":
         want = x.sum(axis=(0, 2, 3))
+    elif op == "Sqrt":
+        want = np.sqrt(x)
+    elif op == "Log":
+        want = np.log(x)
+    elif op == "Neg":
+        want = -x
     else:
         shifted = x - x.max(axis=1, keepdims=True)
         exp = np.exp(shifted)
         want = exp / exp.sum(axis=1, keepdims=True)
-    np.testing.assert_allclose(got, want, atol=float(meta["scales"]["y"]) * 2.0, rtol=0)
+    tolerance = 4.0 if op == "Sqrt" else 2.0
+    np.testing.assert_allclose(
+        got, want, atol=float(meta["scales"]["y"]) * tolerance, rtol=0
+    )
 
 
 class _EchoSession:
