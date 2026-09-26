@@ -28,8 +28,8 @@ import binary_op_scale_validate as bsv  # noqa: E402
 import elementwise_scale_emit as ew  # noqa: E402
 import emitter  # noqa: E402
 import llm_build_dtype_analysis as lbd  # noqa: E402
-import misc_op_record_emit as misc  # noqa: E402
 import matmul_record_emit as mre  # noqa: E402
+import misc_op_record_emit as misc  # noqa: E402
 import tinygrad_ax_backend as axb  # noqa: E402
 
 _FIX = os.path.join(_AXERA_DIR, "fixtures")
@@ -161,8 +161,16 @@ def test_compiler_request_runs_measured_generator_without_pulsar2(tmp_path):
                 onnx.helper.make_node("Relu", ["r"], ["y"]),
             ],
             "source",
-            [onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 8, 4, 4])],
-            [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1, 8, 16])],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 8, 4, 4]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [1, 1, 8, 16]
+                )
+            ],
             [shape],
         ),
         opset_imports=[onnx.helper.make_opsetid("", 13)],
@@ -185,6 +193,35 @@ def test_lower_and_compile_tinygrad_reshape_relu_uop_without_pulsar2(tmp_path):
     assert [node.op_type for node in lowered.graph.node] == ["Reshape", "Relu"]
     schedule = tmp_path / "uop.schedule.json"
     generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
+    assert [node.op_type for node in generated.graph.node] == ["neu mode"]
+    assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
+
+
+def test_compile_onnx_imports_through_tinygrad_uop_without_pulsar2(tmp_path):
+    shape = numpy_helper.from_array(np.array([1, 1, 8, 16], dtype=np.int64), "shape")
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Reshape", ["x", "shape"], ["r"]),
+                onnx.helper.make_node("Relu", ["r"], ["y"]),
+            ],
+            "onnx_to_uop",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, [1, 8, 4, 4]
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, [1, 1, 8, 16]
+                )
+            ],
+            [shape],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "onnx_to_uop.schedule.json"
+    generated = onnx.load_from_string(axb.compile_onnx(model, str(schedule)))
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reshape_relu"
 
@@ -367,9 +404,11 @@ def test_lower_and_compile_tinygrad_reducesum_uop_with_explicit_calibration(tmp_
 def test_lower_and_compile_tinygrad_maxpool_uop_with_explicit_calibration(tmp_path):
     from tinygrad import Tensor
 
-    root = Tensor.empty(16, 64, 112, 112).max_pool2d(
-        kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)
-    ).uop
+    root = (
+        Tensor.empty(16, 64, 112, 112)
+        .max_pool2d(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+        .uop
+    )
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["MaxPool"]
     _, meta = misc.load_template("MaxPool:16x64x112x112:k3x3:s2x2:p1,1,1,1")
@@ -439,11 +478,7 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     root = Tensor.empty(16, 1000).sum(axis=axis, keepdim=True).uop
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["ReduceSum"]
-    key = (
-        "ReduceSum:16x1000:axes0:k1"
-        if axis == 0
-        else "ReduceSum:16x1000:axes1:k1"
-    )
+    key = "ReduceSum:16x1000:axes0:k1" if axis == 0 else "ReduceSum:16x1000:axes1:k1"
     _, meta = misc.load_template(key)
     schedule = tmp_path / f"reducesum_axis{axis}.schedule.json"
     generated = onnx.load_from_string(
@@ -455,7 +490,13 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "reducesum"
-    assert tuple(generated.graph.output[0].type.tensor_type.shape.dim[i].dim_value for i in range(2)) == output_shape
+    assert (
+        tuple(
+            generated.graph.output[0].type.tensor_type.shape.dim[i].dim_value
+            for i in range(2)
+        )
+        == output_shape
+    )
 
 
 def test_lower_and_compile_tinygrad_transpose_uop_without_pulsar2(tmp_path):
@@ -527,11 +568,16 @@ def test_lower_tinygrad_rank2_matmul_uop_to_onnx():
     root = (Tensor.empty(16, 512) @ Tensor.empty(512, 1000)).uop
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
-    assert [tuple(d.dim_value for d in value.type.tensor_type.shape.dim) for value in lowered.graph.input] == [
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in lowered.graph.input
+    ] == [
         (16, 512),
         (512, 1000),
     ]
-    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == (
+    assert tuple(
+        d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim
+    ) == (
         16,
         1000,
     )
@@ -539,14 +585,25 @@ def test_lower_tinygrad_rank2_matmul_uop_to_onnx():
 
 @pytest.mark.parametrize(
     "a_shape,b_shape,output_shape",
-    [((3, 4), (4, 5), (3, 5)), ((2, 3, 4), (2, 4, 5), (2, 3, 5)), ((2, 3, 4), (4, 5), (2, 3, 5))],
+    [
+        ((3, 4), (4, 5), (3, 5)),
+        ((2, 3, 4), (2, 4, 5), (2, 3, 5)),
+        ((2, 3, 4), (4, 5), (2, 3, 5)),
+    ],
 )
-def test_lower_tinygrad_arbitrary_shape_matmul_uop_to_onnx(a_shape, b_shape, output_shape):
+def test_lower_tinygrad_arbitrary_shape_matmul_uop_to_onnx(
+    a_shape, b_shape, output_shape
+):
     from tinygrad import Tensor
 
-    lowered = axb.lower_uop_to_onnx((Tensor.empty(*a_shape) @ Tensor.empty(*b_shape)).uop)
+    lowered = axb.lower_uop_to_onnx(
+        (Tensor.empty(*a_shape) @ Tensor.empty(*b_shape)).uop
+    )
     assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
-    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+    assert (
+        tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim)
+        == output_shape
+    )
 
 
 def test_lower_tinygrad_batched_bias_matmul_to_matmul_add():
@@ -556,7 +613,9 @@ def test_lower_tinygrad_batched_bias_matmul_to_matmul_add():
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["MatMul", "Add"]
     assert [value.name for value in lowered.graph.input] == ["x", "z", "b"]
-    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == (2, 3, 5)
+    assert tuple(
+        d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim
+    ) == (2, 3, 5)
 
 
 @pytest.mark.parametrize(
@@ -575,7 +634,10 @@ def test_lower_tinygrad_transposed_matmul_views(
     right = Tensor.empty(5, 4).transpose() if transpose_right else Tensor.empty(4, 5)
     lowered = axb.lower_uop_to_onnx((left @ right).uop)
     assert [node.op_type for node in lowered.graph.node] == ["MatMul"]
-    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+    assert (
+        tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim)
+        == output_shape
+    )
 
 
 @pytest.mark.parametrize("op", ["add", "mul", "sub", "div"])
@@ -592,12 +654,15 @@ def test_lower_tinygrad_broadcast_binary_uop_to_onnx(op):
     }[op].uop
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == [op.title()]
-    assert [
-        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
-        for value in lowered.graph.input
-    ] == [(2, 3, 4), (1, 4) if op == "mul" else (4,)] if op in ("add", "mul") else [
-        (2, 3, 4), (2, 1, 4) if op == "sub" else (1,)
-    ]
+    assert (
+        [
+            tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+            for value in lowered.graph.input
+        ]
+        == [(2, 3, 4), (1, 4) if op == "mul" else (4,)]
+        if op in ("add", "mul")
+        else [(2, 3, 4), (2, 1, 4) if op == "sub" else (1,)]
+    )
 
 
 def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
@@ -611,7 +676,9 @@ def test_lower_and_emit_tinygrad_live_matmul_without_pulsar2(tmp_path):
     zero_points = {"x": old[names[0]][1], "z": old[names[1]][1], "y": old[names[2]][1]}
     schedule = tmp_path / "matmul.schedule.json"
     generated = onnx.load_from_string(
-        axb.compile_uop(root, str(schedule), {"scales": scales, "zero_points": zero_points})
+        axb.compile_uop(
+            root, str(schedule), {"scales": scales, "zero_points": zero_points}
+        )
     )
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]
     assert json.loads(schedule.read_text())["kernels"][0]["chain"] == "matmul"
@@ -629,16 +696,24 @@ def test_lower_tinygrad_rank2_gemm_uop_to_onnx():
 def test_lower_tinygrad_stem_conv_uop_to_onnx():
     from tinygrad import Tensor
 
-    root = Tensor.empty(16, 3, 224, 224).conv2d(
-        Tensor.empty(64, 3, 7, 7), stride=2, padding=3
-    ).uop
+    root = (
+        Tensor.empty(16, 3, 224, 224)
+        .conv2d(Tensor.empty(64, 3, 7, 7), stride=2, padding=3)
+        .uop
+    )
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["Conv"]
-    assert [tuple(d.dim_value for d in value.type.tensor_type.shape.dim) for value in lowered.graph.input] == [
+    assert [
+        tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+        for value in lowered.graph.input
+    ] == [
         (16, 3, 224, 224),
         (64, 3, 7, 7),
     ]
-    assert {attr.name for attr in lowered.graph.node[0].attribute} == {"strides", "pads"}
+    assert {attr.name for attr in lowered.graph.node[0].attribute} == {
+        "strides",
+        "pads",
+    }
 
 
 @pytest.mark.parametrize(
@@ -653,27 +728,38 @@ def test_lower_tinygrad_arbitrary_shape_conv_uop_to_onnx(
 ):
     from tinygrad import Tensor
 
-    root = Tensor.empty(*input_shape).conv2d(
-        Tensor.empty(*weight_shape), stride=stride, padding=padding
-    ).uop
+    root = (
+        Tensor.empty(*input_shape)
+        .conv2d(Tensor.empty(*weight_shape), stride=stride, padding=padding)
+        .uop
+    )
     lowered = axb.lower_uop_to_onnx(root)
     node = lowered.graph.node[0]
-    attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
+    attrs = {
+        attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute
+    }
     assert node.op_type == "Conv"
     assert attrs == {"strides": [stride, stride], "pads": [padding] * 4}
-    assert tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim) == output_shape
+    assert (
+        tuple(d.dim_value for d in lowered.graph.output[0].type.tensor_type.shape.dim)
+        == output_shape
+    )
 
 
 @pytest.mark.parametrize("groups", [2, 4])
 def test_lower_tinygrad_grouped_conv_uop_to_onnx(groups):
     from tinygrad import Tensor
 
-    root = Tensor.empty(2, 4, 16, 16).conv2d(
-        Tensor.empty(8, 4 // groups, 3, 3), padding=1, groups=groups
-    ).uop
+    root = (
+        Tensor.empty(2, 4, 16, 16)
+        .conv2d(Tensor.empty(8, 4 // groups, 3, 3), padding=1, groups=groups)
+        .uop
+    )
     lowered = axb.lower_uop_to_onnx(root)
     node = lowered.graph.node[0]
-    attrs = {attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute}
+    attrs = {
+        attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute
+    }
     assert node.op_type == "Conv"
     assert attrs["group"] == groups
     assert attrs["pads"] == [1, 1, 1, 1]
@@ -682,9 +768,11 @@ def test_lower_tinygrad_grouped_conv_uop_to_onnx(groups):
 def test_lower_tinygrad_dilated_conv_uop_to_onnx():
     from tinygrad import Tensor
 
-    root = Tensor.empty(1, 3, 15, 15).conv2d(
-        Tensor.empty(4, 3, 3, 3), padding=2, dilation=2
-    ).uop
+    root = (
+        Tensor.empty(1, 3, 15, 15)
+        .conv2d(Tensor.empty(4, 3, 3, 3), padding=2, dilation=2)
+        .uop
+    )
     lowered = axb.lower_uop_to_onnx(root)
     attrs = {
         attr.name: onnx.helper.get_attribute_value(attr)

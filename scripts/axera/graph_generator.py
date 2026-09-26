@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import os
 from collections.abc import Mapping, Sequence
 
 import binary_op_scale_emit
 import compose_emit
-import misc_op_record_emit
 import matmul_record_emit
+import misc_op_record_emit
 import onnx
 import reshape_emit
 import transpose_real_shapes
@@ -49,6 +50,66 @@ class GraphPlan:
         if len(self.segments) != 1:
             raise ValueError("the current generator only emits one fused segment")
         return self.segments[0].chain
+
+
+def _retarget_schedule_names(
+    schedule: dict, model: onnx.ModelProto, source: onnx.ModelProto
+) -> None:
+    """Make schedule buffer names match a measured model's external names.
+
+    The measured emitters preserve the tensor names from the training-step
+    build.  The schedule, however, is built from the source graph (including
+    ONNX-to-UOp graphs whose inputs are conventionally named ``x``/``y``).
+    Retarget the sidecar by IO position while leaving the model and its MCode
+    untouched.
+    """
+    if len(model.graph.input) != len(source.graph.input) or len(
+        model.graph.output
+    ) != len(source.graph.output):
+        # Calibration-free comparison templates may expose an additional
+        # constant/runtime input that is not present in the source UOp graph.
+        # Their generated sidecar is still useful for inspection, but cannot
+        # be positionally retargeted.
+        return
+    rename = {
+        new.name: old.name
+        for old, new in zip(model.graph.input, source.graph.input)
+        if old.name != new.name
+    }
+    rename.update(
+        {
+            new.name: old.name
+            for old, new in zip(model.graph.output, source.graph.output)
+            if old.name != new.name
+        }
+    )
+
+    def replace(value):
+        if isinstance(value, str):
+            return rename.get(value, value)
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        return value
+
+    retargeted = replace(dict(schedule))
+    for kind, specs in (("inputs", model.graph.input), ("outputs", model.graph.output)):
+        for entry, spec in zip(retargeted.get(kind, ()), specs):
+            entry["name"] = spec.name
+            entry["shape"] = [
+                int(dim.dim_value) for dim in spec.type.tensor_type.shape.dim
+            ]
+            # AXCL reports float32 model IO as runtime type 15, while ONNX
+            # stores it as TensorProto.FLOAT (1).
+            entry["elem_type"] = (
+                15
+                if spec.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+                else int(spec.type.tensor_type.elem_type)
+            )
+            entry["nbytes"] = math.prod(entry["shape"]) * 4
+    schedule.clear()
+    schedule.update(retargeted)
 
 
 def _shape(value) -> tuple[int, ...]:
@@ -127,10 +188,14 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
             raise ValueError("standalone Transpose requires one runtime input named x")
         shape = values.get("x", ())
-        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
         perm = tuple(_attrs(transpose).get("perm", ()))
         if shape != (16, 512) or output_shape != (512, 16) or perm != (1, 0):
-            raise ValueError("standalone Transpose requires the measured [16,512] perm [1,0] form")
+            raise ValueError(
+                "standalone Transpose requires the measured [16,512] perm [1,0] form"
+            )
         return GraphPlan(
             (
                 GraphSegment(
@@ -143,18 +208,29 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         if [item.name for item in model.graph.input] != ["x", "z"]:
             raise ValueError("standalone MatMul requires runtime inputs named x and z")
         input_shapes = tuple(values.get(name, ()) for name in matmul.input)
-        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
         if any(not shape for shape in input_shapes) or not output_shape:
-            raise ValueError("standalone MatMul requires static operand and output shapes")
+            raise ValueError(
+                "standalone MatMul requires static operand and output shapes"
+            )
         if len(input_shapes[0]) < 2 or len(input_shapes[1]) < 2:
             raise ValueError("standalone MatMul requires rank-2-or-higher operands")
         if input_shapes[0][-1] != input_shapes[1][-2]:
-            raise ValueError("standalone MatMul operands have incompatible contraction dimensions")
+            raise ValueError(
+                "standalone MatMul operands have incompatible contraction dimensions"
+            )
         return GraphPlan(
             (
                 GraphSegment(
-                    "matmul", ("x", "z"), model.graph.output[0].name,
-                    input_shapes[0], output_shape, "", input_shapes[1]
+                    "matmul",
+                    ("x", "z"),
+                    model.graph.output[0].name,
+                    input_shapes[0],
+                    output_shape,
+                    "",
+                    input_shapes[1],
                 ),
             )
         )
@@ -166,18 +242,32 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             )
         shape = values.get("x", ())
         if not shape or len(neg.input) != 1 or neg.input[0] != "x":
-            raise ValueError(f"standalone {neg.op_type} requires a static input named x")
+            raise ValueError(
+                f"standalone {neg.op_type} requires a static input named x"
+            )
         if not model.graph.output or values.get(model.graph.output[0].name) != shape:
-            raise ValueError(f"standalone {neg.op_type} output shape must match its input")
+            raise ValueError(
+                f"standalone {neg.op_type} output shape must match its input"
+            )
         return GraphPlan(
-            (GraphSegment(neg.op_type.lower(), ("x",), model.graph.output[0].name, shape, shape),)
+            (
+                GraphSegment(
+                    neg.op_type.lower(),
+                    ("x",),
+                    model.graph.output[0].name,
+                    shape,
+                    shape,
+                ),
+            )
         )
     if len(nodes) == 1 and nodes[0].op_type == "MaxPool":
         max_pool = nodes[0]
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
             raise ValueError("standalone MaxPool requires one runtime input named x")
         shape = values.get("x", ())
-        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
         attrs = _attrs(max_pool)
         if (
             shape != (16, 64, 112, 112)
@@ -187,8 +277,7 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             or tuple(attrs.get("pads", ())) != (1, 1, 1, 1)
         ):
             raise ValueError(
-                "standalone MaxPool requires the measured "
-                "[16,64,112,112] k3/s2/p1 form"
+                "standalone MaxPool requires the measured [16,64,112,112] k3/s2/p1 form"
             )
         return GraphPlan(
             (
@@ -204,7 +293,9 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
     ):
         comparison, cast = nodes
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
-            raise ValueError("standalone comparison cast requires one runtime input named x")
+            raise ValueError(
+                "standalone comparison cast requires one runtime input named x"
+            )
         shape = values.get("x", ())
         if (
             shape not in ((16, 64, 112, 112), (1024, 9, 3136))
@@ -230,23 +321,32 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
             raise ValueError("standalone ReduceSum requires one runtime input named x")
         shape = values.get("x", ())
-        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
         attrs = _attrs(reduce_sum)
         key_by_signature = {
-            ((16, 64, 112, 112), (64,), (0, 2, 3), 0):
-                "ReduceSum:16x64x112x112:axes0,2,3:k0",
-            ((16, 1, 64, 3136), (1, 64), (0, 3), 0):
-                "ReduceSum:16x1x64x3136:axes0,3:k0",
-            ((16, 1, 512, 49), (1, 512), (0, 3), 0):
-                "ReduceSum:16x1x512x49:axes0,3:k0",
-            ((16, 1000), (1, 1000), (0,), 1):
-                "ReduceSum:16x1000:axes0:k1",
-            ((16, 1000), (16, 1), (1,), 1):
-                "ReduceSum:16x1000:axes1:k1",
+            (
+                (16, 64, 112, 112),
+                (64,),
+                (0, 2, 3),
+                0,
+            ): "ReduceSum:16x64x112x112:axes0,2,3:k0",
+            (
+                (16, 1, 64, 3136),
+                (1, 64),
+                (0, 3),
+                0,
+            ): "ReduceSum:16x1x64x3136:axes0,3:k0",
+            ((16, 1, 512, 49), (1, 512), (0, 3), 0): "ReduceSum:16x1x512x49:axes0,3:k0",
+            ((16, 1000), (1, 1000), (0,), 1): "ReduceSum:16x1000:axes0:k1",
+            ((16, 1000), (16, 1), (1,), 1): "ReduceSum:16x1000:axes1:k1",
         }
         axes = tuple(attrs.get("axes", ()))
         keepdims = attrs.get("keepdims")
-        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        dynamic_key = misc_op_record_emit.template_key(
+            "ReduceSum", shape, axes, keepdims
+        )
         key = dynamic_key
         try:
             misc_op_record_emit.load_template(key)
@@ -260,7 +360,11 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         return GraphPlan(
             (
                 GraphSegment(
-                    "reducesum", ("x",), model.graph.output[0].name, shape, output_shape,
+                    "reducesum",
+                    ("x",),
+                    model.graph.output[0].name,
+                    shape,
+                    output_shape,
                     key,
                 ),
             )
@@ -270,7 +374,9 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
         if len(model.graph.input) != 1 or model.graph.input[0].name != "x":
             raise ValueError("standalone ReduceMean requires one runtime input named x")
         shape = values.get("x", ())
-        output_shape = values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        output_shape = (
+            values.get(model.graph.output[0].name, ()) if model.graph.output else ()
+        )
         attrs = _attrs(reduce_mean)
         if (
             shape != (16, 512, 7, 7)
@@ -278,11 +384,17 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             or tuple(attrs.get("axes", ())) != (2, 3)
             or attrs.get("keepdims") != 1
         ):
-            raise ValueError("standalone ReduceMean requires the measured [16,512,7,7] axes [2,3] form")
+            raise ValueError(
+                "standalone ReduceMean requires the measured [16,512,7,7] axes [2,3] form"
+            )
         return GraphPlan(
             (
                 GraphSegment(
-                    "reducemean", ("x",), model.graph.output[0].name, shape, output_shape
+                    "reducemean",
+                    ("x",),
+                    model.graph.output[0].name,
+                    shape,
+                    output_shape,
                 ),
             )
         )
@@ -296,7 +408,8 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
                 f"standalone {add.op_type} generator requires runtime inputs named x and z"
             )
         if len(add.input) != 2 or tuple(values.get(name, ()) for name in add.input) != (
-            values.get("x", ()), values.get("z", ())
+            values.get("x", ()),
+            values.get("z", ()),
         ):
             raise ValueError(
                 f"standalone {add.op_type} inputs must be the graph inputs"
@@ -423,11 +536,15 @@ def generate(
             )
     elif plan.chain == "matmul":
         if calibration is None:
-            raise ValueError("standalone MatMul generation requires explicit calibration")
+            raise ValueError(
+                "standalone MatMul generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("MatMul calibration requires scales and zero_points mappings")
+            raise ValueError(
+                "MatMul calibration requires scales and zero_points mappings"
+            )
         segment = plan.segments[0]
         model = matmul_record_emit.emit_standalone_matmul(
             segment.input_shape,
@@ -438,11 +555,15 @@ def generate(
         onnx.save(model, output_path)
     elif plan.chain == "reducemean":
         if calibration is None:
-            raise ValueError("standalone ReduceMean generation requires explicit calibration")
+            raise ValueError(
+                "standalone ReduceMean generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("ReduceMean calibration requires scales and zero_points mappings")
+            raise ValueError(
+                "ReduceMean calibration requires scales and zero_points mappings"
+            )
         model = misc_op_record_emit.emit_spec(
             "ReduceMean",
             plan.segments[0].input_shape,
@@ -454,17 +575,23 @@ def generate(
         onnx.save(model, output_path)
     elif plan.chain == "reducesum":
         if calibration is None:
-            raise ValueError("standalone ReduceSum generation requires explicit calibration")
+            raise ValueError(
+                "standalone ReduceSum generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("ReduceSum calibration requires scales and zero_points mappings")
+            raise ValueError(
+                "ReduceSum calibration requires scales and zero_points mappings"
+            )
         segment = plan.segments[0]
         attrs = _attrs(model.graph.node[0])
         shape = segment.input_shape
         axes = tuple(attrs.get("axes", ()))
         keepdims = attrs.get("keepdims")
-        dynamic_key = misc_op_record_emit.template_key("ReduceSum", shape, axes, keepdims)
+        dynamic_key = misc_op_record_emit.template_key(
+            "ReduceSum", shape, axes, keepdims
+        )
         if plan.segments[0].position == dynamic_key:
             model = misc_op_record_emit.emit_spec(
                 "ReduceSum",
@@ -481,11 +608,15 @@ def generate(
         onnx.save(model, output_path)
     elif plan.chain == "maxpool":
         if calibration is None:
-            raise ValueError("standalone MaxPool generation requires explicit calibration")
+            raise ValueError(
+                "standalone MaxPool generation requires explicit calibration"
+            )
         scales = calibration.get("scales")
         zero_points = calibration.get("zero_points")
         if not isinstance(scales, Mapping) or not isinstance(zero_points, Mapping):
-            raise ValueError("MaxPool calibration requires scales and zero_points mappings")
+            raise ValueError(
+                "MaxPool calibration requires scales and zero_points mappings"
+            )
         model = misc_op_record_emit.emit_spec(
             "MaxPool",
             plan.segments[0].input_shape,
@@ -556,6 +687,17 @@ def generate(
         compose_emit.emit_gather_in_graph(plan.chain, output_path, indices=indices)
     if not os.path.exists(output_path):
         raise RuntimeError(f"generator did not produce {output_path}")
+    if schedule_path is not None:
+        with open(schedule_path, encoding="utf-8") as stream:
+            schedule = json.load(stream)
+        _retarget_schedule_names(
+            schedule,
+            onnx.load(output_path, load_external_data=False),
+            onnx.load(source_path, load_external_data=False),
+        )
+        with open(schedule_path, "w", encoding="utf-8") as stream:
+            json.dump(schedule, stream, indent=2, sort_keys=True)
+            stream.write("\n")
     return plan
 
 

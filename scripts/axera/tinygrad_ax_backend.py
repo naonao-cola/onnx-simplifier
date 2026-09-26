@@ -1565,6 +1565,23 @@ def build_generated_graph_request(
     return json.dumps(req, sort_keys=True)
 
 
+def build_onnx_uop_request(
+    source_path: str,
+    output_path: str | None = None,
+    schedule_path: str | None = None,
+    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+) -> str:
+    """Build an ``AXCompiler`` request for ONNX -> tinygrad UOp -> mcode."""
+    req = {"kind": "onnx_uop", "source": source_path}
+    if output_path is not None:
+        req["output"] = output_path
+    if schedule_path is not None:
+        req["schedule"] = schedule_path
+    if calibration is not None:
+        req["calibration"] = calibration
+    return json.dumps(req, sort_keys=True)
+
+
 def lower_uop_to_onnx(root) -> onnx.ModelProto:
     """Lower one statically shaped tinygrad UOp pattern to ordinary ONNX.
 
@@ -2457,6 +2474,112 @@ def compile_uop(
             return stream.read()
 
 
+def onnx_to_uop(model_or_path):
+    """Import one static-shape ONNX graph through tinygrad and return its UOp.
+
+    This is deliberately a small bridge rather than a second ONNX importer:
+    tinygrad's ``OnnxRunner`` is the importer, so its normal lowering rules
+    (including the fork's view and broadcast lowering) are the source of
+    truth.  Inputs are symbolic ``Tensor.empty`` values; no input data is
+    realized.  The returned UOp therefore describes the graph and is ready
+    for :func:`compile_uop`.
+
+    The AX mcode path currently emits one output at a time.  Graphs with more
+    than one output, dynamic dimensions, non-float inputs, or missing output
+    names are rejected before tinygrad can silently choose a different
+    program family.
+    """
+    try:
+        from tinygrad import Tensor
+        from tinygrad.nn.onnx import OnnxRunner
+    except ImportError as exc:
+        raise ImportError(
+            "ONNX-to-UOp compilation needs the pinned tinygrad fork"
+        ) from exc
+
+    cleanup = False
+    if isinstance(model_or_path, onnx.ModelProto):
+        model = model_or_path
+        handle = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+        try:
+            handle.write(model.SerializeToString())
+            handle.close()
+        except Exception:
+            handle.close()
+            os.unlink(handle.name)
+            raise
+        model_path = handle.name
+        cleanup = True
+    elif isinstance(model_or_path, (bytes, bytearray, memoryview)):
+        model = onnx.load_model_from_string(bytes(model_or_path))
+        handle = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+        handle.write(model.SerializeToString())
+        handle.close()
+        model_path = handle.name
+        cleanup = True
+    else:
+        model_path = os.fspath(model_or_path)
+        model = onnx.load(model_path, load_external_data=False)
+
+    try:
+        initializer_names = {item.name for item in model.graph.initializer}
+        feeds = {}
+        for value in model.graph.input:
+            if value.name in initializer_names:
+                continue
+            tensor_type = value.type.tensor_type
+            if tensor_type.elem_type != onnx.TensorProto.FLOAT:
+                raise ValueError(
+                    f"ONNX-to-UOp currently supports float32 inputs only: {value.name}"
+                )
+            shape = []
+            for dim in tensor_type.shape.dim:
+                if not dim.HasField("dim_value") or dim.dim_value <= 0:
+                    raise ValueError(
+                        f"ONNX-to-UOp requires static positive shape for {value.name}"
+                    )
+                shape.append(int(dim.dim_value))
+            feeds[value.name] = Tensor.empty(*shape)
+        if len(model.graph.output) != 1:
+            raise ValueError(
+                f"ONNX-to-UOp currently emits one output, got {len(model.graph.output)}"
+            )
+        output_name = model.graph.output[0].name
+        runner = OnnxRunner(model_path)
+        outputs = runner(feeds)
+        try:
+            output = outputs[output_name]
+        except (KeyError, TypeError, IndexError) as exc:
+            raise ValueError(
+                f"tinygrad OnnxRunner did not produce ONNX output {output_name!r}"
+            ) from exc
+        if not hasattr(output, "uop"):
+            raise ValueError("tinygrad OnnxRunner output is not a Tensor")
+        return output.uop
+    finally:
+        if cleanup:
+            os.unlink(model_path)
+
+
+def compile_onnx(
+    model_or_path,
+    schedule_path: str | None = None,
+    calibration: Mapping[str, Mapping[str, float | int]] | None = None,
+) -> bytes:
+    """Compile ONNX through the complete ``ONNX -> tinygrad UOp -> mcode`` path.
+
+    ``model_or_path`` may be an ONNX ``ModelProto``, serialized model bytes,
+    or a filesystem path.  The UOp lowering remains intentionally measured:
+    unsupported shapes and graph forms raise from :func:`compile_uop` rather
+    than falling back to Pulsar2.
+    """
+    return compile_uop(
+        onnx_to_uop(model_or_path),
+        schedule_path=schedule_path,
+        calibration=calibration,
+    )
+
+
 def apply_policy(
     key: TemplateKey, policy: QuantPolicy, node: str | None = None
 ) -> TemplateKey:
@@ -2530,6 +2653,24 @@ def compile_request(
         graph_generator.generate(source, output, schedule_path=schedule)
         with open(output, "rb") as f:
             return f.read()
+    if req.get("kind") == "onnx_uop":
+        source = req.get("source")
+        if not isinstance(source, str):
+            raise ValueError("onnx_uop request missing source path")
+        output = req.get("output")
+        schedule = req.get("schedule")
+        if output is not None and not isinstance(output, str):
+            raise ValueError("onnx_uop output must be a path")
+        if schedule is not None and not isinstance(schedule, str):
+            raise ValueError("onnx_uop schedule must be a path")
+        calibration = req.get("calibration")
+        model_bytes = compile_onnx(
+            source, schedule_path=schedule, calibration=calibration
+        )
+        if output is not None:
+            with open(output, "wb") as f:
+                f.write(model_bytes)
+        return model_bytes
     key = TemplateKey.from_json(req["key"])
     if policy is not None:
         key = apply_policy(key, policy, req.get("node"))
