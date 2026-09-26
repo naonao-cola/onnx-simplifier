@@ -9,7 +9,34 @@ hexagon-sim: 0/25088 mismatches vs ORT's semantics; 23945103 pcycles/inference (
   vs ORT CPU's output: 0/25088 mismatches
 ```
 
-23.9M pcycles matches the handoff's number, so this is the same baseline.
+## Simulator and phone are different numbers - do not conflate them
+
+Everything in the breakdown below is **hexagon-sim pcycles**, not milliseconds. The phone figure
+is separate, and was measured on the same build:
+
+| where | result | vs ORT |
+|---|---|---|
+| hexagon-sim `-mv69 --mhmx 1` | 23,945,103 pcycles/inference | 0/25088 |
+| **Xiaomi 12S (SM8475, V69), real DSP** | **22,306.6 us = 22.31 ms** (10 iters) | **0/25088** |
+
+```
+rc 0 codes power 0 ctx 1946473852 hvx 0 hmx 0 vtcm 4194304 thread 0 heap 16934 KB; 0/25088 mismatches
+22306.6 us/inference (10 iters) PASS
+```
+
+That 22.31 ms is the number to beat, and it is the one the handoff's "22.7 ms" refers to (the
+same build, a different session). The earlier version of this file said the 23.9M pcycles
+"matches the handoff's number", which implied the two were comparable; they are not - one is a
+simulator cycle count and the other is wall-clock on silicon.
+
+**Which to optimise against.** The per-kernel breakdown is only available from the simulator, so
+that is what the shares below are. The simulator is trustworthy for *integer* results - the
+requantization here is integer, and 0/25088 on both is the check that it is. It is **not**
+trustworthy for float: the simulator runs V69's `.sf` vector ops as IEEE fp32 where the hardware
+computes qf32, which is how a requant exact on the simulator came out 94% wrong on the phone.
+Cycle counts are a different matter again - the phone is ~1075x faster than the sim here, and
+the two need not scale the same way per kernel. So treat the shares as a guide to *where to
+look*, and confirm any candidate change on the phone before believing it.
 
 ## Where the cycles go
 
