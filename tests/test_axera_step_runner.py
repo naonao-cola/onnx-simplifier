@@ -305,6 +305,46 @@ def test_onnx_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
 
 
 @needs_device
+def test_onnx_transpose_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
+    """Run a verified real-shape Transpose through the replacement path."""
+    pytest.importorskip("tinygrad")
+    import axcl_session
+    import tinygrad_ax_backend as axb
+
+    input_shape, perm = (16, 1, 256, 49), (0, 1, 3, 2)
+    output_shape = tuple(input_shape[axis] for axis in perm)
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("Transpose", ["x"], ["y"], perm=list(perm))],
+            "onnx_transpose_to_uop_vm",
+            [
+                onnx.helper.make_tensor_value_info(
+                    "x", onnx.TensorProto.FLOAT, input_shape
+                )
+            ],
+            [
+                onnx.helper.make_tensor_value_info(
+                    "y", onnx.TensorProto.FLOAT, output_shape
+                )
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
+    )
+    schedule = tmp_path / "onnx_transpose_to_uop.schedule.json"
+    axmodel = axb.compile_onnx(model, str(schedule))
+    x = np.arange(np.prod(input_shape), dtype=np.float32).reshape(input_shape)
+
+    with axcl_session.AXSession(subdir=f"transpose_{tmp_path.name}") as session:
+        loaded = session.load(axmodel, str(schedule))
+        try:
+            (got,) = session.run(loaded, [x])
+        finally:
+            session.unload(loaded)
+
+    np.testing.assert_array_equal(got, np.transpose(x, perm))
+
+
+@needs_device
 def test_onnx_matmul_to_tinygrad_uop_to_mcode_runs_on_axcl_vm(tmp_path):
     """Run a calibrated standalone MatMul emitted from an imported ONNX UOp."""
     pytest.importorskip("tinygrad")

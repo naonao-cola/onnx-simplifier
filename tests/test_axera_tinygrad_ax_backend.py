@@ -499,12 +499,24 @@ def test_lower_and_compile_tinygrad_classifier_reducesum_uop(
     )
 
 
-def test_lower_and_compile_tinygrad_transpose_uop_without_pulsar2(tmp_path):
+@pytest.mark.parametrize(
+    "input_shape, perm",
+    [
+        ((16, 512), (1, 0)),
+        ((16, 1, 256, 49), (0, 1, 3, 2)),
+    ],
+)
+def test_lower_and_compile_tinygrad_transpose_uop_without_pulsar2(
+    tmp_path, input_shape, perm
+):
     from tinygrad import Tensor
 
-    root = Tensor.empty(16, 512).permute(1, 0).uop
+    root = Tensor.empty(*input_shape).permute(*perm).uop
     lowered = axb.lower_uop_to_onnx(root)
     assert [node.op_type for node in lowered.graph.node] == ["Transpose"]
+    assert [
+        onnx.helper.get_attribute_value(a) for a in lowered.graph.node[0].attribute
+    ] == [list(perm)]
     schedule = tmp_path / "transpose.schedule.json"
     generated = onnx.load_from_string(axb.compile_uop(root, str(schedule)))
     assert [node.op_type for node in generated.graph.node] == ["neu mode"]

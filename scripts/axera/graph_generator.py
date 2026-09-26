@@ -37,6 +37,7 @@ class GraphSegment:
     output_shape: tuple[int, ...] = ()
     position: str = ""
     operand_shape: tuple[int, ...] = ()
+    perm: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -192,14 +193,27 @@ def schedule_graph(model: onnx.ModelProto) -> GraphPlan:
             values.get(model.graph.output[0].name, ()) if model.graph.output else ()
         )
         perm = tuple(_attrs(transpose).get("perm", ()))
-        if shape != (16, 512) or output_shape != (512, 16) or perm != (1, 0):
+        if not shape or not output_shape or len(perm) != len(shape):
             raise ValueError(
-                "standalone Transpose requires the measured [16,512] perm [1,0] form"
+                "standalone Transpose requires static shapes and a complete permutation"
             )
+        if output_shape != tuple(shape[axis] for axis in perm):
+            raise ValueError("standalone Transpose output shape does not match perm")
+        try:
+            transpose_real_shapes.template_path(shape, perm)
+        except ValueError as exc:
+            raise ValueError(
+                f"standalone Transpose has no verified template for {shape} perm {perm}"
+            ) from exc
         return GraphPlan(
             (
                 GraphSegment(
-                    "transpose", ("x",), model.graph.output[0].name, shape, output_shape
+                    "transpose",
+                    ("x",),
+                    model.graph.output[0].name,
+                    shape,
+                    output_shape,
+                    perm=perm,
                 ),
             )
         )
@@ -531,7 +545,7 @@ def generate(
         with open(output_path, "wb") as stream:
             stream.write(
                 transpose_real_shapes.load_template_bytes(
-                    plan.segments[0].input_shape, (1, 0)
+                    plan.segments[0].input_shape, plan.segments[0].perm
                 )
             )
     elif plan.chain == "matmul":
