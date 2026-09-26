@@ -852,6 +852,45 @@ template serves which ``step.onnx`` node, and how the node's tensor names
 map onto the template's (``docs/axera-matmul-step-templates.md``)."""
 
 
+STANDALONE_MATMUL_TEMPLATES = {
+    ((16, 1000), (1000, 512)): (
+        "fc_dX_MatMul_36__v2.axmodel.gz",
+        "fc_dX_MatMul_36__v2.quant.json.gz",
+    ),
+}
+
+
+def emit_standalone_matmul(
+    a_shape,
+    b_shape,
+    scales: Mapping[str, float],
+    zero_points: Mapping[str, int],
+) -> onnx.ModelProto:
+    """Retarget one exact live-weight MatMul template without Pulsar2.
+
+    The template is a measured full AX program; this adapter only maps the
+    caller's ``x/z/y`` calibration onto its three tensor names. Unknown
+    operand shapes remain refused until a matching training-chain build is
+    validated.
+    """
+    key = (tuple(int(v) for v in a_shape), tuple(int(v) for v in b_shape))
+    paths = STANDALONE_MATMUL_TEMPLATES.get(key)
+    if paths is None:
+        raise ValueError(f"no measured standalone MatMul template for {key}")
+    model_path, quant_path = (os.path.join(STEP_TEMPLATE_DIR, name) for name in paths)
+    model = load_model(model_path)
+    old = load_scales(quant_path)
+    if len(model.graph.input) != 2 or len(model.graph.output) != 1:
+        raise ValueError("standalone MatMul template has an unexpected signature")
+    names = [item.name for item in model.graph.input] + [model.graph.output[0].name]
+    new = {
+        names[0]: (float(scales["x"]), float(zero_points["x"])),
+        names[1]: (float(scales["z"]), float(zero_points["z"])),
+        names[2]: (float(scales["y"]), float(zero_points["y"])),
+    }
+    return recalibrate(model, old, new)[0]
+
+
 def step_manifest() -> dict:
     with open(os.path.join(STEP_TEMPLATE_DIR, "manifest.json")) as f:
         return json.load(f)
